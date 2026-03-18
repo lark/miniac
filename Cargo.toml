@@ -12,3 +12,4 @@ anyhow = "1.0"
 rcgen = "0.13"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["time", "local-time"] }
+dashmap = "6.1.0"

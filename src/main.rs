@@ -6,6 +6,8 @@ use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::{Duration, Ins
 use tokio::{net::UdpSocket, sync::{mpsc, Mutex}};
 use tracing::{info, warn, error, debug};
 
+use capwap::{WtpState, WtpContext, CtrlMsg, MsgType, MsgElemType};
+
 const CTRL_PORT: u16 = 5246;
 
 struct DiscState {
@@ -95,48 +97,32 @@ async fn handle_session(
     let dtls_conn = dtls::conn::DTLSConn::new(vconn, mgr.config.clone(), false, None).await?;
     info!("[!] with {}: dtls handshake done", peer);
 
-    let mut ctx = capwap::WtpContext::new(peer);
+    let mut ctx = WtpContext::new(peer);
     let mut app_buf = [0u8; 2048];
 
     loop {
-        let now = Instant::now();
+        let retrans_duration = ctx.last_sent
+            .as_ref()
+            .filter(|last| MsgType::is_request(last.msg_type))
+            .map(|last| ctx.retrans_interval.saturating_sub(last.send_time.elapsed()))
+            .unwrap_or(Duration::from_secs(60));
 
-        let retrans_duration = if let Some(ref last) = ctx.last_sent {
-            if last.msg_type.is_request() {
-                let elapsed = last.send_time.elapsed();
-                if elapsed >= ctx.retrans_interval {
-                    Duration::from_millis(0)
-                } else {
-                    ctx.retrans_interval - elapsed
-                }
-            } else {
-                Duration::from_secs(60)
-            }
-        } else {
-            Duration::from_secs(60)
-        };
-
-        let idle_deadline = ctx.last_recv_time + ctx.echo_interval;
-        let idle_duration = if idle_deadline > now {
-            idle_deadline - now
-        } else {
-            Duration::from_millis(0)
-        };
+        let idle_duration = ctx.echo_interval.saturating_sub(ctx.last_seen.elapsed());
 
         let sleep_duration = std::cmp::min(retrans_duration, idle_duration);
 
         tokio::select! {
             res = dtls_conn.read(&mut app_buf, None) => {
                 let n = res?;
-                ctx.last_recv_time = Instant::now();
+                ctx.keep_alive();
 
-                let msg = capwap::CtrlMsg::decode(&app_buf[..n])?;
+                let msg = CtrlMsg::decode(&app_buf[..n])?;
                 let seq = msg.hdr.seq_num;
-                let m_type = msg.hdr.msg_type();
+                let m_type = msg.hdr.msg_type;
 
                 if let Some(ref last) = ctx.last_sent {
                     if seq == last.seq && m_type == last.msg_type {
-                        if last.msg_type.is_response() {
+                        if MsgType::is_response(last.msg_type) {
                             warn!("[!] from {}: dup req (seq {}), resending response", peer, seq);
                             dtls_conn.write(&last.buf, None).await?;
                             continue;
@@ -144,42 +130,66 @@ async fn handle_session(
                     }
                 }
 
-                if m_type.is_response() {
-                    if let Some(last) = ctx.last_sent.as_ref().filter(|l| l.seq == seq && l.msg_type.is_request()) {
+                if MsgType::is_response(m_type) {
+                    if let Some(last) = ctx.last_sent.as_ref().filter(|l| l.seq == seq && MsgType::is_request(l.msg_type)) {
                         info!("[<] from {}: received response for {:?} (seq {})", peer, last.msg_type, seq);
                         ctx.last_sent = None;
                     }
                 }
 
                 match (ctx.state, m_type) {
-                    (capwap::WtpState::Join, capwap::MsgType::JoinReq) => {
+                    (WtpState::Join, MsgType::JOIN_REQ) => {
                         info!("[<] from {}: join req (seq {})", peer, seq);
-                        let resp_msg = capwap::CtrlMsg::new(capwap::MsgType::JoinResp, seq).with_result_success();
+                        let resp_msg = CtrlMsg::new(MsgType::JOIN_RESP, seq)
+                            .with_result_success()
+                            .add_elem(MsgElemType::AC_DESCRIPTOR, &[0u8, 0u8, 1u8, 0u8, 0u8, 1u8, 0u8, 100u8, 4u8, 4u8, 0u8, 0u8])
+                            .add_elem(MsgElemType::AC_NAME, b"miniac")
+                            //.add_elem(MsgElemType::WTP_RADIO_INFO, &radio1_info)
+                            //.add_elem(MsgElemType::WTP_RADIO_INFO, &radio2_info)
+                            .add_elem(MsgElemType::ECN_SUPPORT, &[1u8])
+                            .add_elem(MsgElemType::CAPWAP_CTRL_V4_ADDR, &[127u8, 0u8, 0u8, 1u8])
+                            .add_elem(MsgElemType::CAPWAP_LOCAL_V4_ADDR, &[127u8, 0u8, 0u8, 1u8]);
                         let resp_buf = resp_msg.encode();
                         dtls_conn.write(&resp_buf, None).await?;
                         ctx.set_last_sent(&resp_msg, resp_buf);
-                        info!("[>] to {}: join resp sent", peer);
 
-                        ctx.state = capwap::WtpState::Configure;
-                        let config_req = capwap::CtrlMsg::new(capwap::MsgType::ConfigReq, ctx.next_seq())
-                            .add_elem(1025, &[1, 1]);
-                        let config_buf = config_req.encode();
-                        dtls_conn.write(&config_buf, None).await?;
-                        ctx.set_last_sent(&config_req, config_buf);
-                        info!("[>] to {}: config req sent, state -> Configure", peer);
+                        ctx.state = WtpState::Configure;
+                        info!("[>] to {}: join resp sent, state -> Configure", peer);
+
                     }
 
-                    (capwap::WtpState::Configure, capwap::MsgType::ConfigResp) => {
-                        info!("[<] from {}: config resp (seq {})", peer, seq);
-                        ctx.state = capwap::WtpState::Run;
-                        info!("[!] with {}: state -> RUN", peer);
-                    }
-
-                    (capwap::WtpState::Run, capwap::MsgType::EchoReq) => {
-                        let resp_msg = capwap::CtrlMsg::new(capwap::MsgType::EchoResp, seq);
+                    (WtpState::Configure, MsgType::CONF_STATUS_REQ) => {
+                        info!("[<] from {}: config status req (seq {})", peer, seq);
+                        let resp_msg = CtrlMsg::new(MsgType::CONF_STATUS_RESP, seq)
+                            .add_elem(MsgElemType::CAPWAP_TIMERS, &[20u8, 60u8])  // disc 20s, echo 60s
+                            .add_elem(MsgElemType::DEC_ERR_REPORT_PERIOD, &[1u8, 0u8, 120u8]) // radio 1, 120s
+                            .add_elem(MsgElemType::DEC_ERR_REPORT_PERIOD, &[2u8, 0u8, 120u8]) // radio 2, 120s
+                            .add_elem(MsgElemType::IDLE_TIMEOUT, &[0u8, 0u8, 1u8, 44u8]) // 300s
+                            .add_elem(MsgElemType::WTP_FALLBACK, &[2u8]); // 1-enable 2-disable
                         let resp_buf = resp_msg.encode();
                         dtls_conn.write(&resp_buf, None).await?;
                         ctx.set_last_sent(&resp_msg, resp_buf);
+                        info!("[>] to {}: config resp sent", peer);
+                    }
+
+                    (WtpState::Configure, MsgType::CH_STATE_EV_REQ) => {
+                        info!("[<] from {}: change status event req (seq {})", peer, seq);
+                        let resp_msg = CtrlMsg::new(MsgType::CH_STATE_EV_RESP, seq);
+                        let resp_buf = resp_msg.encode();
+                        dtls_conn.write(&resp_buf, None).await?;
+                        ctx.set_last_sent(&resp_msg, resp_buf);
+
+                        ctx.state = WtpState::Run;
+                        info!("[>] to {}: change status event resp sent, state -> Run", peer);
+                    }
+
+                    (WtpState::Run, MsgType::ECHO_REQ) => {
+                        info!("[<] from {}: echo req (seq {})", peer, seq);
+                        let resp_msg = CtrlMsg::new(MsgType::ECHO_RESP, seq);
+                        let resp_buf = resp_msg.encode();
+                        dtls_conn.write(&resp_buf, None).await?;
+                        ctx.set_last_sent(&resp_msg, resp_buf);
+                        info!("[>] to {}: echo resp", peer);
                     }
 
                     _ => debug!("[?] from {}: unhandled state/msg", peer),
@@ -190,10 +200,10 @@ async fn handle_session(
                 let now = Instant::now();
 
                 if let Some(ref mut last) = ctx.last_sent {
-                    if last.msg_type.is_request() && now >= last.send_time + ctx.retrans_interval {
+                    if MsgType::is_request(last.msg_type) && now >= last.send_time + ctx.retrans_interval {
                         if last.retry_count < ctx.max_retries {
                             last.retry_count += 1;
-                            last.send_time = Instant::now();
+                            last.send_time = now;
                             warn!("[>] to {}: retransmitting {:?} (seq {}, attempt {})",
                                 peer, last.msg_type, last.seq, last.retry_count);
                             dtls_conn.write(&last.buf, None).await?;
@@ -203,15 +213,9 @@ async fn handle_session(
                         }
                     }
                 }
-                else if now >= ctx.last_recv_time + ctx.echo_interval {
-                    if ctx.state == capwap::WtpState::Run {
-                        let seq = ctx.next_seq();
-                        let echo_req = capwap::CtrlMsg::new(capwap::MsgType::EchoReq, seq);
-                        let buf = echo_req.encode();
-                        dtls_conn.write(&buf, None).await?;
-                        ctx.set_last_sent(&echo_req, buf);
-                        info!("[>] to {}: idle timeout, sending echo request (seq {})", peer, seq);
-                    }
+                if ctx.state == WtpState::Run && now >= ctx.last_seen + ctx.echo_interval {
+                    error!("[!] with {}: echo timeout (no traffic for {}s)", peer, ctx.echo_interval.as_secs());
+                    return Err(anyhow::anyhow!("echo timeout"));
                 }
             }
         }
