@@ -1,0 +1,84 @@
+Discovery Request
++  Discovery Type
++  WTP Board Data
++  WTP Descriptor
++  WTP Frame Tunnel Mode
++  WTP MAC Type
++  WTP Radio Information
+=  MTU Discovery Padding
+=  Vendor Specific Payload
+
+Primary Discovery Request
++  Discovery Type
++  WTP Board Data
++  WTP Descriptor
++  WTP Frame Tunnel Mode
++  WTP MAC Type
++  WTP Radio Information
+=  MTU Discovery Padding
+=  Vendor Specific Payload
+
+Join Request
++  Location Data
++  WTP Board Data
++  WTP Descriptor
++  WTP Frame Tunnel Mode
++  Session ID
++  WTP MAC Type
++  WTP Radio Information
++  ECN Support
++  CAPWAP Local IPv4 Address, CAPWAP Local IPv6 Address
+=  CAPWAP Transport Protocol
+=  Maximum Message Length
+=  WTP Reboot Statistics
+=  Vendor Specific Payload
+
+Echo Request
+=  Vendor Specific Payload
+
+Configuration Status Request
++  AC Name
++  Radio Administrative State
++  Statistics Timer
++  WTP Reboot Statistics
+=  AC Name with Priority
+=  CAPWAP Transport Protocol
+=  WTP Static IP Address Information
+=  Vendor Specific Payload
+
+Configuration Update Response
++  Result Code
+=  Radio Operational State
+=  Vendor Specific Payload
+
+Change State Event Request
++  Radio Operational State
++  Result Code
+=m Returned Message Elements
+=m Vendor Specific Payload
+
+Clear Configuration Response
++  Result Code
+=  Vendor Specific Payload
+
+Image Data Request
+=  CAPWAP Transport Protocol
+=  Image Data
+=  Vendor Specific Payload
+=  Image Identifier
+=  Initiate Download
+
+Image Data Response
++  Result Code
+=  Vendor Specific Payload
+
+Reset Response
+=  Result Code
+=  Vendor Specific Payload
+
+WTP Event Request
++m Decryption Error Report, Duplicate IPv4 Address, Duplicate IPv6 Address, WTP Radio Statistics, WTP Reboot Statistics, Delete Station, Vendor Specific Payload
+
+Station Configuration Response
++  Result Code
+=  Vendor Specific Payload
