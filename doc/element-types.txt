@@ -1,0 +1,71 @@
+The 16-bit Type field identifies the information carried in the Value
+field and Length (16 bits) indicates the number of bytes in the Value
+field.  The value of zero (0) is reserved and MUST NOT be used.  The
+rest of the Type field values are allocated as follows:
+
+           Usage                              Type Values
+
+CAPWAP Protocol Message Elements                   1 - 1023
+IEEE 802.11 Message Elements                    1024 - 2047
+Reserved for Future Use                         2048 - 3071
+EPCGlobal Message Elements                      3072 - 4095
+Reserved for Future Use                         4096 - 65535
+
+The table below lists the CAPWAP protocol Message Elements and their
+Type values.
+
+CAPWAP Message Element                            Type Value
+
+AC Descriptor                                         1
+AC IPv4 List                                          2
+AC IPv6 List                                          3
+AC Name                                               4
+AC Name with Priority                                 5
+AC Timestamp                                          6
+Add MAC ACL Entry                                     7
+Add Station                                           8
+Reserved                                              9
+CAPWAP Control IPV4 Address                          10
+CAPWAP Control IPV6 Address                          11
+CAPWAP Local IPV4 Address                            30
+CAPWAP Local IPV6 Address                            50
+CAPWAP Timers                                        12
+CAPWAP Transport Protocol                            51
+Data Transfer Data                                   13
+Data Transfer Mode                                   14
+Decryption Error Report                              15
+Decryption Error Report Period                       16
+Delete MAC ACL Entry                                 17
+Delete Station                                       18
+Reserved                                             19
+Discovery Type                                       20
+Duplicate IPv4 Address                               21
+Duplicate IPv6 Address                               22
+ECN Support                                          53
+Idle Timeout                                         23
+Image Data                                           24
+Image Identifier                                     25
+Image Information                                    26
+Initiate Download                                    27
+Location Data                                        28
+Maximum Message Length                               29
+MTU Discovery Padding                                52
+Radio Administrative State                           31
+Radio Operational State                              32
+Result Code                                          33
+Returned Message Element                             34
+Session ID                                           35
+Statistics Timer                                     36
+Vendor Specific Payload                              37
+WTP Board Data                                       38
+WTP Descriptor                                       39
+WTP Fallback                                         40
+WTP Frame Tunnel Mode                                41
+Reserved                                             42
+Reserved                                             43
+WTP MAC Type                                         44
+WTP Name                                             45
+Unused/Reserved                                      46
+WTP Radio Statistics                                 47
+WTP Reboot Statistics                                48
+WTP Static IP Address Information                    49

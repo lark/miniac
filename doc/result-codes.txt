@@ -1,0 +1,27 @@
+   Result Code:   The following enumerated values are defined:
+
+      0  Success
+      1  Failure (AC List Message Element MUST Be Present)
+      2  Success (NAT Detected)
+      3  Join Failure (Unspecified)
+      4  Join Failure (Resource Depletion)
+      5  Join Failure (Unknown Source)
+      6  Join Failure (Incorrect Data)
+      7  Join Failure (Session ID Already in Use)
+      8  Join Failure (WTP Hardware Not Supported)
+      9  Join Failure (Binding Not Supported)
+      10 Reset Failure (Unable to Reset)
+      11 Reset Failure (Firmware Write Error)
+      12 Configuration Failure (Unable to Apply Requested Configuration
+         - Service Provided Anyhow)
+      13 Configuration Failure (Unable to Apply Requested Configuration
+         - Service Not Provided)
+      14 Image Data Error (Invalid Checksum)
+      15 Image Data Error (Invalid Data Length)
+      16 Image Data Error (Other Error)
+      17 Image Data Error (Image Already Present)
+      18 Message Unexpected (Invalid in Current State)
+      19 Message Unexpected (Unrecognized Request)
+      20 Failure - Missing Mandatory Message Element
+      21 Failure - Unrecognized Message Element
+      22 Data Transfer Error (No Information to Transfer)

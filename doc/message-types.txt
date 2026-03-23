@@ -1,0 +1,31 @@
+The valid values for CAPWAP Control Message Types are specified in
+the table below:
+
+CAPWAP Control Message           Message Type
+                                   Value
+Discovery Request                    1
+Discovery Response                   2
+Join Request                         3
+Join Response                        4
+Configuration Status Request         5
+Configuration Status Response        6
+Configuration Update Request         7
+Configuration Update Response        8
+WTP Event Request                    9
+WTP Event Response                  10
+Change State Event Request          11
+Change State Event Response         12
+Echo Request                        13
+Echo Response                       14
+Image Data Request                  15
+Image Data Response                 16
+Reset Request                       17
+Reset Response                      18
+Primary Discovery Request           19
+Primary Discovery Response          20
+Data Transfer Request               21
+Data Transfer Response              22
+Clear Configuration Request         23
+Clear Configuration Response        24
+Station Configuration Request       25
+Station Configuration Response      26
