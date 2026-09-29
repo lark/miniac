@@ -1,0 +1,285 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>miniac AC — Management Plane</title>
+<style>
+  :root {
+    --bg: #0f172a; --panel: #1e293b; --line: #334155; --text: #e2e8f0;
+    --muted: #94a3b8; --accent: #38bdf8; --ok: #4ade80; --bad: #f87171;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
+         background: var(--bg); color: var(--text); }
+  header { display: flex; align-items: center; justify-content: space-between;
+           padding: 16px 24px; border-bottom: 1px solid var(--line); }
+  header h1 { font-size: 18px; margin: 0; }
+  header h1 span { color: var(--accent); }
+  .stats { display: flex; gap: 16px; color: var(--muted); font-size: 13px; }
+  main { padding: 24px; display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }
+  @media (max-width: 1100px) { main { grid-template-columns: 1fr; } }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+            padding: 16px; min-width: 0; }
+  section h2 { font-size: 14px; text-transform: uppercase; letter-spacing: .06em;
+               color: var(--muted); margin: 0 0 12px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--line); }
+  th { color: var(--muted); font-weight: 600; white-space: nowrap; }
+  td { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 220px; }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 12px; }
+  .run { background: rgba(74,222,128,.15); color: var(--ok); }
+  .other { background: rgba(148,163,184,.15); color: var(--muted); }
+  .pending { background: rgba(250,204,21,.15); color: #facc15; }
+  .empty { color: var(--muted); font-size: 13px; padding: 8px; }
+  #events { max-height: 360px; overflow: auto; }
+  #events li { padding: 5px 0; border-bottom: 1px solid var(--line); font-size: 12.5px; }
+  #events .ts { color: var(--muted); margin-right: 8px; font-family: ui-monospace, monospace; }
+  form.inline { display: flex; gap: 8px; margin-bottom: 12px; }
+  input, select, button { background: var(--bg); color: var(--text); border: 1px solid var(--line);
+         border-radius: 6px; padding: 6px 10px; font-size: 13px; }
+  button { cursor: pointer; background: var(--accent); color: #0f172a; font-weight: 600; border: none; }
+  button:hover { filter: brightness(1.08); }
+</style>
+</head>
+<body>
+<header>
+  <h1>miniac <span>AC</span> — Management Plane</h1>
+  <div class="stats">
+    <span id="stat-devices">APs —</span>
+    <span id="stat-stations">Stations —</span>
+  </div>
+</header>
+<main>
+  <section id="devices-sec">
+    <h2>Access Points</h2>
+    <table>
+      <thead><tr><th>MAC</th><th>Name</th><th>Address</th><th>SW</th><th>State</th><th>Upgrade</th></tr></thead>
+      <tbody id="devices"></tbody>
+    </table>
+    <div class="empty" id="devices-empty" hidden>No WTPs yet. They appear after joining via CAPWAP.</div>
+  </section>
+
+  <section>
+    <h2>Device Metadata</h2>
+    <form class="inline" id="meta-form">
+      <input id="meta-mac" placeholder="aa:bb:cc:dd:ee:ff" class="mono">
+      <input id="meta-name" placeholder="Display name">
+      <input id="meta-desc" placeholder="Description">
+      <button type="submit">Save</button>
+    </form>
+    <div class="empty">Set the user-facing name and description for a known AP.</div>
+  </section>
+
+  <section id="stations-sec">
+    <h2>Client Stations</h2>
+    <table>
+      <thead><tr><th>Client MAC</th><th>WTP</th><th>SSID</th><th>State</th><th>RSSI</th></tr></thead>
+      <tbody id="stations"></tbody>
+    </table>
+    <div class="empty" id="stations-empty" hidden>No associated clients.</div>
+  </section>
+
+  <section id="radios-sec">
+    <h2>Radios</h2>
+    <table>
+      <thead><tr><th>WTP</th><th>Radio</th><th>Band</th><th>Channel</th><th>TX</th></tr></thead>
+      <tbody id="radios"></tbody>
+    </table>
+    <div class="empty" id="radios-empty" hidden>No radio state reported yet.</div>
+  </section>
+
+  <section id="profiles-sec">
+    <h2>Security Profiles</h2>
+    <table>
+      <thead><tr><th>Name</th><th>Method</th><th>Cipher</th><th>Caps</th></tr></thead>
+      <tbody id="profiles"></tbody>
+    </table>
+    <div class="empty" id="profiles-empty" hidden>No profiles defined.</div>
+  </section>
+
+  <section>
+    <h2>Add Security Profile</h2>
+    <form class="inline" id="profile-form">
+      <input id="profile-name" placeholder="name">
+      <select id="profile-method">
+        <option value="wpa2-psk">wpa2-psk</option>
+        <option value="wpa3-sae">wpa3-sae</option>
+        <option value="802.1x">802.1x</option>
+      </select>
+      <select id="profile-cipher">
+        <option value="ccmp">ccmp</option>
+        <option value="tkip">tkip</option>
+      </select>
+      <button type="submit">Add</button>
+    </form>
+  </section>
+
+  <section id="firmware-sec">
+    <h2>Firmware Images</h2>
+    <table>
+      <thead><tr><th>Path</th><th>Size</th><th>MD5</th><th>Uploaded</th></tr></thead>
+      <tbody id="firmware"></tbody>
+    </table>
+    <div class="empty" id="firmware-empty" hidden>No firmware uploaded.</div>
+  </section>
+
+  <section>
+    <h2>Upload Firmware</h2>
+    <form class="inline" id="fw-form" style="flex-wrap:wrap">
+      <input id="fw-vendor" placeholder="vendor (tplink)">
+      <input id="fw-model" placeholder="model (ac100)">
+      <input id="fw-hw" placeholder="hw_version (v3)">
+      <input id="fw-file" type="file">
+      <button type="submit">Upload</button>
+    </form>
+    <div class="empty">Stored as firmwares/{vendor}/{model}/{hw_version}/{file}</div>
+  </section>
+
+  <section id="events-sec">
+    <h2>Management Events</h2>
+    <ul id="events" style="list-style:none; margin:0; padding:0;"></ul>
+    <div class="empty" id="events-empty" hidden>No events recorded.</div>
+  </section>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g,
+  c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+async function getJson(url) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(url + ' ' + r.status);
+  return r.json();
+}
+function setTable(rowEl, emptyEl, rows, cols) {
+  rowEl.innerHTML = rows.length
+    ? rows.map(r => `<tr>${cols.map(c => `<td ${c.mono?'class="mono"':''}>${esc(c.v(r))}</td>`).join('')}</tr>`).join('')
+    : '';
+  emptyEl.hidden = rows.length > 0;
+}
+
+async function loadDevices() {
+  const [rows, fw] = await Promise.all([getJson('/api/devices'), getJson('/api/firmware')]);
+  const fwOpts = (mac) => `<select data-fwfor="${esc(mac)}"><option value="">none</option>` +
+    fw.map(f => `<option value="${f.id}">${esc(f.stored_path)}</option>`).join('') + '</select>';
+  setTable($('devices'), $('devices-empty'), rows, [
+    { v: r => r.mac, mono: true }, { v: r => r.name }, { v: r => r.ip_addr || '-' },
+    { v: r => r.sw_version || '-' },
+    { v: r => r.approved
+      ? `<span class="pill ${r.state === 'run' ? 'run' : 'other'}">${esc(r.state)}</span>`
+      : '<span class="pill pending">待确认</span>' },
+    { v: r => r.approved
+      ? `<span style="display:flex;gap:6px">${fwOpts(r.mac)}<button data-upgrade="${esc(r.mac)}">Upgrade</button></span>`
+      : `<button data-approve="${esc(r.mac)}">确认</button>` },
+  ]);
+  $('stat-devices').textContent = 'APs ' + rows.length;
+}
+async function loadFirmware() {
+  const rows = await getJson('/api/firmware');
+  setTable($('firmware'), $('firmware-empty'), rows, [
+    { v: r => r.stored_path, mono: true },
+    { v: r => (r.size / 1024).toFixed(1) + ' KiB' },
+    { v: r => r.hash, mono: true },
+    { v: r => new Date(r.uploaded_at * 1000).toISOString() },
+  ]);
+}
+async function loadStations() {
+  const rows = await getJson('/api/stations');
+  setTable($('stations'), $('stations-empty'), rows, [
+    { v: r => r.mac, mono: true }, { v: r => r.wmac, mono: true },
+    { v: r => r.ssid || '-' }, { v: r => r.state },
+    { v: r => r.rssi ?? '-' },
+  ]);
+  $('stat-stations').textContent = 'Stations ' + rows.length;
+}
+async function loadRadios() {
+  const rows = await getJson('/api/radios');
+  setTable($('radios'), $('radios-empty'), rows, [
+    { v: r => r.mac, mono: true }, { v: r => r.radio_id + 1 },
+    { v: r => r.band || '-' }, { v: r => r.channel ?? '-' }, { v: r => r.tx_power ?? '-' },
+  ]);
+}
+async function loadProfiles() {
+  const rows = await getJson('/api/profiles');
+  setTable($('profiles'), $('profiles-empty'), rows, [
+    { v: r => r.name }, { v: r => r.method }, { v: r => r.cipher },
+    { v: r => '0x' + Number(r.caps).toString(16) },
+  ]);
+}
+async function loadEvents() {
+  const rows = await getJson('/api/events');
+  const ul = $('events');
+  ul.innerHTML = rows.map(r => `<li><span class="ts">${r.ts_unix}</span>[${esc(r.category)}] ${esc(r.message)}</li>`).join('');
+  $('events-empty').hidden = rows.length > 0;
+}
+async function refresh() {
+  try {
+    await Promise.all([loadDevices(), loadStations(), loadRadios(), loadProfiles(), loadFirmware(), loadEvents()]);
+  } catch (e) { console.error(e); }
+}
+
+$('meta-form').addEventListener('submit', async (ev) => {
+  ev.preventDefault();
+  const mac = $('meta-mac').value.trim();
+  if (!mac) return;
+  const body = { name: $('meta-name').value, description: $('meta-desc').value };
+  const r = await fetch('/api/devices/' + encodeURIComponent(mac), {
+    method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+  });
+  if (r.ok) refresh(); else alert('update failed: ' + r.status);
+});
+
+$('profile-form').addEventListener('submit', async (ev) => {
+  ev.preventDefault();
+  const body = {
+    name: $('profile-name').value, method: $('profile-method').value,
+    cipher: $('profile-cipher').value, caps: 0,
+  };
+  const r = await fetch('/api/profiles', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+  });
+  if (r.ok) refresh(); else alert('add failed: ' + r.status);
+});
+
+$('fw-form').addEventListener('submit', async (ev) => {
+  ev.preventDefault();
+  const file = $('fw-file').files[0];
+  if (!file) { alert('choose a file'); return; }
+  const fd = new FormData();
+  fd.append('vendor', $('fw-vendor').value.trim());
+  fd.append('model', $('fw-model').value.trim());
+  fd.append('hw_version', $('fw-hw').value.trim());
+  fd.append('file', file);
+  const r = await fetch('/api/firmware', { method: 'POST', body: fd });
+  if (r.ok) { refresh(); } else { alert('upload failed: ' + r.status + ' ' + (await r.text())); }
+});
+
+document.addEventListener('click', async (ev) => {
+  const ap = ev.target.closest && ev.target.closest('button[data-approve]');
+  if (ap) {
+    const mac = ap.dataset.approve;
+    const r = await fetch('/api/devices/' + encodeURIComponent(mac) + '/approve', { method: 'POST' });
+    if (r.ok) { refresh(); } else { alert('approve failed: ' + r.status + ' ' + (await r.text())); }
+    return;
+  }
+  const btn = ev.target.closest && ev.target.closest('button[data-upgrade]');
+  if (!btn) return;
+  const mac = btn.dataset.upgrade;
+  const sel = document.querySelector(`select[data-fwfor="${mac}"]`);
+  const imageId = sel ? sel.value : '';
+  if (!imageId) { alert('select a firmware image first'); return; }
+  const r = await fetch('/api/devices/' + encodeURIComponent(mac) + '/upgrade', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ image_id: Number(imageId) }),
+  });
+  if (r.ok) { refresh(); } else { alert('upgrade failed: ' + r.status + ' ' + (await r.text())); }
+});
+
+refresh();
+setInterval(refresh, 5000);
+</script>
+</body>
+</html>

@@ -1,13 +1,17 @@
+//! CAPWAP control messages, message elements, schema validation and WTP session state.
+//!
+//! Copyright (c) 2026  Wang Jian
+
 use anyhow::{anyhow, Result};
-use std::time::{Instant, Duration};
+use dashmap::DashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::net::{Ipv4Addr, Ipv6Addr};
-use std::collections::{HashMap, HashSet};
-use dashmap::DashMap;
+use std::time::{Duration, Instant};
 
 pub struct CtrlHdr {
     pub msg_type: u32,
-    pub seq_num: u8,
+    pub seq_num: u32,
     pub elem_len: u16,
     pub flags: u8,
 }
@@ -54,7 +58,7 @@ pub struct Radio {
 
 pub struct LastSentInfo {
     pub buf: Vec<u8>,
-    pub seq: u8,
+    pub seq: u32,
     pub msg_type: u32,
     pub send_time: Instant,
     pub retry_count: u32,
@@ -65,6 +69,9 @@ pub struct WtpContext {
     pub wtp_id: Vec<u8>,
     pub name: String,
     pub description: String,
+
+    /// WTP board MAC learned from WTP Board Data during join (device identifier).
+    pub mac: Option<[u8; 6]>,
 
     pub state: WtpState,
 
@@ -78,12 +85,14 @@ pub struct WtpContext {
     pub session_id: u64,
     pub last_seen: Instant,
     pub last_sent: Option<LastSentInfo>,
+    /// When the Run-state keep-alive Echo Request was last sent to the WTP.
+    pub last_echo_sent: Instant,
 
     pub echo_interval: Duration,
     pub retrans_interval: Duration,
     pub max_retries: u32,
 
-    pub seq_counter: u8,
+    pub seq_counter: u32,
 }
 
 #[allow(unused)]
@@ -100,7 +109,7 @@ impl CtrlHdr {
         }
         Ok(Self {
             msg_type: u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]),
-            seq_num: buf[4],
+            seq_num: buf[4] as u32,
             elem_len: u16::from_be_bytes([buf[5], buf[6]]),
             flags: buf[7],
         })
@@ -109,7 +118,7 @@ impl CtrlHdr {
     pub fn encode(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(Self::SIZE);
         buf.extend_from_slice(&self.msg_type.to_be_bytes());
-        buf.push(self.seq_num);
+        buf.push((self.seq_num & 0xff) as u8);
         buf.extend_from_slice(&self.elem_len.to_be_bytes());
         buf.push(self.flags);
 
@@ -119,7 +128,7 @@ impl CtrlHdr {
 
 #[allow(unused)]
 impl CtrlMsg {
-    pub fn new(m_type: u32, seq: u8) -> Self {
+    pub fn new(m_type: u32, seq: u32) -> Self {
         Self {
             hdr: CtrlHdr {
                 msg_type: m_type,
@@ -132,47 +141,56 @@ impl CtrlMsg {
     }
 
     pub fn add_elem(mut self, tag: u16, val: &[u8]) -> Self {
-        self.elems.push(RawElem { tag, data: val.to_vec(), });
+        self.elems.push(RawElem {
+            tag,
+            data: val.to_vec(),
+        });
         self.hdr.elem_len += (4 + val.len()) as u16;
         self
     }
 
     pub fn with_result_success(self) -> Self {
-        self.add_elem(MsgElemType::RESULT_CODE, &[CwResult::Success as u8])
+        self.with_result(CwResult::Success)
+    }
+
+    /// Sets the RFC 5415 Result Code element (1 octet) on a response. The H3C
+    /// framing layer re-encodes this element on the wire (4-byte value) so the
+    /// generic API stays RFC-compliant.
+    pub fn with_result(self, code: CwResult) -> Self {
+        self.add_elem(MsgElemType::RESULT_CODE, &[code as u8])
+    }
+
+    /// Append a single typed base element (see `crate::elements::BaseElem`).
+    pub fn add_element(mut self, elem: crate::elements::BaseElem) -> Self {
+        let (tag, val) = elem.encode();
+        self.add_elem(tag, &val)
     }
 
     pub fn encode(&self) -> Vec<u8> {
-        let mut buf = self.hdr.encode();
-
-        buf.reserve(self.hdr.elem_len as usize);
-
-        for elem in &self.elems {
-            buf.extend_from_slice(&elem.tag.to_be_bytes()); // type, u16
-            buf.extend_from_slice(&(elem.data.len() as u16).to_be_bytes()); // length, u16
-            buf.extend_from_slice(&elem.data); // value
-        }
-
-        buf
+        crate::vendor::framing::CtrlFrame::Rfc.frame(self)
     }
 
-    pub fn decode(buf: &[u8]) -> Result<Self> {
-        let hdr = CtrlHdr::decode(buf)?;
-        let hdr_len = 8;
-        let body_len = hdr.elem_len as usize;
+    /// Encode this control message using a vendor framing (adds the 8-byte
+    /// base header and widens the Seq where the vendor requires it).
+    pub fn encode_for(&self, frame: crate::vendor::framing::CtrlFrame) -> Vec<u8> {
+        frame.frame(self)
+    }
 
-        if buf.len() < hdr_len + body_len {
-            return Err(anyhow!("truncated"));
-        }
+    pub fn decode(frame: crate::vendor::framing::CtrlFrame, buf: &[u8]) -> Result<Self> {
+        let hdr = frame.parse_hdr(buf)?;
+        let elem_off = frame.elem_off();
 
         let mut elems = Vec::new();
-        let mut pos = hdr_len;
-        while pos + 4 <= hdr_len + body_len {
-            let tag = u16::from_be_bytes([buf[pos], buf[pos+1]]);
-            let len = u16::from_be_bytes([buf[pos+2], buf[pos+3]]) as usize;
+        let mut pos = elem_off;
+        while pos + 4 <= buf.len() {
+            let tag = u16::from_be_bytes([buf[pos], buf[pos + 1]]);
+            let len = u16::from_be_bytes([buf[pos + 2], buf[pos + 3]]) as usize;
             pos += 4;
 
             let end = pos + len;
-            if end > buf.len() { break; }
+            if end > buf.len() {
+                break;
+            }
 
             elems.push(RawElem {
                 tag,
@@ -216,6 +234,7 @@ impl WtpContext {
             wtp_id: Vec::new(),
             name: format!("AP-{}", peer.ip()),
             description: String::new(),
+            mac: None,
             state: WtpState::Join,
             hardware_version: 0,
             software_version: 0,
@@ -225,6 +244,7 @@ impl WtpContext {
             session_id: 0,
             last_seen: Instant::now(),
             last_sent: None,
+            last_echo_sent: Instant::now(),
             echo_interval: Duration::from_secs(30),
             retrans_interval: Duration::from_secs(5),
             max_retries: 3,
@@ -246,7 +266,7 @@ impl WtpContext {
         });
     }
 
-    pub fn next_seq(&mut self) -> u8 {
+    pub fn next_seq(&mut self) -> u32 {
         let seq = self.seq_counter;
         self.seq_counter = self.seq_counter.wrapping_add(1);
         seq
@@ -260,25 +280,6 @@ fn parse_u32(data: &[u8]) -> u32 { u32::from_be_bytes(data[0..4].try_into().unwr
 fn parse_ipv4(data: &[u8]) -> Ipv4Addr { Ipv4Addr::new(data[0], data[1], data[2], data[3]) }
 */
 
-pub fn decode(data: &[u8]) -> Result<CtrlMsg> {
-    if data.len() < 16 {
-        return Err(anyhow!("packet too short"));
-    }
-
-    // skip the 8-byte CAPWAP header
-    let ctrl_part = &data[8..];
-
-    let msg_type = u32::from_be_bytes([ctrl_part[0], ctrl_part[1], ctrl_part[2], ctrl_part[3]]);
-    let seq_num = ctrl_part[4];
-    let elem_len = u16::from_be_bytes([ctrl_part[5], ctrl_part[6]]);
-    let flags = ctrl_part[7];
-
-    Ok(CtrlMsg {
-        hdr: CtrlHdr { msg_type, seq_num, elem_len, flags },
-        elems: Vec::new(), // filled in later by the parser
-    })
-}
-
 #[derive(Debug, Clone)]
 #[allow(unused)]
 pub enum CwElem {
@@ -291,10 +292,19 @@ pub enum CwElem {
     Bytes(Vec<u8>),
     ResultCode(u8),
     WtpName(String),
-    WtpDescriptor { hardware: u32, software: u32 },
-    RadioOp { radio_id: u8, state: u8 },
+    WtpDescriptor {
+        hardware: u32,
+        software: u32,
+    },
+    RadioOp {
+        radio_id: u8,
+        state: u8,
+    },
     ACIp4List(Vec<Ipv4Addr>),
-    WtpRadioInfo { radio_id: u8, entries: HashMap<u16, Vec<CwElem>> },
+    WtpRadioInfo {
+        radio_id: u8,
+        entries: HashMap<u16, Vec<CwElem>>,
+    },
     Unknown(u16, Vec<u8>),
 }
 
@@ -439,98 +449,497 @@ pub static MSG_SCHEMAS: Lazy<HashMap<u32, MsgSchema>> = Lazy::new(|| {
     let mut m = HashMap::new();
 
     // 1. Discovery Request
-    m.insert(MsgType::DISC_REQ, MsgSchema {
-        mandatory: [
-            MsgElemType::DISC_TYPE, MsgElemType::WTP_BOARD_DATA,
-            MsgElemType::WTP_DESCRIPTOR, MsgElemType::WTP_FRAME_TUNNEL_MODE,
-            MsgElemType::WTP_MAC_TYPE, MsgElemType::WTP_RADIO_INFO,
-        ].into(),
-        optional: [MsgElemType::MTU_DISC_PADDING, MsgElemType::VENDOR_SPECIFIC_PAYLOAD].into(),
-        allow_multi: [].into(),
-        exclusive_groups: vec![],
-        at_least_one: vec![],
-    });
+    m.insert(
+        MsgType::DISC_REQ,
+        MsgSchema {
+            mandatory: [
+                MsgElemType::DISC_TYPE,
+                MsgElemType::WTP_BOARD_DATA,
+                MsgElemType::WTP_DESCRIPTOR,
+                MsgElemType::WTP_FRAME_TUNNEL_MODE,
+                MsgElemType::WTP_MAC_TYPE,
+                MsgElemType::WTP_RADIO_INFO,
+            ]
+            .into(),
+            optional: [
+                MsgElemType::MTU_DISC_PADDING,
+                MsgElemType::VENDOR_SPECIFIC_PAYLOAD,
+            ]
+            .into(),
+            allow_multi: [].into(),
+            exclusive_groups: vec![],
+            at_least_one: vec![],
+        },
+    );
 
     // 2. Primary Discovery Request
-    m.insert(MsgType::PRIMARY_DISC_REQ, m.get(&MsgType::DISC_REQ).unwrap().clone());
+    m.insert(
+        MsgType::PRIMARY_DISC_REQ,
+        m.get(&MsgType::DISC_REQ).unwrap().clone(),
+    );
 
     // 3. Join Request
-    m.insert(MsgType::JOIN_REQ, MsgSchema {
-        mandatory: [
-            MsgElemType::LOCATION_DATA, MsgElemType::WTP_BOARD_DATA,
-            MsgElemType::WTP_DESCRIPTOR, MsgElemType::WTP_FRAME_TUNNEL_MODE,
-            MsgElemType::SESSION_ID, MsgElemType::WTP_MAC_TYPE,
-            MsgElemType::WTP_RADIO_INFO, MsgElemType::ECN_SUPPORT,
-        ].into(),
-        optional: [
-            MsgElemType::CAPWAP_TRANSPORT_PROTO, MsgElemType::MAX_MESSAGE_LEN,
-            MsgElemType::WTP_REBOOT_STATS, MsgElemType::VENDOR_SPECIFIC_PAYLOAD,
-        ].into(),
-        allow_multi: [MsgElemType::WTP_RADIO_INFO].into(),
-        exclusive_groups: vec![],
-        at_least_one: vec![
-            [MsgElemType::CAPWAP_LOCAL_IPV4_ADDR, MsgElemType::CAPWAP_LOCAL_IPV6_ADDR].into()
-        ],
-    });
+    m.insert(
+        MsgType::JOIN_REQ,
+        MsgSchema {
+            mandatory: [
+                MsgElemType::LOCATION_DATA,
+                MsgElemType::WTP_BOARD_DATA,
+                MsgElemType::WTP_DESCRIPTOR,
+                MsgElemType::WTP_FRAME_TUNNEL_MODE,
+                MsgElemType::SESSION_ID,
+                MsgElemType::WTP_MAC_TYPE,
+                MsgElemType::WTP_RADIO_INFO,
+                MsgElemType::ECN_SUPPORT,
+            ]
+            .into(),
+            optional: [
+                MsgElemType::CAPWAP_TRANSPORT_PROTO,
+                MsgElemType::MAX_MESSAGE_LEN,
+                MsgElemType::WTP_REBOOT_STATS,
+                MsgElemType::VENDOR_SPECIFIC_PAYLOAD,
+            ]
+            .into(),
+            allow_multi: [MsgElemType::WTP_RADIO_INFO].into(),
+            exclusive_groups: vec![],
+            at_least_one: vec![[
+                MsgElemType::CAPWAP_LOCAL_IPV4_ADDR,
+                MsgElemType::CAPWAP_LOCAL_IPV6_ADDR,
+            ]
+            .into()],
+        },
+    );
 
     // 4. Configuration Status Request
-    m.insert(MsgType::CONFIG_STATUS_REQ, MsgSchema {
-        mandatory: [
-            MsgElemType::AC_NAME, MsgElemType::RADIO_ADMIN_STATE,
-            MsgElemType::STATS_TIMER, MsgElemType::WTP_REBOOT_STATS,
-        ].into(),
-        optional: [
-            MsgElemType::AC_NAME_WITH_PRIORITY, MsgElemType::CAPWAP_TRANSPORT_PROTO,
-            MsgElemType::WTP_STATIC_IP_ADDR_INFO, MsgElemType::VENDOR_SPECIFIC_PAYLOAD,
-        ].into(),
-        allow_multi: [].into(),
-        exclusive_groups: vec![],
-        at_least_one: vec![],
-    });
+    m.insert(
+        MsgType::CONFIG_STATUS_REQ,
+        MsgSchema {
+            mandatory: [
+                MsgElemType::AC_NAME,
+                MsgElemType::RADIO_ADMIN_STATE,
+                MsgElemType::STATS_TIMER,
+                MsgElemType::WTP_REBOOT_STATS,
+            ]
+            .into(),
+            optional: [
+                MsgElemType::AC_NAME_WITH_PRIORITY,
+                MsgElemType::CAPWAP_TRANSPORT_PROTO,
+                MsgElemType::WTP_STATIC_IP_ADDR_INFO,
+                MsgElemType::VENDOR_SPECIFIC_PAYLOAD,
+            ]
+            .into(),
+            // The H3C AX60 ConfigStatusRequest carries one AC-Name-with-priority
+            // element per known AC, and one Radio Admin-State element per radio.
+            // Both are legitimately multi-valued, so relax dedup for them.
+            allow_multi: [
+                MsgElemType::AC_NAME_WITH_PRIORITY,
+                MsgElemType::RADIO_ADMIN_STATE,
+            ]
+            .into(),
+            exclusive_groups: vec![],
+            at_least_one: vec![],
+        },
+    );
 
     // 5. Change State Event Request
-    m.insert(MsgType::CHANGE_STATE_EV_REQ, MsgSchema {
-        mandatory: [MsgElemType::RADIO_OP_STATE, MsgElemType::RESULT_CODE].into(),
-        optional: [MsgElemType::RETURNED_MESSAGE_ELEMENT, MsgElemType::VENDOR_SPECIFIC_PAYLOAD].into(),
-        allow_multi: [MsgElemType::RETURNED_MESSAGE_ELEMENT, MsgElemType::VENDOR_SPECIFIC_PAYLOAD].into(),
-        exclusive_groups: vec![],
-        at_least_one: vec![],
-    });
+    m.insert(
+        MsgType::CHANGE_STATE_EV_REQ,
+        MsgSchema {
+            mandatory: [MsgElemType::RADIO_OP_STATE, MsgElemType::RESULT_CODE].into(),
+            optional: [
+                MsgElemType::RETURNED_MESSAGE_ELEMENT,
+                MsgElemType::VENDOR_SPECIFIC_PAYLOAD,
+            ]
+            .into(),
+            // The H3C AX60 sends one Radio Op-State element per radio.
+            allow_multi: [
+                MsgElemType::RADIO_OP_STATE,
+                MsgElemType::RETURNED_MESSAGE_ELEMENT,
+                MsgElemType::VENDOR_SPECIFIC_PAYLOAD,
+            ]
+            .into(),
+            exclusive_groups: vec![],
+            at_least_one: vec![],
+        },
+    );
 
     // 6. WTP Event Request
-    m.insert(MsgType::WTP_EVENT_REQ, MsgSchema {
-        mandatory: [].into(),
-        optional: [
-            MsgElemType::DECRYPT_ERR_REPORT, MsgElemType::DUPLICATE_IPV4_ADDR,
-            MsgElemType::DUPLICATE_IPV6_ADDR, MsgElemType::WTP_RADIO_STATS,
-            MsgElemType::WTP_REBOOT_STATS, MsgElemType::DEL_STATION,
-            MsgElemType::VENDOR_SPECIFIC_PAYLOAD,
-        ].into(),
-        allow_multi: [
-            MsgElemType::DECRYPT_ERR_REPORT, MsgElemType::DUPLICATE_IPV4_ADDR,
-            MsgElemType::DUPLICATE_IPV6_ADDR, MsgElemType::WTP_RADIO_STATS,
-            MsgElemType::WTP_REBOOT_STATS, MsgElemType::DEL_STATION,
-            MsgElemType::VENDOR_SPECIFIC_PAYLOAD,
-        ].into(),
-        exclusive_groups: vec![],
-        at_least_one: vec![
-            [
-                MsgElemType::DECRYPT_ERR_REPORT, MsgElemType::DUPLICATE_IPV4_ADDR,
-                MsgElemType::DUPLICATE_IPV6_ADDR, MsgElemType::WTP_RADIO_STATS,
-                MsgElemType::WTP_REBOOT_STATS, MsgElemType::DEL_STATION,
-                MsgElemType::VENDOR_SPECIFIC_PAYLOAD
-            ].into()
-        ],
-    });
+    m.insert(
+        MsgType::WTP_EVENT_REQ,
+        MsgSchema {
+            mandatory: [].into(),
+            optional: [
+                MsgElemType::DECRYPT_ERR_REPORT,
+                MsgElemType::DUPLICATE_IPV4_ADDR,
+                MsgElemType::DUPLICATE_IPV6_ADDR,
+                MsgElemType::WTP_RADIO_STATS,
+                MsgElemType::WTP_REBOOT_STATS,
+                MsgElemType::DEL_STATION,
+                MsgElemType::VENDOR_SPECIFIC_PAYLOAD,
+            ]
+            .into(),
+            allow_multi: [
+                MsgElemType::DECRYPT_ERR_REPORT,
+                MsgElemType::DUPLICATE_IPV4_ADDR,
+                MsgElemType::DUPLICATE_IPV6_ADDR,
+                MsgElemType::WTP_RADIO_STATS,
+                MsgElemType::WTP_REBOOT_STATS,
+                MsgElemType::DEL_STATION,
+                MsgElemType::VENDOR_SPECIFIC_PAYLOAD,
+            ]
+            .into(),
+            exclusive_groups: vec![],
+            at_least_one: vec![[
+                MsgElemType::DECRYPT_ERR_REPORT,
+                MsgElemType::DUPLICATE_IPV4_ADDR,
+                MsgElemType::DUPLICATE_IPV6_ADDR,
+                MsgElemType::WTP_RADIO_STATS,
+                MsgElemType::WTP_REBOOT_STATS,
+                MsgElemType::DEL_STATION,
+                MsgElemType::VENDOR_SPECIFIC_PAYLOAD,
+            ]
+            .into()],
+        },
+    );
 
     // 7. Echo Request
-    m.insert(MsgType::ECHO_REQ, MsgSchema {
-        mandatory: [].into(),
-        optional: [MsgElemType::VENDOR_SPECIFIC_PAYLOAD].into(),
-        allow_multi: [].into(),
-        exclusive_groups: vec![],
-        at_least_one: vec![],
-    });
+    m.insert(
+        MsgType::ECHO_REQ,
+        MsgSchema {
+            mandatory: [].into(),
+            optional: [MsgElemType::VENDOR_SPECIFIC_PAYLOAD].into(),
+            allow_multi: [].into(),
+            exclusive_groups: vec![],
+            at_least_one: vec![],
+        },
+    );
+
+    // 2. Discovery Response
+    m.insert(
+        MsgType::DISC_RESP,
+        MsgSchema {
+            mandatory: [
+                MsgElemType::AC_DESCRIPTOR,
+                MsgElemType::AC_NAME,
+                MsgElemType::WTP_RADIO_INFO,
+            ]
+            .into(),
+            optional: [MsgElemType::VENDOR_SPECIFIC_PAYLOAD].into(),
+            allow_multi: [MsgElemType::WTP_RADIO_INFO].into(),
+            exclusive_groups: vec![],
+            at_least_one: vec![[
+                MsgElemType::CAPWAP_CTRL_IPV4_ADDR,
+                MsgElemType::CAPWAP_CTRL_IPV6_ADDR,
+            ]
+            .into()],
+        },
+    );
+
+    // 4. Join Response
+    m.insert(
+        MsgType::JOIN_RESP,
+        MsgSchema {
+            mandatory: [
+                MsgElemType::RESULT_CODE,
+                MsgElemType::AC_DESCRIPTOR,
+                MsgElemType::AC_NAME,
+                MsgElemType::WTP_RADIO_INFO,
+            ]
+            .into(),
+            optional: [
+                MsgElemType::AC_IPV4_LIST,
+                MsgElemType::AC_IPV6_LIST,
+                MsgElemType::CAPWAP_TRANSPORT_PROTO,
+                MsgElemType::IMAGE_ID,
+                MsgElemType::MAX_MESSAGE_LEN,
+                MsgElemType::VENDOR_SPECIFIC_PAYLOAD,
+            ]
+            .into(),
+            allow_multi: [MsgElemType::WTP_RADIO_INFO].into(),
+            exclusive_groups: vec![],
+            at_least_one: vec![
+                [
+                    MsgElemType::CAPWAP_CTRL_IPV4_ADDR,
+                    MsgElemType::CAPWAP_CTRL_IPV6_ADDR,
+                ]
+                .into(),
+                [
+                    MsgElemType::CAPWAP_LOCAL_IPV4_ADDR,
+                    MsgElemType::CAPWAP_LOCAL_IPV6_ADDR,
+                ]
+                .into(),
+            ],
+        },
+    );
+
+    // 6. Configuration Status Response
+    m.insert(
+        MsgType::CONFIG_STATUS_RESP,
+        MsgSchema {
+            mandatory: [
+                MsgElemType::CAPWAP_TIMERS,
+                MsgElemType::DECRYPT_ERR_REPORT_PERIOD,
+                MsgElemType::IDLE_TIMEOUT,
+                MsgElemType::WTP_FALLBACK,
+            ]
+            .into(),
+            optional: [
+                MsgElemType::AC_IPV4_LIST,
+                MsgElemType::AC_IPV6_LIST,
+                MsgElemType::WTP_STATIC_IP_ADDR_INFO,
+                MsgElemType::VENDOR_SPECIFIC_PAYLOAD,
+            ]
+            .into(),
+            allow_multi: [MsgElemType::DECRYPT_ERR_REPORT_PERIOD].into(),
+            exclusive_groups: vec![],
+            at_least_one: vec![[MsgElemType::AC_IPV4_LIST, MsgElemType::AC_IPV6_LIST].into()],
+        },
+    );
+
+    // 7. Configuration Update Request (AC->WTP downlink config; same-type elements may repeat).
+    m.insert(
+        MsgType::CONFIG_UPDATE_REQ,
+        MsgSchema {
+            mandatory: [].into(),
+            optional: [
+                MsgElemType::AC_NAME_WITH_PRIORITY,
+                MsgElemType::AC_TIMESTAMP,
+                MsgElemType::ADD_MAC_ACL_ENTRY,
+                MsgElemType::DEL_MAC_ACL_ENTRY,
+                MsgElemType::CAPWAP_TIMERS,
+                MsgElemType::IDLE_TIMEOUT,
+                MsgElemType::LOCATION_DATA,
+                MsgElemType::RADIO_ADMIN_STATE,
+                MsgElemType::STATS_TIMER,
+                MsgElemType::WTP_FALLBACK,
+                MsgElemType::WTP_NAME,
+                MsgElemType::WTP_STATIC_IP_ADDR_INFO,
+                MsgElemType::IMAGE_ID,
+                MsgElemType::VENDOR_SPECIFIC_PAYLOAD,
+            ]
+            .into(),
+            allow_multi: [
+                MsgElemType::ADD_MAC_ACL_ENTRY,
+                MsgElemType::DEL_MAC_ACL_ENTRY,
+                MsgElemType::RADIO_ADMIN_STATE,
+                MsgElemType::WTP_NAME,
+                MsgElemType::VENDOR_SPECIFIC_PAYLOAD,
+            ]
+            .into(),
+            exclusive_groups: vec![],
+            at_least_one: vec![[
+                MsgElemType::AC_NAME_WITH_PRIORITY,
+                MsgElemType::AC_TIMESTAMP,
+                MsgElemType::ADD_MAC_ACL_ENTRY,
+                MsgElemType::DEL_MAC_ACL_ENTRY,
+                MsgElemType::CAPWAP_TIMERS,
+                MsgElemType::IDLE_TIMEOUT,
+                MsgElemType::LOCATION_DATA,
+                MsgElemType::RADIO_ADMIN_STATE,
+                MsgElemType::STATS_TIMER,
+                MsgElemType::WTP_FALLBACK,
+                MsgElemType::WTP_NAME,
+                MsgElemType::WTP_STATIC_IP_ADDR_INFO,
+                MsgElemType::IMAGE_ID,
+                MsgElemType::VENDOR_SPECIFIC_PAYLOAD,
+            ]
+            .into()],
+        },
+    );
+
+    // 8. Configuration Update Response (RFC 8.5)
+    m.insert(
+        MsgType::CONFIG_UPDATE_RESP,
+        MsgSchema {
+            mandatory: [MsgElemType::RESULT_CODE].into(),
+            optional: [
+                MsgElemType::RADIO_OP_STATE,
+                MsgElemType::VENDOR_SPECIFIC_PAYLOAD,
+            ]
+            .into(),
+            allow_multi: [MsgElemType::RADIO_OP_STATE].into(),
+            exclusive_groups: vec![],
+            at_least_one: vec![],
+        },
+    );
+
+    // 10. WTP Event Response (RFC 9.5)
+    m.insert(
+        MsgType::WTP_EVENT_RESP,
+        MsgSchema {
+            mandatory: [].into(),
+            optional: [MsgElemType::VENDOR_SPECIFIC_PAYLOAD].into(),
+            allow_multi: [].into(),
+            exclusive_groups: vec![],
+            at_least_one: vec![],
+        },
+    );
+
+    // 12. Change State Event Response (RFC 8.7)
+    m.insert(
+        MsgType::CHANGE_STATE_EV_RESP,
+        MsgSchema {
+            mandatory: [].into(),
+            optional: [MsgElemType::VENDOR_SPECIFIC_PAYLOAD].into(),
+            allow_multi: [].into(),
+            exclusive_groups: vec![],
+            at_least_one: vec![],
+        },
+    );
+
+    // 14. Echo Response (RFC 7.2)
+    m.insert(
+        MsgType::ECHO_RESP,
+        MsgSchema {
+            mandatory: [].into(),
+            optional: [MsgElemType::VENDOR_SPECIFIC_PAYLOAD].into(),
+            allow_multi: [].into(),
+            exclusive_groups: vec![],
+            at_least_one: vec![],
+        },
+    );
+
+    // 15/16. Image Data Request/Response (RFC 9.1, firmware upgrade)
+    m.insert(
+        MsgType::IMAGE_DATA_REQ,
+        MsgSchema {
+            mandatory: [].into(),
+            optional: [
+                MsgElemType::IMAGE_ID,
+                MsgElemType::INIT_DOWNLOAD,
+                MsgElemType::VENDOR_SPECIFIC_PAYLOAD,
+            ]
+            .into(),
+            allow_multi: [].into(),
+            exclusive_groups: vec![],
+            at_least_one: vec![],
+        },
+    );
+    m.insert(
+        MsgType::IMAGE_DATA_RESP,
+        MsgSchema {
+            mandatory: [MsgElemType::RESULT_CODE].into(),
+            optional: [
+                MsgElemType::IMAGE_INFO,
+                MsgElemType::VENDOR_SPECIFIC_PAYLOAD,
+            ]
+            .into(),
+            allow_multi: [].into(),
+            exclusive_groups: vec![],
+            at_least_one: vec![],
+        },
+    );
+
+    // 17/18. Reset Request/Response (RFC 9.2/9.3)
+    m.insert(
+        MsgType::RESET_REQ,
+        MsgSchema {
+            mandatory: [MsgElemType::IMAGE_ID].into(),
+            optional: [MsgElemType::VENDOR_SPECIFIC_PAYLOAD].into(),
+            allow_multi: [].into(),
+            exclusive_groups: vec![],
+            at_least_one: vec![],
+        },
+    );
+    m.insert(
+        MsgType::RESET_RESP,
+        MsgSchema {
+            mandatory: [].into(),
+            optional: [
+                MsgElemType::RESULT_CODE,
+                MsgElemType::VENDOR_SPECIFIC_PAYLOAD,
+            ]
+            .into(),
+            allow_multi: [].into(),
+            exclusive_groups: vec![],
+            at_least_one: vec![],
+        },
+    );
+
+    // 20. Primary Discovery Response (identical element set to Discovery Response)
+    m.insert(
+        MsgType::PRIMARY_DISC_RESP,
+        m.get(&MsgType::DISC_RESP).unwrap().clone(),
+    );
+
+    // 21/22. Data Transfer Request/Response (RFC 9.6). Mandatory element
+    //   depends on sender: AC sends Data Transfer Mode; WTP sends Data Transfer Data.
+    m.insert(
+        MsgType::DATA_TRANSFER_REQ,
+        MsgSchema {
+            mandatory: [].into(),
+            optional: [
+                MsgElemType::DATA_TRANSFER_MODE,
+                MsgElemType::DATA_TRANSFER_DATA,
+                MsgElemType::VENDOR_SPECIFIC_PAYLOAD,
+            ]
+            .into(),
+            allow_multi: [].into(),
+            exclusive_groups: vec![],
+            at_least_one: vec![],
+        },
+    );
+    m.insert(
+        MsgType::DATA_TRANSFER_RESP,
+        MsgSchema {
+            mandatory: [MsgElemType::RESULT_CODE].into(),
+            optional: [MsgElemType::VENDOR_SPECIFIC_PAYLOAD].into(),
+            allow_multi: [].into(),
+            exclusive_groups: vec![],
+            at_least_one: vec![],
+        },
+    );
+
+    // 23/24. Clear Configuration Request/Response.
+    //   RFC lists no mandatory elements for the request; response confirms by Result Code.
+    m.insert(
+        MsgType::CLEAR_CONFIG_REQ,
+        MsgSchema {
+            mandatory: [].into(),
+            optional: [MsgElemType::VENDOR_SPECIFIC_PAYLOAD].into(),
+            allow_multi: [].into(),
+            exclusive_groups: vec![],
+            at_least_one: vec![],
+        },
+    );
+    m.insert(
+        MsgType::CLEAR_CONFIG_RESP,
+        MsgSchema {
+            mandatory: [MsgElemType::RESULT_CODE].into(),
+            optional: [MsgElemType::VENDOR_SPECIFIC_PAYLOAD].into(),
+            allow_multi: [].into(),
+            exclusive_groups: vec![],
+            at_least_one: vec![],
+        },
+    );
+
+    // 25/26. Station Configuration Request/Response (RFC 10.1/10.2).
+    //   Request has no mandatory elements; Add/Delete Station may repeat.
+    m.insert(
+        MsgType::STATION_CONFIG_REQ,
+        MsgSchema {
+            mandatory: [].into(),
+            optional: [
+                MsgElemType::ADD_STATION,
+                MsgElemType::DEL_STATION,
+                MsgElemType::VENDOR_SPECIFIC_PAYLOAD,
+            ]
+            .into(),
+            allow_multi: [MsgElemType::ADD_STATION, MsgElemType::DEL_STATION].into(),
+            exclusive_groups: vec![],
+            at_least_one: vec![],
+        },
+    );
+    m.insert(
+        MsgType::STATION_CONFIG_RESP,
+        MsgSchema {
+            mandatory: [MsgElemType::RESULT_CODE].into(),
+            optional: [MsgElemType::VENDOR_SPECIFIC_PAYLOAD].into(),
+            allow_multi: [].into(),
+            exclusive_groups: vec![],
+            at_least_one: vec![],
+        },
+    );
 
     m
 });
@@ -547,34 +956,77 @@ impl MsgSchema {
         }
     }
 
-    pub fn validate(&self, m_type: u32, mut data: &[u8]) -> std::result::Result<HashMap<u16, Vec<CwElem>>, CwError> {
+    pub fn validate(
+        &self,
+        m_type: u32,
+        data: &[u8],
+    ) -> std::result::Result<HashMap<u16, Vec<CwElem>>, CwError> {
+        self.validate_impl(m_type, data, true)
+    }
+
+    /// Validate but tolerate elements not declared in `mandatory`/`optional`:
+    /// they are parsed as `Unknown` and skipped instead of hard-failing. Vendor
+    /// WTPs (e.g. H3C AX60) set many private elements inside Join/Config
+    /// requests, so strict RFC schema checking is impractical for them.
+    pub fn validate_lenient(
+        &self,
+        m_type: u32,
+        data: &[u8],
+    ) -> std::result::Result<HashMap<u16, Vec<CwElem>>, CwError> {
+        self.validate_impl(m_type, data, false)
+    }
+
+    fn validate_impl(
+        &self,
+        _m_type: u32,
+        mut data: &[u8],
+        strict: bool,
+    ) -> std::result::Result<HashMap<u16, Vec<CwElem>>, CwError> {
         let mut results: HashMap<u16, Vec<CwElem>> = HashMap::new();
         let mut seen_ids = HashSet::new();
 
         while !data.is_empty() {
             if data.len() < 4 {
-                return Err(CwError { code: CwResult::InvalidElement, msg: "tlv truncated".into() });
+                return Err(CwError {
+                    code: CwResult::InvalidElement,
+                    msg: "tlv truncated".into(),
+                });
             }
 
             let id = u16::from_be_bytes([data[0], data[1]]);
             let len = u16::from_be_bytes([data[2], data[3]]) as usize;
 
             if data.len() < 4 + len {
-                return Err(CwError { code: CwResult::InvalidElement, msg: format!("elem {} len mismatch", id) });
+                return Err(CwError {
+                    code: CwResult::InvalidElement,
+                    msg: format!("elem {} len mismatch", id),
+                });
             }
 
-            if !self.mandatory.contains(&id) && !self.optional.contains(&id) {
-                return Err(CwError { code: CwResult::UnrecognizedMsg, msg: format!("unexpected elem {}", id) });
+            let body = &data[4..4 + len];
+            let known = self.mandatory.contains(&id) || self.optional.contains(&id);
+
+            // Unknown element: hard-fail in strict mode, otherwise record it as
+            // Unknown (for logging) and skip the constraint bookkeeping.
+            if !known {
+                if strict {
+                    return Err(CwError {
+                        code: CwResult::UnrecognizedMsg,
+                        msg: format!("unexpected elem {}", id),
+                    });
+                }
+                let elem = self.decode_elem(id, body)?;
+                results.entry(id).or_default().push(elem);
+                data = &data[4 + len..];
+                continue;
             }
 
             if seen_ids.contains(&id) && !self.allow_multi.contains(&id) {
                 return Err(CwError {
                     code: CwResult::InvalidElement,
-                    msg: format!("elem {} appeared multiple times but not allowed", id)
+                    msg: format!("elem {} appeared multiple times but not allowed", id),
                 });
             }
-
-            let body = &data[4..4 + len];
 
             let elem = self.decode_elem(id, body)?;
             results.entry(id).or_default().push(elem);
@@ -583,20 +1035,25 @@ impl MsgSchema {
             data = &data[4 + len..];
         }
 
-        self.check_constraints(&seen_ids)?;
+        self.check_constraints(&seen_ids, strict)?;
         Ok(results)
     }
 
-    pub(crate) fn parse_raw_tlvs(&self, mut data: &[u8]) -> std::result::Result<HashMap<u16, Vec<CwElem>>, CwError> {
-        let mut map: HashMap<u16, Vec<CwElem>>= HashMap::new();
+    pub(crate) fn parse_raw_tlvs(
+        &self,
+        mut data: &[u8],
+    ) -> std::result::Result<HashMap<u16, Vec<CwElem>>, CwError> {
+        let mut map: HashMap<u16, Vec<CwElem>> = HashMap::new();
         while data.len() >= 4 {
             let id = u16::from_be_bytes([data[0], data[1]]);
             let len = u16::from_be_bytes([data[2], data[3]]) as usize;
-            if data.len() < 4 + len { break; }
+            if data.len() < 4 + len {
+                break;
+            }
 
-            let elem = self.decode_elem(id, &data[4..4+len])?;
+            let elem = self.decode_elem(id, &data[4..4 + len])?;
             map.entry(id).or_default().push(elem);
-            data = &data[4+len..];
+            data = &data[4 + len..];
         }
         Ok(map)
     }
@@ -608,20 +1065,25 @@ impl MsgSchema {
             MsgElemType::WTP_NAME => {
                 let name = String::from_utf8_lossy(data).trim_matches('\0').to_string();
                 Ok(CwElem::WtpName(name))
-            },
+            }
 
             MsgElemType::WTP_DESCRIPTOR if data.len() >= 8 => {
                 let hw = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
                 let sw = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
-                Ok(CwElem::WtpDescriptor { hardware: hw, software: sw })
-            },
-
-            MsgElemType::RADIO_OP_STATE if data.len() >= 2 => {
-                Ok(CwElem::RadioOp { radio_id: data[0], state: data[1] })
+                Ok(CwElem::WtpDescriptor {
+                    hardware: hw,
+                    software: sw,
+                })
             }
 
+            MsgElemType::RADIO_OP_STATE if data.len() >= 2 => Ok(CwElem::RadioOp {
+                radio_id: data[0],
+                state: data[1],
+            }),
+
             MsgElemType::AC_IPV4_LIST => {
-                let addrs = data.chunks_exact(4)
+                let addrs = data
+                    .chunks_exact(4)
                     .map(|chunk| Ipv4Addr::new(chunk[0], chunk[1], chunk[2], chunk[3]))
                     .collect();
                 Ok(CwElem::ACIp4List(addrs))
@@ -640,23 +1102,47 @@ impl MsgSchema {
         }
     }
 
-    fn check_constraints(&self, seen_ids: &HashSet<u16>) -> std::result::Result<(), CwError> {
+    // Constraint checks are strict RFC guarantees. In lenient mode they are
+    // skipped entirely: vendor WTPs may omit the mandatory set and pack many
+    // private elements that are not tracked in `seen_ids` (so the RFC
+    // at-least-one / exclusive groups cannot be evaluated reliably).
+    fn check_constraints(
+        &self,
+        seen_ids: &HashSet<u16>,
+        strict: bool,
+    ) -> std::result::Result<(), CwError> {
+        if !strict {
+            return Ok(());
+        }
         for id in &self.mandatory {
             if !seen_ids.contains(id) {
-                return Err(CwError { code: CwResult::MissingElement, msg: format!("missing mandatory {}", id) });
+                return Err(CwError {
+                    code: CwResult::MissingElement,
+                    msg: format!("missing mandatory {}", id),
+                });
             }
         }
 
         for group in &self.at_least_one {
             if !group.iter().any(|id| seen_ids.contains(id)) {
-                return Err(CwError { code: CwResult::MissingElement, msg: "at least one required in group".into() });
+                return Err(CwError {
+                    code: CwResult::MissingElement,
+                    msg: "at least one required in group".into(),
+                });
             }
         }
 
         for group in &self.exclusive_groups {
             if group.iter().filter(|id| seen_ids.contains(id)).count() > 1 {
-                let conflicts: Vec<u16> = group.iter().filter(|id| seen_ids.contains(id)).cloned().collect();
-                return Err(CwError { code: CwResult::InvalidElement, msg: format!("exclusive conflict: {:?}", conflicts) });
+                let conflicts: Vec<u16> = group
+                    .iter()
+                    .filter(|id| seen_ids.contains(id))
+                    .cloned()
+                    .collect();
+                return Err(CwError {
+                    code: CwResult::InvalidElement,
+                    msg: format!("exclusive conflict: {:?}", conflicts),
+                });
             }
         }
 
@@ -673,28 +1159,31 @@ mod tests {
         // Build a Join-Request-like schema.
         let schema = MsgSchema {
             mandatory: HashSet::new(), // empty so the test focuses on at_least_one
-            optional: [MsgElemType::CAPWAP_LOCAL_IPV4_ADDR, MsgElemType::CAPWAP_LOCAL_IPV6_ADDR].into(),
+            optional: [
+                MsgElemType::CAPWAP_LOCAL_IPV4_ADDR,
+                MsgElemType::CAPWAP_LOCAL_IPV6_ADDR,
+            ]
+            .into(),
             allow_multi: HashSet::new(),
-            at_least_one: vec![
-                [MsgElemType::CAPWAP_LOCAL_IPV4_ADDR, MsgElemType::CAPWAP_LOCAL_IPV6_ADDR].into()
-            ],
+            exclusive_groups: Vec::new(),
+            at_least_one: vec![[
+                MsgElemType::CAPWAP_LOCAL_IPV4_ADDR,
+                MsgElemType::CAPWAP_LOCAL_IPV6_ADDR,
+            ]
+            .into()],
         };
 
-        // Case 1: IPv4 present (ok)
-        let data_ipv4 = vec![
-            0, 11, 0, 4, 192, 168, 1, 1, // ID=11 (IPv4), Len=4
-        ];
-        assert!(schema.validate(&data_ipv4).is_ok());
+        // Case 1: IPv4 present (ok)  [CAPWAP_LOCAL_IPV4_ADDR=30]
+        let data_ipv4 = vec![0, 30, 0, 4, 192, 168, 1, 1];
+        assert!(schema.validate(0, &data_ipv4).is_ok());
 
-        // Case 2: IPv6 present (ok)
-        let data_ipv6 = vec![
-            0, 12, 0, 16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, // ID=12 (IPv6), Len=16
-        ];
-        assert!(schema.validate(&data_ipv6).is_ok());
+        // Case 2: IPv6 present (ok)  [CAPWAP_LOCAL_IPV6_ADDR=50]
+        let data_ipv6 = vec![0, 50, 0, 16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        assert!(schema.validate(0, &data_ipv6).is_ok());
 
         // Case 3: neither present (fails)
         let data_empty = vec![];
-        let result = schema.validate(&data_empty);
+        let result = schema.validate(0, &data_empty);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("at least one"));
 
@@ -703,7 +1192,7 @@ mod tests {
             0, 39, 0, 4, 1, 2, 3, 4, // ID=39 (Vendor Specific)
         ];
         // 39 is not in optional/mandatory, so validate reports "not allowed" first.
-        let result = schema.validate(&data_wrong);
+        let result = schema.validate(0, &data_wrong);
         assert!(result.is_err());
     }
 
@@ -712,19 +1201,65 @@ mod tests {
         // Model a WTP Event Request: at least one of several error reports is required.
         let schema = MsgSchema {
             mandatory: HashSet::new(),
-            optional: [MsgElemType::DUPLICATE_IPV4_ADDR, MsgElemType::WTP_RADIO_STATS].into(),
-            allow_multi: [MsgElemType::WTP_RADIO_STATS].into(),
-            at_least_one: vec![
-                [MsgElemType::DUPLICATE_IPV4_ADDR, MsgElemType::WTP_RADIO_STATS].into()
-            ],
+            optional: [
+                MsgElemType::DUPLICATE_IPV4_ADDR,
+                MsgElemType::WTP_REBOOT_STATS,
+            ]
+            .into(),
+            allow_multi: [MsgElemType::WTP_REBOOT_STATS].into(),
+            exclusive_groups: Vec::new(),
+            at_least_one: vec![[
+                MsgElemType::DUPLICATE_IPV4_ADDR,
+                MsgElemType::WTP_REBOOT_STATS,
+            ]
+            .into()],
         };
 
-        // Two same-type repeatable elements (ok)
+        // Two same-type repeatable elements (ok)  [WTP_REBOOT_STATS=48]
         let data = vec![
-            0, 48, 0, 2, 0, 1, // Radio Stats 1
-            0, 48, 0, 2, 0, 2, // Radio Stats 2
+            0, 48, 0, 2, 0, 1, // Reboot Stats 1
+            0, 48, 0, 2, 0, 2, // Reboot Stats 2
         ];
-        let res = schema.validate(&data).unwrap();
+        let res = schema.validate(0, &data).unwrap();
         assert_eq!(res.get(&48).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn all_control_messages_have_schemas() {
+        let ids = [
+            MsgType::DISC_REQ,
+            MsgType::DISC_RESP,
+            MsgType::JOIN_REQ,
+            MsgType::JOIN_RESP,
+            MsgType::CONFIG_STATUS_REQ,
+            MsgType::CONFIG_STATUS_RESP,
+            MsgType::CONFIG_UPDATE_REQ,
+            MsgType::CONFIG_UPDATE_RESP,
+            MsgType::WTP_EVENT_REQ,
+            MsgType::WTP_EVENT_RESP,
+            MsgType::CHANGE_STATE_EV_REQ,
+            MsgType::CHANGE_STATE_EV_RESP,
+            MsgType::ECHO_REQ,
+            MsgType::ECHO_RESP,
+            MsgType::IMAGE_DATA_REQ,
+            MsgType::IMAGE_DATA_RESP,
+            MsgType::RESET_REQ,
+            MsgType::RESET_RESP,
+            MsgType::PRIMARY_DISC_REQ,
+            MsgType::PRIMARY_DISC_RESP,
+            MsgType::DATA_TRANSFER_REQ,
+            MsgType::DATA_TRANSFER_RESP,
+            MsgType::CLEAR_CONFIG_REQ,
+            MsgType::CLEAR_CONFIG_RESP,
+            MsgType::STATION_CONFIG_REQ,
+            MsgType::STATION_CONFIG_RESP,
+        ];
+        for id in ids {
+            assert!(
+                MSG_SCHEMAS.contains_key(&id),
+                "missing schema for msg type {}",
+                id
+            );
+        }
     }
 }
