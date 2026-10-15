@@ -23,7 +23,7 @@ use tokio::net::TcpListener;
 use crate::device::{self, DeviceStore};
 use crate::firmware::{FirmwareStore, UpgradeCmd, UpgradeRegistry};
 use crate::logx;
-use crate::radio::RadioStore;
+use crate::radio::{H3cRadioHeader, RadioStore, RadioWlan};
 use crate::security::ProfileStore;
 use crate::station::StationStore;
 
@@ -105,6 +105,11 @@ fn router(state: Arc<AppData>) -> Router {
         .route("/api/devices/{mac}", get(get_device).put(update_device))
         .route("/api/devices/{mac}/approve", post(approve_device))
         .route("/api/radios", get(list_radios))
+        .route("/api/devices/{mac}/wlans", get(list_device_wlans).post(set_device_wlan))
+        .route(
+            "/api/devices/{mac}/radios/{radio_id}",
+            get(get_radio_h3c_header).put(set_radio_h3c_header),
+        )
         .route("/api/stations", get(list_stations))
         .route("/api/profiles", get(list_profiles).post(create_profile))
         .route("/api/firmware", get(list_firmware).post(upload_firmware))
@@ -372,6 +377,230 @@ async fn list_radios(
     Ok(Json(out))
 }
 
+#[derive(Serialize)]
+struct RadioWlanDto {
+    mac: String,
+    radio_id: u8,
+    wlan_id: u8,
+    ssid: String,
+    security: String,
+    psk: Option<String>,
+    wlan_enable: bool,
+    isolate: bool,
+    broadcast: bool,
+    client_count: u32,
+    vlan_id: u32,
+    cipher: u32,
+    rekey_period: u32,
+}
+
+fn serde_default_true() -> bool {
+    true
+}
+
+fn serde_default_cipher() -> u32 {
+    2
+}
+
+#[derive(Deserialize)]
+struct RadioWlanReq {
+    radio_id: u8,
+    wlan_id: Option<u8>,
+    ssid: String,
+    security: String,
+    psk: Option<String>,
+    /// H3C 0xfde8 record fields; optional with DB-matching defaults
+    /// (record up, SSID visible, AES cipher).
+    #[serde(default = "serde_default_true")]
+    wlan_enable: bool,
+    #[serde(default)]
+    isolate: bool,
+    #[serde(default = "serde_default_true")]
+    broadcast: bool,
+    #[serde(default)]
+    client_count: u32,
+    #[serde(default)]
+    vlan_id: u32,
+    #[serde(default = "serde_default_cipher")]
+    cipher: u32,
+    #[serde(default)]
+    rekey_period: u32,
+}
+
+/// List the per-radio WLAN configurations pushed to a WTP.
+async fn list_device_wlans(
+    State(st): State<Arc<AppData>>,
+    Path(mac): Path<String>,
+) -> Result<Json<Vec<RadioWlanDto>>, ApiError> {
+    let mac = device::mac_from_str(&mac).map_err(ApiError::from)?;
+    let wlans = st.radios.list_wlans(mac)?;
+    Ok(Json(
+        wlans
+            .iter()
+            .map(|w| RadioWlanDto {
+                mac: device::mac_to_str(w.mac),
+                radio_id: w.radio_id,
+                wlan_id: w.wlan_id,
+                ssid: w.ssid.clone(),
+                security: w.security.clone(),
+                psk: w.psk.clone(),
+                wlan_enable: w.wlan_enable,
+                isolate: w.isolate,
+                broadcast: w.broadcast,
+                client_count: w.client_count,
+                vlan_id: w.vlan_id,
+                cipher: w.cipher,
+                rekey_period: w.rekey_period,
+            })
+            .collect(),
+    ))
+}
+
+/// Set (insert or overwrite) a per-radio WLAN configuration for a WTP. The new
+/// value takes effect on the WTP's next Configure-phase push.
+async fn set_device_wlan(
+    State(st): State<Arc<AppData>>,
+    Path(mac): Path<String>,
+    Json(req): Json<RadioWlanReq>,
+) -> Result<Json<RadioWlanDto>, ApiError> {
+    let mac = device::mac_from_str(&mac).map_err(ApiError::from)?;
+    if crate::config::SecurityMethod::from_policy(&req.security).is_none() {
+        return Err(ApiError {
+            status: StatusCode::BAD_REQUEST,
+            msg: format!(
+                "invalid security method '{}' (open|wpa2|wpa3|wpa2-wpa3)",
+                req.security
+            ),
+        });
+    }
+    // PSK policy requires an 8..63 char passphrase; open allows none and
+    // ignores any supplied key.
+    let is_open = req.security == "open";
+    if !is_open {
+        let len = req.psk.as_deref().map(str::len).unwrap_or(0);
+        if !(8..=63).contains(&len) {
+            return Err(ApiError {
+                status: StatusCode::BAD_REQUEST,
+                msg: "psk must be 8..63 characters for a secured network".into(),
+            });
+        }
+    }
+    let wlan_id = req.wlan_id.unwrap_or(1);
+    st.radios
+        .set_wlan(&RadioWlan {
+            mac,
+            radio_id: req.radio_id,
+            wlan_id,
+            ssid: req.ssid.clone(),
+            security: req.security.clone(),
+            psk: if is_open { None } else { req.psk.clone() },
+            wlan_enable: req.wlan_enable,
+            isolate: req.isolate,
+            broadcast: req.broadcast,
+            client_count: req.client_count,
+            vlan_id: req.vlan_id,
+            cipher: req.cipher,
+            rekey_period: req.rekey_period,
+        })?;
+    logx::admin(format!(
+        "WLAN config set for {} radio {}: ssid={}, security={}, broadcast={}, cipher={}",
+        device::mac_to_str(mac),
+        req.radio_id,
+        req.ssid,
+        req.security,
+        req.broadcast,
+        req.cipher
+    ));
+    Ok(Json(RadioWlanDto {
+        mac: device::mac_to_str(mac),
+        radio_id: req.radio_id,
+        wlan_id,
+        ssid: req.ssid,
+        security: req.security,
+        psk: if is_open { None } else { req.psk },
+        wlan_enable: req.wlan_enable,
+        isolate: req.isolate,
+        broadcast: req.broadcast,
+        client_count: req.client_count,
+        vlan_id: req.vlan_id,
+        cipher: req.cipher,
+        rekey_period: req.rekey_period,
+    }))
+}
+
+#[derive(Serialize)]
+struct H3cRadioHeaderDto {
+    radio_id: u8,
+    enable: bool,
+    power: u32,
+    mode: u32,
+    channel: u32,
+}
+
+impl From<H3cRadioHeader> for H3cRadioHeaderDto {
+    fn from(h: H3cRadioHeader) -> Self {
+        H3cRadioHeaderDto {
+            radio_id: h.radio_id,
+            enable: h.enable,
+            power: h.power,
+            mode: h.mode,
+            channel: h.channel,
+        }
+    }
+}
+
+/// H3C band-header config body; absent fields keep the stored value.
+#[derive(Deserialize)]
+struct H3cRadioHeaderPatch {
+    enable: Option<bool>,
+    power: Option<u32>,
+    mode: Option<u32>,
+    channel: Option<u32>,
+}
+
+/// Read a radio's H3C 0xfde8 band-header config (defaults when never stored).
+async fn get_radio_h3c_header(
+    State(st): State<Arc<AppData>>,
+    Path((mac, radio_id)): Path<(String, u8)>,
+) -> Result<Json<H3cRadioHeaderDto>, ApiError> {
+    let mac = device::mac_from_str(&mac).map_err(ApiError::from)?;
+    let h = st.radios.h3c_header(mac, radio_id)?;
+    Ok(Json(h.into()))
+}
+
+/// Update a radio's H3C 0xfde8 band-header config (enable/power/mode/channel).
+async fn set_radio_h3c_header(
+    State(st): State<Arc<AppData>>,
+    Path((mac, radio_id)): Path<(String, u8)>,
+    Json(p): Json<H3cRadioHeaderPatch>,
+) -> Result<Json<H3cRadioHeaderDto>, ApiError> {
+    let mac = device::mac_from_str(&mac).map_err(ApiError::from)?;
+    let mut h = st.radios.h3c_header(mac, radio_id)?;
+    if let Some(v) = p.enable {
+        h.enable = v;
+    }
+    if let Some(v) = p.power {
+        h.power = v;
+    }
+    if let Some(v) = p.mode {
+        h.mode = v;
+    }
+    if let Some(v) = p.channel {
+        h.channel = v;
+    }
+    st.radios.set_h3c_header(mac, &h)?;
+    logx::admin(format!(
+        "H3C radio header set for {} radio {}: enable={}, power={}, mode={}, channel={}",
+        device::mac_to_str(mac),
+        h.radio_id,
+        h.enable,
+        h.power,
+        h.mode,
+        h.channel
+    ));
+    Ok(Json(h.into()))
+}
+
 #[derive(Deserialize)]
 struct StationFilter {
     mac: Option<String>,
@@ -604,5 +833,66 @@ mod tests {
         let d = state.devices.get([1, 2, 3, 4, 5, 6]).unwrap().unwrap();
         assert_eq!(d.name, "Hall-AP");
         assert_eq!(d.description, "lobby");
+    }
+
+    #[tokio::test]
+    async fn radio_wlan_set_and_list() {
+        let state = test_state();
+        let mac = device::mac_to_str([1, 2, 3, 4, 5, 6]);
+        let body = serde_json::json!({
+            "radio_id": 1,
+            "ssid": "minimac",
+            "security": "wpa2-wpa3",
+            "psk": "person0finterest"
+        })
+        .to_string();
+        let app = router(state.clone());
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/devices/{mac}/wlans"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let wlans = state.radios.list_wlans([1, 2, 3, 4, 5, 6]).unwrap();
+        assert_eq!(wlans.len(), 1);
+        assert_eq!(wlans[0].ssid, "minimac");
+        assert_eq!(wlans[0].security, "wpa2-wpa3");
+        assert_eq!(wlans[0].psk.as_deref(), Some("person0finterest"));
+        // Omitted record fields fall back to the DB defaults: record up,
+        // SSID visible, AES cipher, no isolation/limit/vlan/rekey.
+        assert_eq!(wlans[0].wlan_enable, true);
+        assert_eq!(wlans[0].isolate, false);
+        assert_eq!(wlans[0].broadcast, true);
+        assert_eq!(wlans[0].client_count, 0);
+        assert_eq!(wlans[0].vlan_id, 0);
+        assert_eq!(wlans[0].cipher, 2);
+        assert_eq!(wlans[0].rekey_period, 0);
+        // Invalid security policy is rejected.
+        let bad = serde_json::json!({
+            "radio_id": 2,
+            "ssid": "x",
+            "security": "wep-64",
+            "psk": "person0finterest"
+        })
+        .to_string();
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/devices/{mac}/wlans"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(bad))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
     }
 }

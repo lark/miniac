@@ -2,9 +2,12 @@
 //!
 //! Copyright (c) 2026  Wang Jian
 //!
-//! CAPWAP carries DTLS on the control port inside a 4-byte framing header whose
-//! first byte is 1. Inbound frames are stripped of that header before being fed
-//! to the Endpoint; outbound DTLS records are prefixed with [1,0,0,0].
+//! CAPWAP carries DTLS on the control port. RFC 5415 §4.1/§4.2 prefix every
+//! DTLS-carried datagram with the 4-byte CAPWAP DTLS Header: the CAPWAP Preamble
+//! (Version 0, Type 1 = "CAPWAP DTLS Header") followed by 24 reserved zero bits,
+//! i.e. [1,0,0,0]. Inbound datagrams are stripped of it before being fed to the
+//! Endpoint, and outbound DTLS records are prefixed with it. This framing is
+//! standard and uniform across vendors and profiles.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -18,8 +21,10 @@ use rtc_shared::TransportProtocol;
 use tokio::net::UdpSocket;
 use tracing::warn;
 
-/// Framing header byte identifying a DTLS packet inside the CAPWAP control stream.
-const DTLS_FRAME_MARKER: u8 = 1;
+/// First byte of the CAPWAP DTLS Header (RFC 5415 §4.1 CAPWAP Preamble): Version
+/// 0 in the high nibble, Type 1 in the low nibble ("CAPWAP DTLS Header follows
+/// the UDP header"). The trailing 3 bytes are the zeroed 24-bit Reserved field.
+const CAPWAP_DTLS_PREAMBLE: u8 = 1;
 
 pub struct CapwapDtls {
     endpoint: Endpoint,
@@ -53,7 +58,7 @@ impl CapwapDtls {
                 warn!("outgoing DTLS record too large: {} bytes", msg.len());
             }
             let mut pkt = Vec::with_capacity(msg.len() + 4);
-            pkt.extend_from_slice(&[DTLS_FRAME_MARKER, 0, 0, 0]);
+            pkt.extend_from_slice(&[CAPWAP_DTLS_PREAMBLE, 0, 0, 0]);
             pkt.extend_from_slice(&msg);
             self.socket
                 .send_to(&pkt, self.peer)
@@ -66,7 +71,7 @@ impl CapwapDtls {
     /// Feeds one inbound CAPWAP frame into the DTLS state machine and returns
     /// any decrypted application data it produced.
     pub async fn feed(&mut self, pkt: &[u8]) -> Result<Vec<BytesMut>> {
-        let body = if pkt.len() >= 4 && pkt[0] == DTLS_FRAME_MARKER {
+        let body = if pkt.len() >= 4 && pkt[0] == CAPWAP_DTLS_PREAMBLE {
             &pkt[4..]
         } else {
             pkt
@@ -84,7 +89,10 @@ impl CapwapDtls {
         for event in events {
             match event {
                 EndpointEvent::HandshakeComplete => self.handshake_complete = true,
-                EndpointEvent::ApplicationData(data) => app_data.push(data),
+                EndpointEvent::ApplicationData(data) => {
+                    crate::dump::write("RX", &data);
+                    app_data.push(data)
+                }
                 _ => {}
             }
         }
@@ -94,6 +102,7 @@ impl CapwapDtls {
 
     /// Sends one application-data message over the DTLS association.
     pub async fn write(&mut self, data: &[u8]) -> Result<()> {
+        crate::dump::write("TX", data);
         self.endpoint
             .write(Instant::now(), self.peer, data)
             .context("DTLS write")?;

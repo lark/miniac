@@ -56,6 +56,22 @@ pub struct Radio {
     pub wlans: Vec<Wlan>,
 }
 
+/// Runtime view of a client station associated to this WTP, maintained in memory
+/// from Station Configuration Request (Add/Delete Station) notifications. The
+/// AC-only/controller info mirrors what is persisted to the `stations` table.
+#[allow(unused)]
+#[derive(Debug, Clone)]
+pub struct RuntimeStation {
+    pub mac: [u8; 6],
+    pub radio_id: u8,
+    pub wlan_id: u8,
+    pub ssid: Option<String>,
+    pub rssi: Option<i32>,
+    pub ip: Option<String>,
+    pub state: String,
+    pub associated_at: u64,
+}
+
 pub struct LastSentInfo {
     pub buf: Vec<u8>,
     pub seq: u32,
@@ -80,6 +96,10 @@ pub struct WtpContext {
     pub boot_version: u32,
 
     pub radios: Vec<Radio>,
+
+    /// Runtime client-station table, filled from Add/Delete Station
+    /// (STATION_CONFIG_REQ) after the link enters the Run state.
+    pub stations: Vec<RuntimeStation>,
 
     pub led_enabled: bool,
     pub session_id: u64,
@@ -240,6 +260,7 @@ impl WtpContext {
             software_version: 0,
             boot_version: 0,
             radios: Vec::new(),
+            stations: Vec::new(),
             led_enabled: true,
             session_id: 0,
             last_seen: Instant::now(),
@@ -270,6 +291,28 @@ impl WtpContext {
         let seq = self.seq_counter;
         self.seq_counter = self.seq_counter.wrapping_add(1);
         seq
+    }
+
+    /// Add or refresh a station in the runtime table (Add Station notification).
+    /// `associated_at` is only applied on a first sighting so a refresh does not
+    /// move the association timestamp.
+    pub fn add_station(&mut self, st: RuntimeStation) {
+        match self.stations.iter_mut().find(|s| s.mac == st.mac) {
+            Some(existing) => {
+                existing.radio_id = st.radio_id;
+                existing.wlan_id = st.wlan_id;
+                existing.ssid = st.ssid;
+                existing.rssi = st.rssi;
+                existing.ip = st.ip;
+                existing.state = st.state;
+            }
+            None => self.stations.push(st),
+        }
+    }
+
+    /// Drop a station from the runtime table (Delete Station notification).
+    pub fn remove_station(&mut self, mac: [u8; 6]) {
+        self.stations.retain(|s| s.mac != mac);
     }
 }
 
@@ -941,6 +984,20 @@ pub static MSG_SCHEMAS: Lazy<HashMap<u32, MsgSchema>> = Lazy::new(|| {
         },
     );
 
+    // 145. H3C AX60 channel-utilization report (WTP -> AC). No RFC schema: the
+    //   0xfe20 element is kept as Unknown and acked with mtype 146 in Run state
+    //   (see `vendor::h3c::WTP_CHAN_UTIL_REQ`).
+    m.insert(
+        crate::vendor::h3c::WTP_CHAN_UTIL_REQ,
+        MsgSchema {
+            mandatory: [].into(),
+            optional: [].into(),
+            allow_multi: [].into(),
+            exclusive_groups: vec![],
+            at_least_one: vec![],
+        },
+    );
+
     m
 });
 
@@ -1261,5 +1318,31 @@ mod tests {
                 id
             );
         }
+    }
+
+    #[test]
+    fn runtime_station_upsert_and_remove() {
+        let mut ctx = WtpContext::new("127.0.0.1:5000".parse().unwrap());
+        let st = RuntimeStation {
+            mac: [1, 2, 3, 4, 5, 6],
+            radio_id: 1,
+            wlan_id: 1,
+            ssid: Some("minimac".into()),
+            rssi: None,
+            ip: None,
+            state: "associated".into(),
+            associated_at: 0,
+        };
+        ctx.add_station(st.clone());
+        assert_eq!(ctx.stations.len(), 1);
+        // A refresh updates the same entry (no duplicate).
+        ctx.add_station(RuntimeStation {
+            rssi: Some(-48),
+            ..st.clone()
+        });
+        assert_eq!(ctx.stations.len(), 1);
+        assert_eq!(ctx.stations[0].rssi, Some(-48));
+        ctx.remove_station([1, 2, 3, 4, 5, 6]);
+        assert!(ctx.stations.is_empty());
     }
 }

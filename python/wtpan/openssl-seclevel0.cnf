@@ -1,0 +1,13 @@
+# OpenSSL system-default configuration for wtpan: lower the default security
+# level so the AX60 1024-bit RSA client key can be loaded and used for the
+# DTLS 1.2 handshake (OpenSSL 3.x rejects it at the default SECLEVEL=1).
+openssl_conf = openssl_init
+
+[openssl_init]
+ssl_conf = ssl_sect
+
+[ssl_sect]
+system_default = system_default_sect
+
+[system_default_sect]
+CipherString = DEFAULT@SECLEVEL=0

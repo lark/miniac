@@ -8,6 +8,7 @@ mod connection;
 mod db;
 mod device;
 mod dtls_local;
+mod dump;
 mod elements;
 mod firmware;
 mod logx;
@@ -43,19 +44,22 @@ const HTTP_DEFAULT_PORT: &str = "8080";
 const FRAME: vendor::framing::CtrlFrame = vendor::framing::CtrlFrame::H3c;
 
 /// Command-line settings: `-a` (repeatable) names the CAPWAP control bind
-/// addresses (the control port 5246 is fixed by RFC 5415), and `-l` gives the
-/// web/API listen address (`ip[:port]` or `:port`).
+/// addresses (the control port 5246 is fixed by RFC 5415), `-l` gives the
+/// web/API listen address (`ip[:port]` or `:port`), and `-D <file>` enables
+/// plaintext control-message dumping for offline replay analysis.
 struct Cli {
     control_ips: Vec<String>,
     http_listen: Option<String>,
+    dump_file: Option<String>,
 }
 
-/// Value picked up from `-a` / `-l` flags. Unknown flags are ignored. With no
-/// `-a`, the control plane defaults to all interfaces (0.0.0.0).
+/// Value picked up from `-a` / `-l` / `-D` flags. Unknown flags are ignored.
+/// With no `-a`, the control plane defaults to all interfaces (0.0.0.0).
 fn parse_cli() -> Cli {
     let mut cli = Cli {
         control_ips: Vec::new(),
         http_listen: None,
+        dump_file: None,
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -68,6 +72,11 @@ fn parse_cli() -> Cli {
             "-l" => {
                 if let Some(addr) = args.next() {
                     cli.http_listen = Some(addr);
+                }
+            }
+            "-D" => {
+                if let Some(path) = args.next() {
+                    cli.dump_file = Some(path);
                 }
             }
             _ => {}
@@ -128,9 +137,18 @@ fn add_ip(ip: std::net::Ipv4Addr, delta: u32) -> std::net::Ipv4Addr {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt().with_target(true).init();
+    // Honor RUST_LOG (e.g. RUST_LOG=debug) for runtime message-level tracing.
+    tracing_subscriber::fmt()
+        .with_target(true)
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .init();
 
     let cli = parse_cli();
+
+    if let Some(dump_path) = &cli.dump_file {
+        dump::open(dump_path)?;
+        info!("[*] plaintext control dump -> {dump_path}");
+    }
 
     let dtls_config = generate_dtls_config()?;
 
@@ -139,7 +157,7 @@ async fn main() -> Result<()> {
 
     let db = Arc::new(db::Db::open("miniac.db")?);
     let devices = Arc::new(device::DeviceStore::new(db.clone()));
-    let _radios = Arc::new(radio::RadioStore::new(db.clone())); // wired once radio-info parsing lands
+    let radios = Arc::new(radio::RadioStore::new(db.clone()));
     let stations = Arc::new(station::StationStore::new(db.clone()));
     let profiles = Arc::new(security::ProfileStore::new(db.clone())); // 802.1X / RSN policy store
     let fw = Arc::new(firmware::FirmwareStore::with_root(db.clone(), "firmware")); // image catalog + upgrade audit
@@ -153,7 +171,7 @@ async fn main() -> Result<()> {
     let http_addr = resolve_http_addr(cli.http_listen);
     let web_state = std::sync::Arc::new(web::AppData::new(
         devices.clone(),
-        _radios,
+        radios.clone(),
         stations.clone(),
         profiles.clone(),
         fw.clone(),
@@ -219,6 +237,7 @@ async fn main() -> Result<()> {
             dispatcher_map.clone(),
             dtls_config.clone(),
             devices.clone(),
+            radios.clone(),
             stations.clone(),
             fw.clone(),
             upgrade_reg.clone(),
@@ -240,6 +259,7 @@ async fn run_control_socket(
     dispatcher_map: Arc<Mutex<HashMap<SocketAddr, mpsc::Sender<Vec<u8>>>>>,
     dtls_config: Arc<rtc_dtls::config::HandshakeConfig>,
     devices: Arc<device::DeviceStore>,
+    radios: Arc<radio::RadioStore>,
     stations: Arc<station::StationStore>,
     fw: Arc<firmware::FirmwareStore>,
     upgrade_reg: Arc<firmware::UpgradeRegistry>,
@@ -299,6 +319,7 @@ async fn run_control_socket(
                 &socket,
                 &dtls_config,
                 devices.clone(),
+                radios.clone(),
                 stations.clone(),
                 fw.clone(),
                 upgrade_reg.clone(),
@@ -343,6 +364,7 @@ async fn start_new_session(
     socket: &Arc<UdpSocket>,
     config: &Arc<rtc_dtls::config::HandshakeConfig>,
     devices: Arc<device::DeviceStore>,
+    radios: Arc<radio::RadioStore>,
     stations: Arc<station::StationStore>,
     fw: Arc<firmware::FirmwareStore>,
     upgrade: Arc<firmware::UpgradeRegistry>,
@@ -356,7 +378,7 @@ async fn start_new_session(
     tokio::spawn(async move {
         info!("[*] with {}: session thread spawned", peer);
         if let Err(e) = handle_session(
-            peer, rx, sock_clone, conf_clone, devices, stations, fw, upgrade,
+            peer, rx, sock_clone, conf_clone, devices, radios, stations, fw, upgrade,
         )
         .await
         {
@@ -367,12 +389,56 @@ async fn start_new_session(
     tx
 }
 
+/// Build the ordered list of WLAN configurations to push to a WTP from its
+/// per-radio store entries (`radio_wlans`). Auth type follows the security
+/// policy: open networks use the legacy open-authentication byte, anything with
+/// a PSK uses RSN.
+fn configs_from_store(
+    radios: &radio::RadioStore,
+    mac: device::Mac,
+) -> Result<Vec<config::WlanConfig>> {
+    let mut out = Vec::new();
+    for rw in radios.list_wlans_enabled(mac)? {
+        let method = config::SecurityMethod::from_policy(&rw.security)
+            .unwrap_or(config::SecurityMethod::Open);
+        let auth_type = if method == config::SecurityMethod::Open {
+            config::AuthType::Open
+        } else {
+            config::AuthType::Rsn
+        };
+        out.push(config::WlanConfig {
+            radio_id: rw.radio_id,
+            wlan_id: rw.wlan_id,
+            capability: 0x0001, // ESS
+            qos: 0,
+            auth_type,
+            mac_mode: 0,
+            tunnel_mode: 0,
+            suppress_ssid: false,
+            ssid: rw.ssid.clone().into_bytes(),
+            security: config::WlanSecurity {
+                method,
+                psk: rw.psk.clone(),
+            },
+            wlan_enable: rw.wlan_enable,
+            isolate: rw.isolate,
+            broadcast: rw.broadcast,
+            client_count: rw.client_count,
+            vlan_id: rw.vlan_id,
+            cipher: rw.cipher,
+            rekey_period: rw.rekey_period,
+        });
+    }
+    Ok(out)
+}
+
 async fn handle_session(
     peer: SocketAddr,
     mut rx: mpsc::Receiver<Vec<u8>>,
     socket: Arc<UdpSocket>,
     config: Arc<rtc_dtls::config::HandshakeConfig>,
     devices: Arc<device::DeviceStore>,
+    radios: Arc<radio::RadioStore>,
     stations: Arc<station::StationStore>,
     fw: Arc<firmware::FirmwareStore>,
     upgrade: Arc<firmware::UpgradeRegistry>,
@@ -428,7 +494,18 @@ async fn handle_session(
                     if n < 16 { continue }
                     ctx.keep_alive();
 
-                    let msg = CtrlMsg::decode(FRAME, &app_data[8..n])?;
+                    let msg = match CtrlMsg::decode(FRAME, &app_data[8..n]) {
+                        Ok(m) => m,
+                        // A frame below the control-header minimum is not fatal:
+                        // logging and carrying on keeps the session (and its
+                        // applied config) alive instead of tearing the control
+                        // channel down. Zero-element keepalives (the 19B ECHO_REQ)
+                        // decode cleanly through parse_hdr.
+                        Err(e) => {
+                            warn!("[?] ctrl decode: {e} ({n}B); keep session");
+                            continue;
+                        }
+                    };
                     debug!("[?] ctrl payload:\n{:?}", &app_data[8..n]);
                     let seq = msg.hdr.seq_num;
                     let m_type = msg.hdr.msg_type;
@@ -546,54 +623,129 @@ async fn handle_session(
 
                         (WtpState::Configure, MsgType::CONFIG_STATUS_REQ) => {
                             info!("[<] from {}: config status req (seq {})", peer, seq);
-                            // Capture the WTP's reported name.
-                            if let Some(CwElem::WtpName(name)) = elems.get(&MsgElemType::WTP_NAME).and_then(|v| v.first()) {
+                            // TEMP debug: dump raw config status request wire bytes and
+                            // each parsed element for reverse-engineering analysis.
+                            {
+                                let hx: String =
+                                    app_data.iter().map(|b| format!("{:02x}", b)).collect();
+                                info!("[DBG] cfg-status-req app_data ({}B): {}", app_data.len(), hx);
+                                for e in &msg.elems {
+                                    info!("[DBG]   elem tag={:#06x} len={} val={}", e.tag, e.data.len(),
+                                        e.data.iter().map(|b| format!("{:02x}", b)).collect::<String>());
+                                }
+                            }
+                            // Decode the WTP-reported name, radio operational states
+                            // and declared radios (vendor::h3c::ConfigStatusReq). The
+                            // AX60 reports each radio as admin_state=1 (Disabled) in
+                            // its Config Status Request, and its apply chain silently
+                            // skips WLAN/SSID config for radios that stay disabled --
+                            // so the AC must turn them on by echoing a
+                            // RADIO_ADMIN_STATE element with admin_state=0 before any
+                            // per-radio WLAN config can take effect.
+                            let req = vendor::h3c::ConfigStatusReq::parse(&msg);
+                            if let Some(name) = &req.wtp_name {
                                 ctx.name = name.clone();
                                 info!("[*] WTP Name updated: {}", ctx.name);
                             }
-
-                            // Capture radio operational states.
-                            if let Some(radio_elems) = elems.get(&MsgElemType::RADIO_OP_STATE) {
-                                for elem in radio_elems {
-                                    if let CwElem::RadioOp { radio_id, state } = elem {
-                                        info!("[*] Radio ID: {}, Operational State: {}", radio_id, state);
-                                        // ctx.radios could be updated from these states.
-                                    }
-                                }
+                            for (radio_id, state) in &req.radio_op_states {
+                                info!("[*] Radio ID: {}, Operational State: {}", radio_id, state);
+                            }
+                            let mut declared_radios = req.declared_radios;
+                            if declared_radios.is_empty() {
+                                info!("[*] no RADIO_ADMIN_STATE declared; assuming radios 0 and 1");
+                                declared_radios.push((0, 1));
+                                declared_radios.push((1, 1));
                             }
 
-                            let resp_msg = CtrlMsg::new(MsgType::CONFIG_STATUS_RESP, seq)
-                                .add_element(elements::BaseElem::CapwapTimers { disc_interval_secs: 20, echo_interval_secs: 60 })
-                                .add_element(elements::BaseElem::IdleTimeout(300))
-                                .add_element(elements::BaseElem::WtpFallback(2))
-                                .add_elem(MsgElemType::DECRYPT_ERR_REPORT_PERIOD, &[1, 0, 120]) // radio 1, 120s
-                                .add_elem(MsgElemType::DECRYPT_ERR_REPORT_PERIOD, &[2, 0, 120]); // radio 2, 120s
+                            // Build the WTP's WLAN list first (from the radio_wlans
+                            // store; a single default WLAN if none is configured yet).
+                            let mut wlans = configs_from_store(&*radios, ctx.mac.unwrap_or([0; 6]))?;
+                            if wlans.is_empty() {
+                                // Empty configuration template: push the default
+                                // SSID to both radios. The AX60 maps radio id to
+                                // band as band = radio_id - 1 (0x3ff20), so radio 1
+                                // is 2.4G and radio 2 is 5G.
+                                for radio_id in [1u8, 2u8] {
+                                    wlans.push(config::WlanConfig {
+                                        radio_id,
+                                        wlan_id: 1,
+                                        capability: 0x0001, // ESS
+                                        qos: 0,
+                                        auth_type: config::AuthType::Rsn,
+                                        mac_mode: 0,
+                                        tunnel_mode: 0,
+                                        suppress_ssid: false,
+                                        ssid: b"miniac".to_vec(),
+                                        security: config::WlanSecurity {
+                                            method: config::SecurityMethod::Wpa2Wpa3,
+                                            psk: Some("person0finterest".into()),
+                                        },
+                                        ..config::WlanConfig::default()
+                                    });
+                                }
+                            }
+                            // Rebuild the Config Status Response to mirror the M60
+                            // AC's assembly order (AC.dis 0x1001d6a0-0x1001feec):
+                            // [2][3][12][32][16][23][40][55] then one 0xfde8 per
+                            // radio/WLAN. The full assembly (H3C base elements,
+                            // radio records, the tag31 echo and the 0xfde8 WLAN
+                            // config, with the MINIAC_H3C_EXP bisection switches)
+                            // lives in vendor::h3c::config_status_response.
+                            let mac = ctx.mac.unwrap_or([0; 6]);
+                            let g24_hdr = radios.h3c_header(mac, 1)?;
+                            let g5_hdr = radios.h3c_header(mac, 2)?;
+                            // Advanced radio features (fe28 OFDMA/MU-MIMO, fe31
+                            // band navigation): driven by env overrides until a
+                            // DB source exists; None keeps the m60 wire layout
+                            // byte-identical to the M60 718B capture.
+                            let ofdma = std::env::var("MINIAC_H3C_OFDMA")
+                                .ok()
+                                .and_then(|v| v.parse::<u32>().ok())
+                                .unwrap_or(0);
+                            let mumimo = std::env::var("MINIAC_H3C_MUMIMO")
+                                .ok()
+                                .and_then(|v| v.parse::<u32>().ok())
+                                .unwrap_or(0);
+                            let fe28 = if ofdma != 0 || mumimo != 0 {
+                                Some((ofdma, mumimo))
+                            } else {
+                                None
+                            };
+                            let fe31 = std::env::var("MINIAC_H3C_LBD")
+                                .ok()
+                                .and_then(|v| v.parse::<u32>().ok())
+                                .filter(|&v| v != 0);
+                            let resp_msg = vendor::h3c::config_status_response(
+                                &vendor::h3c::ConfigStatusResp {
+                                    seq,
+                                    ac_ip,
+                                    peer,
+                                    declared_radios: &declared_radios,
+                                    wlans: &wlans,
+                                    g24_hdr: &g24_hdr,
+                                    g5_hdr: &g5_hdr,
+                                    wtp_mac: ctx.mac,
+                                    fe28,
+                                    fe31,
+                                },
+                            );
                             let resp_buf = resp_msg.encode_for(FRAME);
+                            // TEMP debug: dump the exact wire bytes sent as the
+                            // Configuration Status Response (head + control + elems).
+                            {
+                                let hx: String =
+                                    resp_buf.iter().map(|b| format!("{:02x}", b)).collect();
+                                info!("[DBG] cfg-status-resp wire ({}B): {}", resp_buf.len(), hx);
+                            }
                             capdtls.write(&resp_buf).await?;
                             ctx.set_last_sent(&resp_msg, resp_buf);
-
-                            // Provision the WTP with its WLANs (AC -> WTP forward
-                            // direction). The tag is tracked until the WTP acks
-                            // with Configuration Update Response, or proceeding to
-                            // the Data Check / Run states (implicit ack).
-                            let demo = config::WlanConfig {
-                                radio_id: 1,
-                                wlan_id: 1,
-                                capability: 0x0001, // ESS
-                                qos: 0,
-                                auth_type: config::AuthType::Rsn,
-                                mac_mode: 0,
-                                tunnel_mode: 0,
-                                suppress_ssid: false,
-                                ssid: b"miniac".to_vec(),
-                            };
-                            let push = config::config_update(ctx.next_seq(), &[], &[demo]);
-                            let push_buf = push.encode_for(FRAME);
-                            capdtls.write(&push_buf).await?;
-                            ctx.set_last_sent(&push, push_buf);
-                            cfg_status.mark_pushed([config::ADD_WLAN]);
-                            logx::device(format!("pushed initial WLAN config to {}", peer));
-                            info!("[>] to {}: configuration update (Add WLAN) sent", peer);
+                            cfg_status.mark_pushed([vendor::h3c::WLAN_CFG_H3C]);
+                            logx::device(format!(
+                                "pushed {} WLAN config(s) to {}",
+                                wlans.len(),
+                                peer
+                            ));
+                            info!("[>] to {}: config response with {} WLAN config(s) sent", peer, wlans.len());
 
                             ctx.state = WtpState::DataCheck;
                             info!("[>] to {}: config resp sent, state -> DataCheck", peer);
@@ -640,6 +792,20 @@ async fn handle_session(
                             debug!("[<] from {}: echo resp (seq {})", peer, seq);
                         }
 
+                        (WtpState::Run, t) if t == vendor::h3c::WTP_CHAN_UTIL_REQ => {
+                            // AX60 channel-utilization report (element 0xfe20,
+                            // [2G%, 5G%]); ack with mtype 146 + zero Result Code
+                            // so the WTP drops its pending copy instead of
+                            // retransmitting every 10s.
+                            debug!("[<] from {}: chan util report (seq {})", peer, seq);
+                            let resp_msg = CtrlMsg::new(vendor::h3c::WTP_CHAN_UTIL_RESP, seq)
+                                .with_result_success();
+                            let resp_buf = resp_msg.encode_for(FRAME);
+                            capdtls.write(&resp_buf).await?;
+                            ctx.set_last_sent(&resp_msg, resp_buf);
+                            debug!("[>] to {}: chan util ack", peer);
+                        }
+
                         (WtpState::Run, MsgType::WTP_EVENT_REQ) => {
                             info!("[<] from {}: wtp event (seq {})", peer, seq);
                             // Log radio/station event elements for observability.
@@ -669,18 +835,53 @@ async fn handle_session(
                         (WtpState::Run, MsgType::STATION_CONFIG_REQ) => {
                             info!("[<] from {}: station config (seq {})", peer, seq);
                             if let Some(adds) = elems.get(&MsgElemType::ADD_STATION) {
+                                // Resolve each station's band/SSID by matching
+                                // the WLAN it joined against the per-radio
+                                // configuration pushed for this WTP.
+                                let wlans = radios.list_wlans(ctx.mac.unwrap_or([0; 6])).unwrap_or_default();
                                 for a in adds {
                                     if let CwElem::Unknown(_, v) = a {
                                         if v.len() >= 7 {
                                             let mut mac = [0u8; 6];
                                             mac.copy_from_slice(&v[..6]);
                                             let wlan_id = v[6];
-                                            let st = stations.upsert(ctx.mac.unwrap_or([0; 6]), mac, 0, wlan_id, "associated", None, None, None);
+                                            let mut radio_id = 0u8;
+                                            let mut ssid = None;
+                                            if let Some(rw) = wlans.iter().find(|w| w.wlan_id == wlan_id) {
+                                                radio_id = rw.radio_id;
+                                                ssid = Some(rw.ssid.clone());
+                                            }
+                                            let assoc_at = std::time::SystemTime::now()
+                                                .duration_since(std::time::UNIX_EPOCH)
+                                                .map(|d| d.as_secs())
+                                                .unwrap_or(0);
+                                            let st = stations.upsert(
+                                                ctx.mac.unwrap_or([0; 6]),
+                                                mac,
+                                                radio_id,
+                                                wlan_id,
+                                                "associated",
+                                                None,
+                                                ssid.as_deref(),
+                                                None,
+                                            );
                                             match st {
-                                                Ok(_) => logx::station(format!(
-                                                    "station {} added on {} (wlan {})",
-                                                    device::mac_to_str(mac), peer, wlan_id,
-                                                )),
+                                                Ok(_) => {
+                                                    ctx.add_station(capwap::RuntimeStation {
+                                                        mac,
+                                                        radio_id,
+                                                        wlan_id,
+                                                        ssid,
+                                                        rssi: None,
+                                                        ip: None,
+                                                        state: "associated".into(),
+                                                        associated_at: assoc_at,
+                                                    });
+                                                    logx::station(format!(
+                                                        "station {} added on {} (radio {}, wlan {})",
+                                                        device::mac_to_str(mac), peer, radio_id, wlan_id,
+                                                    ));
+                                                }
                                                 Err(e) => warn!("[!] station persist failed: {}", e),
                                             }
                                         } else {
@@ -698,6 +899,7 @@ async fn handle_session(
                                             if let Err(e) = stations.delete(ctx.mac.unwrap_or([0; 6]), mac) {
                                                 warn!("[!] station delete failed: {}", e);
                                             }
+                                            ctx.remove_station(mac);
                                             logx::station(format!("station {} removed from {}", device::mac_to_str(mac), peer));
                                         }
                                     }

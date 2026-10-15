@@ -49,7 +49,10 @@ impl CtrlFrame {
     /// header (app_data[8..]). RFC and H3C share Message Type, then diverge on
     /// Seq width.
     pub fn parse_hdr(self, buf: &[u8]) -> Result<CtrlHdr> {
-        if buf.len() < self.elem_off() + 1 {
+        // The control header occupies exactly `elem_off` bytes (Message Type +
+        // Seq + MsgElemLen + Flags); a zero-element message is still valid and
+        // is only that long (the AX60 Run-state 19B ECHO_REQ keepalive).
+        if buf.len() < self.elem_off() {
             return Err(anyhow::anyhow!("ctrl header too short"));
         }
         let msg_type = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
@@ -58,7 +61,10 @@ impl CtrlFrame {
             CtrlFrame::H3c => u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]),
         };
         let elem_len = u16::from_be_bytes([buf[4 + self.seq_len()], buf[5 + self.seq_len()]]);
-        let flags = buf[7 + self.seq_len()];
+        // Flags is the last control-header byte (offset 6 + seq_len); the old
+        // `7 + seq_len` index read the first element's tag high byte instead
+        // (masked only by tags whose high byte is 0x00).
+        let flags = buf[6 + self.seq_len()];
         Ok(CtrlHdr {
             msg_type,
             seq_num: seq,
@@ -160,6 +166,23 @@ mod tests {
         assert_eq!(hdr.flags, 0);
         // Elements begin at byte 11 of the control payload (16 in app_data).
         assert_eq!(CtrlFrame::H3c.elem_off(), 11);
+    }
+
+    #[test]
+    fn h3c_parses_zero_element_keepalive() {
+        // 11-byte control payload (msg_type + 4-byte seq + MsgElemLen + flags)
+        // with no elements: the AX60 Run-state 19B ECHO_REQ keepalive shape.
+        let echo = [
+            0x00, 0x00, 0x00, 0x0d, // Message Type: Echo Request
+            0x00, 0x00, 0x01, 0x77, // Seq 375
+            0x00, 0x03,             // MsgElemLen: self-inclusive 3 = no elements
+            0x00,                   // Flags
+        ];
+        let hdr = CtrlFrame::H3c.parse_hdr(&echo).expect("parse");
+        assert_eq!(hdr.msg_type, 13);
+        assert_eq!(hdr.seq_num, 375);
+        assert_eq!(hdr.elem_len, 3);
+        assert_eq!(hdr.flags, 0);
     }
 
     #[test]

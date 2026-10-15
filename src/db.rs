@@ -38,6 +38,12 @@ CREATE TABLE IF NOT EXISTS radios (
     op_state    INTEGER NOT NULL DEFAULT 0,
     channel     INTEGER,
     tx_power    INTEGER,
+    -- H3C 0xfde8 per-band header config (radio_enable -> word0, power -> word2,
+    -- mode -> word3, radio_channel -> word5; channel is the 5G index 0..12).
+    radio_enable   INTEGER NOT NULL DEFAULT 1,
+    radio_power    INTEGER NOT NULL DEFAULT 6,
+    radio_mode     INTEGER NOT NULL DEFAULT 0,
+    radio_channel  INTEGER NOT NULL DEFAULT 0,
     last_seen   INTEGER NOT NULL,
     PRIMARY KEY (mac, radio_id)
 );
@@ -106,6 +112,30 @@ CREATE TABLE IF NOT EXISTS ap_leases (
     leased_at  INTEGER NOT NULL,
     last_seen  INTEGER NOT NULL
 );
+
+-- Per-radio WLAN configuration pushed to a WTP (AC -> WTP forward direction).
+-- Keyed by (mac, radio_id, wlan_id); the 2.4G and 5G radios carry independent
+-- SSID/security settings. `security` is one of "open" | "wpa2" | "wpa3" |
+-- "wpa2-wpa3"; `psk` holds the WPA passphrase (8..63 chars) for these methods.
+CREATE TABLE IF NOT EXISTS radio_wlans (
+    mac      BLOB NOT NULL,                -- owning WTP MAC (6 raw bytes)
+    radio_id INTEGER NOT NULL,
+    wlan_id  INTEGER NOT NULL DEFAULT 1,
+    ssid     TEXT NOT NULL DEFAULT '',
+    security TEXT NOT NULL DEFAULT 'open',
+    psk      TEXT,
+    -- H3C 0xfde8 record fields: wlan_enable (record slot up), isolate,
+    -- broadcast (SSID visible when 1), client_count limit, vlan_id, cipher
+    -- (1 TKIP / 2 AES / 3 TKIP+AES) and rekey_period.
+    wlan_enable  INTEGER NOT NULL DEFAULT 1,
+    isolate      INTEGER NOT NULL DEFAULT 0,
+    broadcast    INTEGER NOT NULL DEFAULT 1,
+    client_count INTEGER NOT NULL DEFAULT 0,
+    vlan_id      INTEGER NOT NULL DEFAULT 0,
+    cipher       INTEGER NOT NULL DEFAULT 2,
+    rekey_period INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (mac, radio_id, wlan_id)
+);
 "#;
 
 /// SQLite-backed persistent store.
@@ -137,22 +167,35 @@ impl Db {
     fn init_schema(&self) -> Result<()> {
         let conn = self.lock();
         conn.execute_batch(SCHEMA).context("create schema")?;
-        // Migration: add the `approved` column to pre-existing databases where
+        // Migrations: add columns to pre-existing databases where the
         // CREATE TABLE IF NOT EXISTS above is a no-op.
-        let mut stmt = conn
-            .prepare("PRAGMA table_info(devices)")
-            .context("pragma table_info")?;
-        let cols: Vec<String> = stmt
-            .query_map([], |r| r.get::<_, String>(1))
-            .context("read devices columns")?
-            .collect::<rusqlite::Result<_>>()
-            .context("collect devices columns")?;
-        if !cols.iter().any(|c| c == "approved") {
-            conn.execute_batch(
-                "ALTER TABLE devices ADD COLUMN approved INTEGER NOT NULL DEFAULT 0",
-            )
+        ensure_columns(&conn, "devices", &[("approved", "INTEGER NOT NULL DEFAULT 0")])
             .context("migrate devices.approved")?;
-        }
+        ensure_columns(
+            &conn,
+            "radios",
+            &[
+                ("radio_enable", "INTEGER NOT NULL DEFAULT 1"),
+                ("radio_power", "INTEGER NOT NULL DEFAULT 6"),
+                ("radio_mode", "INTEGER NOT NULL DEFAULT 0"),
+                ("radio_channel", "INTEGER NOT NULL DEFAULT 0"),
+            ],
+        )
+        .context("migrate radios h3c header")?;
+        ensure_columns(
+            &conn,
+            "radio_wlans",
+            &[
+                ("wlan_enable", "INTEGER NOT NULL DEFAULT 1"),
+                ("isolate", "INTEGER NOT NULL DEFAULT 0"),
+                ("broadcast", "INTEGER NOT NULL DEFAULT 1"),
+                ("client_count", "INTEGER NOT NULL DEFAULT 0"),
+                ("vlan_id", "INTEGER NOT NULL DEFAULT 0"),
+                ("cipher", "INTEGER NOT NULL DEFAULT 2"),
+                ("rekey_period", "INTEGER NOT NULL DEFAULT 0"),
+            ],
+        )
+        .context("migrate radio_wlans h3c record")?;
         Ok(())
     }
 
@@ -160,4 +203,24 @@ impl Db {
     pub fn lock(&self) -> MutexGuard<'_, Connection> {
         self.conn.lock().unwrap_or_else(|p| p.into_inner())
     }
+}
+
+/// Add any missing columns to `table`, for databases created before the column
+/// existed (the CREATE TABLE IF NOT EXISTS is a no-op there). `ddl` is the
+/// full `type ... DEFAULT ...` clause used by both CREATE TABLE and ALTER.
+fn ensure_columns(
+    conn: &Connection,
+    table: &str,
+    cols: &[(&str, &str)],
+) -> rusqlite::Result<()> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let existing: Vec<String> = stmt
+        .query_map([], |r| r.get::<_, String>(1))?
+        .collect::<rusqlite::Result<_>>()?;
+    for (name, ddl) in cols {
+        if !existing.iter().any(|c| c == name) {
+            conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {name} {ddl}"))?;
+        }
+    }
+    Ok(())
 }
