@@ -16,6 +16,26 @@ from .ctrl import CtrlMsg
 from .ctrl_names import MsgElemType
 
 
+def _patch_board_mac(data, mac):
+    """Rewrite the Base MAC (sub-element type 4) inside a WTP Board Data
+    element: `[vendor id u32][ (type u16, len u16, value)* ]` (RFC 5415
+    4.6.40). Returns (new_data, note)."""
+    if len(data) < 4:
+        return data, None
+    out = bytearray(data)
+    off = 4
+    while off + 4 <= len(out):
+        etype = int.from_bytes(out[off:off + 2], "big")
+        elen = int.from_bytes(out[off + 2:off + 4], "big")
+        if off + 4 + elen > len(out):
+            return data, None
+        if etype == 4 and elen == 6:
+            out[off + 4:off + 10] = mac
+            return bytes(out), "board mac patched"
+        off += 4 + elen
+    return data, None
+
+
 @dataclass
 class Substitution:
     """Rewrite rules for a replay session.
@@ -69,9 +89,7 @@ class Substitution:
                     new_data = bytes(new_data)
                     note = "static ip/gw patched"
             elif tag == MsgElemType.WTP_BOARD_DATA and self.wtp_mac is not None:
-                if len(data) >= 6:
-                    new_data = self.wtp_mac + data[6:]
-                    note = "board mac patched"
+                new_data, note = _patch_board_mac(data, self.wtp_mac)
             if new_data != data:
                 diff.append((tag, bytes(data), bytes(new_data), note or "rewritten"))
                 elems.append((tag, bytes(new_data)))

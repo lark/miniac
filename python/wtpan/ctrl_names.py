@@ -36,6 +36,10 @@ class MsgType:
     # H3C AX60 vendor message types.
     WTP_CHAN_UTIL_REQ = 145
     WTP_CHAN_UTIL_RESP = 146
+    # TP-Link vendor message types (TL-AP1300GI Run state; only active while
+    # the WTP is in Run).
+    TPLINK_WLAN_CFG_REQ = 0x0033DD01
+    TPLINK_WLAN_CFG_RESP = 0x0033DD02
 
 
 MSG_NAMES = {
@@ -67,6 +71,8 @@ MSG_NAMES = {
     26: "Station Configuration Response",
     145: "Chan Util Report (H3C)",
     146: "Chan Util Ack (H3C)",
+    0x0033DD01: "WLAN Config Update Request (TP-Link)",
+    0x0033DD02: "WLAN Config Update Response (TP-Link)",
 }
 
 
@@ -122,6 +128,8 @@ class MsgElemType:
     MTU_DISC_PADDING = 52
     ECN_SUPPORT = 53
     # RFC 5416 IEEE 802.11 binding elements.
+    ADD_WLAN = 1024
+    DEL_WLAN = 1027
     MAC_OPERATION = 1041
     STATION_EVENT_TYPE = 1046
     WTP_RADIO_INFO = 1048
@@ -139,20 +147,39 @@ ELEM_NAMES = {
     3: "AC IPv6 List",
     4: "AC Name",
     5: "AC Name w/ Priority",
+    6: "AC Timestamp",
+    7: "Add MAC ACL Entry",
+    8: "Add Station",
     10: "CAPWAP Control IPv4 Address",
     11: "CAPWAP Control IPv6 Address",
     12: "CAPWAP Timers",
+    13: "Data Transfer Data",
+    14: "Data Transfer Mode",
+    15: "Decrypt Error Report",
+    16: "Decrypt Error Report Period",
+    17: "Delete MAC ACL Entry",
+    18: "Delete Station",
     20: "Discovery Type",
+    21: "Duplicate IPv4 Address",
+    22: "Duplicate IPv6 Address",
+    23: "Idle Timeout",
+    24: "Image Data",
+    25: "Image Identifier",
+    26: "Image Information",
+    27: "Initiate Download",
     28: "Location Data",
     29: "Max Message Length",
     30: "CAPWAP Local IPv4 Address",
     31: "Radio Administrative State",
     32: "Radio Operational State",
     33: "Result Code",
+    34: "Returned Message Element",
     35: "Session ID",
     36: "Statistics Timer",
+    37: "Vendor Specific Payload",
     38: "WTP Board Data",
     39: "WTP Descriptor",
+    40: "WTP Fallback",
     41: "WTP Frame Tunnel Mode",
     44: "WTP MAC Type",
     45: "WTP Name",
@@ -161,7 +188,10 @@ ELEM_NAMES = {
     49: "WTP Static IP Address Info",
     50: "CAPWAP Local IPv6 Address",
     51: "CAPWAP Transport Protocol",
+    52: "MTU Discovery Padding",
     53: "ECN Support",
+    1024: "Add WLAN",
+    1027: "Delete WLAN",
     1041: "MAC Operation",
     1046: "Station Event Type",
     1048: "WTP Radio Information",

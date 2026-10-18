@@ -4,7 +4,7 @@
 
 use anyhow::{anyhow, Result};
 use dashmap::DashMap;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::time::{Duration, Instant};
@@ -108,6 +108,18 @@ pub struct WtpContext {
     /// When the Run-state keep-alive Echo Request was last sent to the WTP.
     pub last_echo_sent: Instant,
 
+    /// TP-Link Run-entry configuration push, delivered strictly serialized:
+    /// AC100 sends one Configuration Update Request at a time and waits for the
+    /// WTP's reply before the next, because the WTP admits a single in-flight
+    /// radio operation and silently drops a message that arrives while one is
+    /// still running. Each entry is an encoded wire frame.
+    pub push_queue: VecDeque<Vec<u8>>,
+    /// Frames released together once `push_queue` drains: the WLAN slot deletes
+    /// and Add WLAN pushes, which the WTP accepts back-to-back.
+    pub push_burst: Vec<Vec<u8>>,
+    /// When the head of `push_queue` was sent, for the no-reply timeout.
+    pub push_last_sent: Option<Instant>,
+
     pub echo_interval: Duration,
     pub retrans_interval: Duration,
     pub max_retries: u32,
@@ -184,6 +196,17 @@ impl CtrlMsg {
     pub fn add_element(mut self, elem: crate::elements::BaseElem) -> Self {
         let (tag, val) = elem.encode();
         self.add_elem(tag, &val)
+    }
+
+    /// Append typed base elements in iteration order.
+    pub fn add_elements(
+        mut self,
+        elems: impl IntoIterator<Item = crate::elements::BaseElem>,
+    ) -> Self {
+        for elem in elems {
+            self = self.add_element(elem);
+        }
+        self
     }
 
     pub fn encode(&self) -> Vec<u8> {
@@ -266,6 +289,9 @@ impl WtpContext {
             last_seen: Instant::now(),
             last_sent: None,
             last_echo_sent: Instant::now(),
+            push_queue: VecDeque::new(),
+            push_burst: Vec::new(),
+            push_last_sent: None,
             echo_interval: Duration::from_secs(30),
             retrans_interval: Duration::from_secs(5),
             max_retries: 3,
@@ -291,6 +317,32 @@ impl WtpContext {
         let seq = self.seq_counter;
         self.seq_counter = self.seq_counter.wrapping_add(1);
         seq
+    }
+
+    /// Queue an encoded frame for serialized delivery (see [`Self::push_queue`]).
+    pub fn push_msg(&mut self, buf: Vec<u8>) {
+        self.push_queue.push_back(buf);
+    }
+
+    /// Queue a frame for the post-serialized burst (see [`Self::push_burst`]).
+    pub fn burst_msg(&mut self, buf: Vec<u8>) {
+        self.push_burst.push(buf);
+    }
+
+    /// Release what the serialized push is due to send: the next serialized
+    /// frame, and — once that queue is drained — the deferred burst as well, so
+    /// the trailing WLAN messages are not stranded behind the last serialized
+    /// frame's reply.
+    pub fn release_push(&mut self) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        if let Some(buf) = self.push_queue.pop_front() {
+            self.push_last_sent = Some(Instant::now());
+            out.push(buf);
+        }
+        if self.push_queue.is_empty() {
+            out.extend(std::mem::take(&mut self.push_burst));
+        }
+        out
     }
 
     /// Add or refresh a station in the runtime table (Add Station notification).
@@ -416,6 +468,13 @@ impl MsgType {
     pub const STATION_CONFIG_REQ: u32 = 25;
     pub const STATION_CONFIG_RESP: u32 = 26;
 
+    /// H3C Release Client by AC Request/Response (AX60 `CW_MSG_TYPE_VALUE_
+    /// RELEASE_CLIENT_BY_AC_REQUEST`, WTP.dis `CWWTPManageGenericRunMessage`
+    /// `v62 == 139`). Not an RFC 5415 message number; the AC evicts one station
+    /// from the WTP by its MAC.
+    pub const RELEASE_CLIENT_REQ: u32 = 139;
+    pub const RELEASE_CLIENT_RESP: u32 = 140;
+
     #[inline]
     pub fn is_request(m_type: u32) -> bool {
         m_type % 2 != 0
@@ -481,6 +540,10 @@ impl MsgElemType {
     pub const ECN_SUPPORT: u16 = 53;
 
     /* RFC 5416 IEEE 802.11 Binding Elements */
+    /// IEEE 802.11 Add WLAN (RFC 5416 6.1).
+    pub const ADD_WLAN: u16 = 1024;
+    /// IEEE 802.11 Delete WLAN (RFC 5416 6.4).
+    pub const DEL_WLAN: u16 = 1027;
     pub const WTP_RADIO_INFO: u16 = 1048;
     pub const WTP_RADIO_CONFIG: u16 = 1049;
     pub const WTP_RADIO_CAPS: u16 = 1050;
@@ -543,7 +606,13 @@ pub static MSG_SCHEMAS: Lazy<HashMap<u32, MsgSchema>> = Lazy::new(|| {
                 MsgElemType::VENDOR_SPECIFIC_PAYLOAD,
             ]
             .into(),
-            allow_multi: [MsgElemType::WTP_RADIO_INFO].into(),
+            // A TP-Link WTP carries one Vendor Specific Payload (RFC 5415 elem 37)
+            // per private element, so 37 legitimately repeats in a single Join.
+            allow_multi: [
+                MsgElemType::WTP_RADIO_INFO,
+                MsgElemType::VENDOR_SPECIFIC_PAYLOAD,
+            ]
+            .into(),
             exclusive_groups: vec![],
             at_least_one: vec![[
                 MsgElemType::CAPWAP_LOCAL_IPV4_ADDR,
@@ -651,7 +720,10 @@ pub static MSG_SCHEMAS: Lazy<HashMap<u32, MsgSchema>> = Lazy::new(|| {
         MsgSchema {
             mandatory: [].into(),
             optional: [MsgElemType::VENDOR_SPECIFIC_PAYLOAD].into(),
-            allow_multi: [].into(),
+            // TP-Link WTPs put several private TLVs in an Echo Request as
+            // separate Vendor Specific Payload elements (observed: three 37s
+            // carrying private 33/32/56), so a single occurrence is too strict.
+            allow_multi: [MsgElemType::VENDOR_SPECIFIC_PAYLOAD].into(),
             exclusive_groups: vec![],
             at_least_one: vec![],
         },
@@ -984,6 +1056,30 @@ pub static MSG_SCHEMAS: Lazy<HashMap<u32, MsgSchema>> = Lazy::new(|| {
         },
     );
 
+    // 139/140. H3C Release Client by AC Request/Response (AC -> WTP). The request
+    //   carries one vendor element (tag 65, a 6-byte client MAC); the response
+    //   confirms with a Result Code (tag 33).
+    m.insert(
+        MsgType::RELEASE_CLIENT_REQ,
+        MsgSchema {
+            mandatory: [].into(),
+            optional: [crate::vendor::h3c::ELEM_RELEASE_CLIENT_MAC].into(),
+            allow_multi: [].into(),
+            exclusive_groups: vec![],
+            at_least_one: vec![[crate::vendor::h3c::ELEM_RELEASE_CLIENT_MAC].into()],
+        },
+    );
+    m.insert(
+        MsgType::RELEASE_CLIENT_RESP,
+        MsgSchema {
+            mandatory: [MsgElemType::RESULT_CODE].into(),
+            optional: [MsgElemType::VENDOR_SPECIFIC_PAYLOAD].into(),
+            allow_multi: [].into(),
+            exclusive_groups: vec![],
+            at_least_one: vec![],
+        },
+    );
+
     // 145. H3C AX60 channel-utilization report (WTP -> AC). No RFC schema: the
     //   0xfe20 element is kept as Unknown and acked with mtype 146 in Run state
     //   (see `vendor::h3c::WTP_CHAN_UTIL_REQ`).
@@ -997,6 +1093,38 @@ pub static MSG_SCHEMAS: Lazy<HashMap<u32, MsgSchema>> = Lazy::new(|| {
             at_least_one: vec![],
         },
     );
+
+    // TP-Link private WLAN Configuration Update Request/Response
+    // (0x0033DD01/0x0033DD02, AC100 `CWWTPManageRunAcRequestMessage`). The
+    // request supplies WLANs with the private 9 security argument wrapped in a
+    // vendor payload and the IEEE 802.11 Add WLAN element; the response echoes
+    // what it accepted. Neither is an RFC 5415 message number, so the schema
+    // accepts any of those elements in any order and multiplicity.
+    for id in [
+        crate::vendor::tplink::WLAN_CONFIG_UPDATE_REQ,
+        crate::vendor::tplink::WLAN_CONFIG_UPDATE_RESP,
+    ] {
+        m.insert(
+            id,
+            MsgSchema {
+                mandatory: [].into(),
+                optional: [
+                    MsgElemType::VENDOR_SPECIFIC_PAYLOAD,
+                    MsgElemType::ADD_WLAN,
+                    MsgElemType::DEL_WLAN,
+                ]
+                .into(),
+                allow_multi: [
+                    MsgElemType::VENDOR_SPECIFIC_PAYLOAD,
+                    MsgElemType::ADD_WLAN,
+                    MsgElemType::DEL_WLAN,
+                ]
+                .into(),
+                exclusive_groups: vec![],
+                at_least_one: vec![],
+            },
+        );
+    }
 
     m
 });

@@ -40,12 +40,25 @@ class TestSubst:
         assert len(diff) == 1
 
     def test_board_data_mac(self):
-        body = bytes.fromhex("c4c063efca25") + bytes(42)
-        msg = CtrlMsg(3, 1, [(M.WTP_BOARD_DATA, body)])
+        # Real TL-AP1300GI WTP Board Data: vendor id then sub-elements
+        # (0 Model, 1 Serial, 4 Base MAC).
+        body = bytes.fromhex(
+            "12345678"
+            "0000000413008e02"
+            "0001001030303030383038663164386461666137"
+            "00040006" "808f1d8dafa7")
         mac = bytes.fromhex("aabbccddeeff")
-        new, _ = Substitution(wtp_mac=mac).apply(msg)
-        assert new.one(M.WTP_BOARD_DATA)[:6] == mac
-        assert new.one(M.WTP_BOARD_DATA)[6:] == body[6:]
+        new, _ = Substitution(wtp_mac=mac).apply(
+            CtrlMsg(3, 1, [(M.WTP_BOARD_DATA, body)]))
+        got = new.one(M.WTP_BOARD_DATA)
+        assert got[:4] == bytes.fromhex("12345678")  # vendor id intact
+        assert got[-6:] == mac
+        assert got[4:-6] == body[4:-6]
+        # The same MAC leaves the element untouched.
+        same, diff = Substitution(wtp_mac=bytes.fromhex("808f1d8dafa7")).apply(
+            CtrlMsg(3, 1, [(M.WTP_BOARD_DATA, body)]))
+        assert same.one(M.WTP_BOARD_DATA) == body
+        assert diff == []
 
     def test_extra_override_wins(self):
         msg = CtrlMsg(3, 1, [(M.CAPWAP_LOCAL_IPV4_ADDR,

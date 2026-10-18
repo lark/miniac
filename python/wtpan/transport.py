@@ -27,6 +27,11 @@ from OpenSSL import SSL  # noqa: E402
 _DTLS12_OPTS = (SSL.OP_NO_SSLv2, SSL.OP_NO_SSLv3, SSL.OP_NO_TLSv1,
                 SSL.OP_NO_TLSv1_1, SSL.OP_NO_TLSv1_3)
 
+#: DTLS protocol version numbers. pyOpenSSL exposes only the TLS_* constants,
+#: so the DTLS values (RFC 6347) are literal here. TP-Link AC100 speaks DTLS 1.0
+#: (``"1.0"``); H3C/miniac use DTLS 1.2 (``"1.2"``, the default).
+_DTLS_PROTO = {"1.0": 0xFEFF, "1.2": 0xFEFD}
+
 
 def _wait_fd(fd, end, write=False):
     """select() until `fd` is ready or the deadline `end` passes."""
@@ -87,12 +92,22 @@ class DtlsClient:
     FRAME_MARKER = b"\x01\x00\x00\x00"
 
     def __init__(self, host, port, client_pem=None, ca=None, verify=False,
-                 timeout=5.0, udp_sock=None):
+                 timeout=5.0, udp_sock=None, dtls_proto=None):
         self.addr = (host, port)
         self.timeout = timeout
         ctx = SSL.Context(SSL.DTLS_CLIENT_METHOD)
-        for opt in _DTLS12_OPTS:
-            ctx.set_options(opt)
+        # TP-Link AC100's GnuTLS server does not advertise RFC 5746 secure
+        # renegotiation, which OpenSSL 3.x rejects by default ("unsafe legacy
+        # renegotiation disabled"); re-enable it for these legacy peers.
+        ctx.set_options(SSL.OP_LEGACY_SERVER_CONNECT)
+        if dtls_proto is not None:
+            # Force an exact DTLS version (TP-Link AC100 wants DTLS 1.0).
+            version = _DTLS_PROTO[dtls_proto]
+            ctx.set_min_proto_version(version)
+            ctx.set_max_proto_version(version)
+        else:
+            for opt in _DTLS12_OPTS:
+                ctx.set_options(opt)
         if client_pem:
             # AX60 client.pem bundles the certificate and the RSA private key.
             ctx.use_certificate_chain_file(client_pem)
@@ -232,7 +247,7 @@ class Transports:
     """Auto-switching transport: plaintext for discovery, DTLS afterwards."""
 
     def __init__(self, host, port, dtls=True, client_pem=None, ca=None,
-                 verify=False, timeout=5.0):
+                 verify=False, timeout=5.0, dtls_proto=None):
         self.host = host
         self.port = port
         self.dtls = dtls
@@ -240,6 +255,7 @@ class Transports:
         self.ca = ca
         self.verify = verify
         self.timeout = timeout
+        self.dtls_proto = dtls_proto
         self.udp = None
         self.dt = None
 
@@ -261,7 +277,8 @@ class Transports:
                     self.udp.connect()
                 self.dt = DtlsClient(self.host, self.port, self.client_pem,
                                      self.ca, self.verify, self.timeout,
-                                     udp_sock=self.udp.sock)
+                                     udp_sock=self.udp.sock,
+                                     dtls_proto=self.dtls_proto)
                 self.dt.connect()
             if self.dt is not None:
                 self.dt.send(payload)

@@ -11,6 +11,7 @@
 //!   in-memory ring buffer for the management UI / persistence to consume.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -46,6 +47,9 @@ impl Category {
 /// A single management log event.
 #[derive(Debug, Clone)]
 pub struct MgmtEvent {
+    /// Monotonic sequence number, assigned on record; lets the UI fetch
+    /// incremental slices via `?since=`.
+    pub seq: u64,
     pub ts_unix: u64,
     pub category: &'static str,
     pub level: &'static str,
@@ -55,6 +59,7 @@ pub struct MgmtEvent {
 const MGMT_CAP: usize = 2048;
 
 static MGMT: Mutex<VecDeque<MgmtEvent>> = Mutex::new(VecDeque::new());
+static MGMT_SEQ: AtomicU64 = AtomicU64::new(0);
 
 fn now_unix() -> u64 {
     SystemTime::now()
@@ -77,6 +82,7 @@ pub fn record(category: Category, level: tracing::Level, message: impl AsRef<str
     }
 
     let event = MgmtEvent {
+        seq: MGMT_SEQ.fetch_add(1, Ordering::Relaxed) + 1,
         ts_unix: now_unix(),
         category: cat,
         level: level.as_str(),
@@ -87,6 +93,13 @@ pub fn record(category: Category, level: tracing::Level, message: impl AsRef<str
     while guard.len() > MGMT_CAP {
         guard.pop_front();
     }
+}
+
+/// Non-destructive incremental read: events with `seq > since`, oldest first.
+/// The ring buffer is left intact so repeated polls do not lose entries.
+pub fn snapshot(since: u64) -> Vec<MgmtEvent> {
+    let guard = MGMT.lock().unwrap();
+    guard.iter().filter(|e| e.seq > since).cloned().collect()
 }
 
 /// Consume the buffered events for the web/callback layer (drain to bound growth).
@@ -151,5 +164,16 @@ mod tests {
         let drained = drain();
         assert!(drained.iter().any(|e| e.message == MARKER));
         assert_eq!(len(), 0);
+
+        // 4) snapshot(since) is incremental and non-destructive.
+        let base = MGMT_SEQ.load(Ordering::Relaxed);
+        record(Category::System, tracing::Level::INFO, "snap-1");
+        record(Category::System, tracing::Level::INFO, "snap-2");
+        let all = snapshot(base);
+        assert_eq!(all.len(), 2);
+        assert_eq!(snapshot(base).len(), 2, "snapshot must not consume");
+        let tail = snapshot(base + 1);
+        assert_eq!(tail.len(), 1);
+        assert_eq!(tail[0].message, "snap-2");
     }
 }

@@ -119,6 +119,23 @@ class ExchangeResult:
         return self.resp is not None and not self.diffs
 
 
+#: Request message types a WTP answers on its own with the matching response
+#: type (sequence number mirrored), so an AC-initiated exchange never stalls
+#: the phase the tool is waiting on. The TP-Link WLAN Configuration Update
+#: Request is included because the AC pushes WLANs only while the WTP is in
+#: Run; answering it keeps the AC talking (and lets the tool capture it).
+AUTO_REPLIES = {
+    MsgType.CONFIG_UPDATE_REQ: MsgType.CONFIG_UPDATE_RESP,
+    MsgType.WTP_EVENT_REQ: MsgType.WTP_EVENT_RESP,
+    MsgType.CHANGE_STATE_EV_REQ: MsgType.CHANGE_STATE_EV_RESP,
+    MsgType.ECHO_REQ: MsgType.ECHO_RESP,
+    MsgType.RESET_REQ: MsgType.RESET_RESP,
+    MsgType.CLEAR_CONFIG_REQ: MsgType.CLEAR_CONFIG_RESP,
+    MsgType.STATION_CONFIG_REQ: MsgType.STATION_CONFIG_RESP,
+    MsgType.TPLINK_WLAN_CFG_REQ: MsgType.TPLINK_WLAN_CFG_RESP,
+}
+
+
 def _diff_msgs(name, got, expected):
     """Element-level comparison of the target reply vs the reference reply."""
     lines = []
@@ -166,7 +183,8 @@ class Session:
     def __init__(self, templates, frm=CtrlFrame.H3C, subst=None,
                  target=("127.0.0.1", 5246), dtls=True, client_pem=None,
                  ca=None, verify=False, timeout=5.0, keep_seq=False,
-                 seq_start=1, require_discovery=False):
+                 seq_start=1, require_discovery=False,
+                 trace=None, dtls_proto=None):
         self.templates = templates or {}
         self.frm = CtrlFrame(frm) if isinstance(frm, str) else frm
         self.subst = subst or Substitution()
@@ -180,9 +198,14 @@ class Session:
         #: lenient (proceed anyway) so the tool still works against ACs that
         #: skip the discovery exchange.
         self.require_discovery = require_discovery
+        #: Optional path for a raw transcript of every datagram in miniac's
+        #: `-D` dump convention (RX = WTP->AC, TX = AC->WTP), so the session
+        #: can be re-parsed with `wtpan parse-dump`.
+        self.trace = trace
         self.transports = Transports(target[0], target[1], dtls=dtls,
                                      client_pem=client_pem, ca=ca,
-                                     verify=verify, timeout=timeout)
+                                     verify=verify, timeout=timeout,
+                                     dtls_proto=dtls_proto)
 
     def _take_seq(self, seq):
         if seq is None and not self.keep_seq:
@@ -204,28 +227,50 @@ class Session:
         raise KeyError(f"no template for message type {mtype} "
                        f"({msg_name(mtype)}); provide --build or a template")
 
-    def _auto_echo(self, resp_wire):
-        """Answer an AC-initiated Echo Request, mirroring a real WTP.
+    def _record(self, tag, wire):
+        """Append one datagram to the raw transcript, using miniac's `-D`
+        dump convention so the file can be re-read by `wtpan parse-dump`:
+        a WTP->AC frame is `RX` (as the AC would see it), an AC->WTP frame
+        is `TX`."""
+        if not self.trace:
+            return
+        with open(self.trace, "a") as fh:
+            fh.write(f"{tag} {int(time.time() * 1_000_000)} {wire.hex()}\n")
 
-        Returns True when `resp_wire` is an Echo Request (already answered);
-        the caller then keeps waiting for the reply it actually wants. The
-        response mirrors the recorded AX60 Echo Response template when one
-        exists, otherwise it is an element-less Echo Response with the same
-        sequence number (what miniac accepts)."""
+    def _auto_answer(self, resp_wire):
+        """Answer an AC-initiated request that a real WTP answers itself.
+
+        Returns True when `resp_wire` is such a request (already answered);
+        the caller then keeps waiting for the reply it actually wants. Echo
+        Requests mirror the recorded Echo Response template when one exists;
+        every other type gets an element-less response carrying an RFC Result
+        Code of 0 (success), which is what a WTP returns for a WLAN
+        Configuration Update Request."""
         try:
             msg = CtrlMsg.decode(self.frm, self.frm.wire_to_control(resp_wire))
         except ValueError:
             return False
-        if msg.msg_type != MsgType.ECHO_REQ:
+        resp_type = AUTO_REPLIES.get(msg.msg_type)
+        if resp_type is None:
             return False
-        if 14 in self.templates:
-            tpl = self.templates[14]
-            echo = CtrlMsg.decode(self.frm, self.frm.wire_to_control(tpl.wire))
-            echo.seq = msg.seq
+        print(f"[auto] AC sent {msg_name(msg.msg_type)} seq {msg.seq} "
+              f"({len(resp_wire)}B) hex={resp_wire.hex()}")
+        if msg.msg_type == MsgType.ECHO_REQ:
+            if MsgType.ECHO_RESP in self.templates:
+                tpl = self.templates[MsgType.ECHO_RESP]
+                answer = CtrlMsg.decode(self.frm,
+                                        self.frm.wire_to_control(tpl.wire))
+            else:
+                answer = CtrlMsg(msg_type=MsgType.ECHO_RESP, seq=msg.seq,
+                                 elems=[])
         else:
-            echo = CtrlMsg(msg_type=MsgType.ECHO_RESP, seq=msg.seq, elems=[])
-        self.transports.send(echo.encode(self.frm), echo.msg_type)
-        print(f"[auto-echo] answered AC Echo Request seq {msg.seq}")
+            answer = CtrlMsg(msg_type=resp_type, seq=msg.seq,
+                             elems=[(MsgElemType.RESULT_CODE,
+                                     b"\x00\x00\x00\x00")])
+        answer.seq = msg.seq
+        wire = answer.encode(self.frm)
+        self.transports.send(wire, answer.msg_type)
+        self._record("RX", wire)
         return True
 
     def send(self, mtype, seq=None, fallback=None, phase=None, out=None):
@@ -239,12 +284,14 @@ class Session:
         new_msg.seq = seq
         wire = new_msg.encode(self.frm)
         self.transports.send(wire, new_msg.msg_type)
+        self._record("RX", wire)
         while True:
             resp_wire = self.transports.recv()
             if resp_wire is None:
                 break  # timeout waiting for the reply
-            if self._auto_echo(resp_wire):
-                continue  # answered an AC keep-alive, keep waiting
+            self._record("TX", resp_wire)
+            if self._auto_answer(resp_wire):
+                continue  # answered an AC request, keep waiting
             break
         resp = None
         if resp_wire:
@@ -324,25 +371,27 @@ class Session:
         if run:
             results.append(self.do_change_state_event(out=out))
             results.append(self.do_echo(out=out))
-            results.append(self.do_chan_util(out=out))
-        if run and hold > 0:
+            if MsgType.WTP_CHAN_UTIL_REQ in self.templates:
+                results.append(self.do_chan_util(out=out))
+        if hold > 0:
             self.hold(hold)
         return results
 
     def hold(self, seconds):
-        """Stay connected for `seconds`, answering AC Echo Requests so a
+        """Stay connected for `seconds`, answering the AC's requests so a
         Run-state session survives the AC's active keep-alive. Returns the
-        number of Echo Requests answered."""
+        number of AC requests answered."""
         deadline = time.monotonic() + seconds
         answered = 0
         while time.monotonic() < deadline:
             resp_wire = self.transports.recv()
             if resp_wire is None:
                 continue
-            if self._auto_echo(resp_wire):
+            self._record("TX", resp_wire)
+            if self._auto_answer(resp_wire):
                 answered += 1
-        print(f"[hold] {seconds}s in Run state, answered {answered} AC "
-              f"Echo Request(s)")
+        print(f"[hold] held {seconds}s, answered {answered} AC "
+              f"request(s)")
         return answered
 
     def _report(self, res):

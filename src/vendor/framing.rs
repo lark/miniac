@@ -8,9 +8,11 @@
 //! with elements starting at byte 16. H3C AX60-style WTPs use the same shape
 //! for the whole control session (not just discovery) but widen Seq to 4 bytes:
 //!   [base header 8B][Message Type 4B][Seq 4B][MsgElemLen 2B][Flags 1B][elements]
-//! with elements at byte 19 and MsgElemLen self-inclusive (elements + 3). All
-//! offsets handled here are relative to the control payload that follows the
-//! 8-byte base header (i.e. app_data[8..]).
+//! with elements at byte 19. In both, MsgElemLen counts the bytes that follow
+//! the Sequence Number field (RFC 5415 4.5.1.3), i.e. MsgElemLen + Flags +
+//! elements = elements + 3; the AX60/M60 and TL-AP1300GI parsers read it that
+//! way and subtract 3. All offsets handled here are relative to the control
+//! payload that follows the 8-byte base header (i.e. app_data[8..]).
 
 use anyhow::Result;
 
@@ -20,6 +22,12 @@ use crate::capwap::{CtrlHdr, CtrlMsg};
 /// type, Fragment ID 0 and 8-byte length. The AX60 parser addresses fields by
 /// offset, so a fixed valid value is enough for responses.
 const BASE_HEADER: [u8; 8] = [0x00, 0x10, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00];
+
+/// RFC 5415 transport header. TP-Link AC100's defaults
+/// (`cw_ac_create_parsed_pkt` 0x4C0268, packed by `cw_header_assemble`
+/// 0x4CE158): Version 0, Type 0, HLEN 2 (8-byte header, so elements follow at
+/// offset 16), RID 0, WBID 1, T 1.
+const BASE_HEADER_RFC: [u8; 8] = [0x00, 0x10, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CtrlFrame {
@@ -76,19 +84,21 @@ impl CtrlFrame {
     /// Serialize a control message back to wire bytes (including the 8-byte
     /// base header) for transmission.
     pub fn frame(self, msg: &CtrlMsg) -> Vec<u8> {
+        let body_len: usize = msg.elems.iter().map(wire_elem_len).sum();
         match self {
             CtrlFrame::Rfc => {
-                let body_len: usize = msg.elems.iter().map(|e| 4 + e.data.len()).sum();
-                let mut out = Vec::with_capacity(8 + body_len);
+                let mut out = Vec::with_capacity(19 + body_len);
+                out.extend_from_slice(&BASE_HEADER_RFC);
                 out.extend_from_slice(&msg.hdr.msg_type.to_be_bytes());
                 out.push((msg.hdr.seq_num & 0xff) as u8);
-                out.extend_from_slice(&(body_len as u16).to_be_bytes());
+                // MsgElemLen counts the bytes after the Sequence Number field
+                // (RFC 5415 4.5.1.3): its own 2 bytes + Flags + elements.
+                out.extend_from_slice(&((3 + body_len) as u16).to_be_bytes());
                 out.push(msg.hdr.flags);
                 append_elems(&mut out, &msg.elems);
                 out
             }
             CtrlFrame::H3c => {
-                let body_len: usize = msg.elems.iter().map(wire_elem_len_h3c).sum();
                 let mut out = Vec::with_capacity(19 + body_len);
                 out.extend_from_slice(&BASE_HEADER);
                 out.extend_from_slice(&msg.hdr.msg_type.to_be_bytes());
@@ -96,36 +106,16 @@ impl CtrlFrame {
                 // MsgElemLen self-inclusive: bytes 16..end = 3 + elements.
                 out.extend_from_slice(&((3 + body_len) as u16).to_be_bytes());
                 out.push(msg.hdr.flags);
-                append_elems_h3c(&mut out, &msg.elems);
+                append_elems(&mut out, &msg.elems);
                 out
             }
         }
     }
 }
 
-/// Append elements in t2l2 framing (Type:2 BE, Len:2 BE, value).
+/// Append elements in t2l2 framing (Type:2 BE, Len:2 BE, value), widening the
+/// Result Code to the 4-byte form of RFC 5415 4.6.35.
 fn append_elems(out: &mut Vec<u8>, elems: &[crate::capwap::RawElem]) {
-    for e in elems {
-        out.extend_from_slice(&e.tag.to_be_bytes());
-        out.extend_from_slice(&(e.data.len() as u16).to_be_bytes());
-        out.extend_from_slice(&e.data);
-    }
-}
-
-/// On-wire byte count of one element under H3C framing. The AX60 Result-Code
-/// element is a 4-byte value (WTP.dis 0x528b4 reads via 4d5f8 = bcopy4+ntohl),
-/// unlike the RFC 1-octet form, so the length must account for that widening.
-fn wire_elem_len_h3c(e: &crate::capwap::RawElem) -> usize {
-    let data_len = if e.tag == crate::capwap::MsgElemType::RESULT_CODE && e.data.len() == 1 {
-        4
-    } else {
-        e.data.len()
-    };
-    4 + data_len
-}
-
-/// Append elements in H3C t2l2 framing, widening the Result Code element.
-fn append_elems_h3c(out: &mut Vec<u8>, elems: &[crate::capwap::RawElem]) {
     for e in elems {
         out.extend_from_slice(&e.tag.to_be_bytes());
         if e.tag == crate::capwap::MsgElemType::RESULT_CODE && e.data.len() == 1 {
@@ -136,6 +126,19 @@ fn append_elems_h3c(out: &mut Vec<u8>, elems: &[crate::capwap::RawElem]) {
             out.extend_from_slice(&e.data);
         }
     }
+}
+
+/// On-wire byte count of one element. The AX60/M60 and TL-AP1300GI Result-Code
+/// parsers read a 32-bit value (WTP.dis 0x528b4; TL-AP1300GI CWParseResultCode),
+/// unlike the 1-octet form `CtrlMsg` keeps in memory, so encoding must account
+/// for that widening.
+fn wire_elem_len(e: &crate::capwap::RawElem) -> usize {
+    let data_len = if e.tag == crate::capwap::MsgElemType::RESULT_CODE && e.data.len() == 1 {
+        4
+    } else {
+        e.data.len()
+    };
+    4 + data_len
 }
 
 #[cfg(test)]
@@ -207,9 +210,10 @@ mod tests {
     }
 
     #[test]
-    fn h3c_widens_result_code_to_4_bytes() {
-        // A 1-octet RFC Result Code element (Success) must be widened to 4
-        // bytes when framed for the H3C AX60, with MsgElemLen reflecting it.
+    fn result_code_is_four_bytes_in_both_frames() {
+        // A 1-octet RFC Result Code element (Success) must be widened to the
+        // 4-byte value of RFC 5415 4.6.35 on the wire, with MsgElemLen
+        // reflecting it.
         let msg = CtrlMsg::new(4, 2).with_result(crate::capwap::CwResult::Success);
         let out = CtrlFrame::H3c.frame(&msg);
         // Elements start at byte 19: [tag=33 0x0021][len=4][4-byte value].
@@ -217,9 +221,28 @@ mod tests {
         assert_eq!(&out[23..27], &[0x00, 0x00, 0x00, 0x00]);
         // MsgElemLen (at offset 16): 3 + one 8-byte element.
         assert_eq!(u16::from_be_bytes([out[16], out[17]]), 11);
-        // RFC framing (no base header, 8-byte control header) keeps the 1-octet form.
+        // RFC framing: 8-byte base header, then Seq(1) / MsgElemLen(2) / Flags(1)
+        // and the same 4-byte Result Code at offset 16.
         let rfc = CtrlFrame::Rfc.frame(&msg);
-        assert_eq!(&rfc[8..12], &[0x00, 0x21, 0x00, 0x01]);
-        assert_eq!(rfc[12], 0x00);
+        assert_eq!(&rfc[0..8], &BASE_HEADER_RFC);
+        assert_eq!(&rfc[8..12], &[0x00, 0x00, 0x00, 0x04]);
+        assert_eq!(&rfc[16..20], &[0x00, 0x21, 0x00, 0x04]);
+        assert_eq!(&rfc[20..24], &[0x00, 0x00, 0x00, 0x00]);
+        // MsgElemLen counts from the Sequence Number field onward: 3 + 8.
+        assert_eq!(u16::from_be_bytes([rfc[13], rfc[14]]), 11);
+    }
+
+    #[test]
+    fn rfc_msg_elem_len_is_self_inclusive() {
+        // A message with no elements is still 3 bytes past the Sequence Number.
+        let msg = CtrlMsg::new(13, 5);
+        let out = CtrlFrame::Rfc.frame(&msg);
+        assert_eq!(&out[12..16], &[5, 0, 3, 0]);
+        // One 4-byte element: 3 + (4 + 4) = 11, elements start at offset 16.
+        let msg = CtrlMsg::new(14, 7).add_elem(0x0001, &[0u8; 4]);
+        let out = CtrlFrame::Rfc.frame(&msg);
+        assert_eq!(u16::from_be_bytes([out[13], out[14]]), 11);
+        assert_eq!(out.len(), 16 + 8);
+        assert_eq!(&out[16..], &[0, 1, 0, 4, 0, 0, 0, 0]);
     }
 }

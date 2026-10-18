@@ -1,285 +1,910 @@
 <!doctype html>
-<html lang="en">
+<html lang="zh-CN">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>miniac AC — Management Plane</title>
+<title data-i18n="doc.title">miniac AC — 管理面</title>
 <style>
-  :root {
-    --bg: #0f172a; --panel: #1e293b; --line: #334155; --text: #e2e8f0;
-    --muted: #94a3b8; --accent: #38bdf8; --ok: #4ade80; --bad: #f87171;
-  }
-  * { box-sizing: border-box; }
-  body { margin: 0; font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
-         background: var(--bg); color: var(--text); }
-  header { display: flex; align-items: center; justify-content: space-between;
-           padding: 16px 24px; border-bottom: 1px solid var(--line); }
-  header h1 { font-size: 18px; margin: 0; }
-  header h1 span { color: var(--accent); }
-  .stats { display: flex; gap: 16px; color: var(--muted); font-size: 13px; }
-  main { padding: 24px; display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }
-  @media (max-width: 1100px) { main { grid-template-columns: 1fr; } }
-  section { background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
-            padding: 16px; min-width: 0; }
-  section h2 { font-size: 14px; text-transform: uppercase; letter-spacing: .06em;
-               color: var(--muted); margin: 0 0 12px; }
-  table { width: 100%; border-collapse: collapse; font-size: 13px; }
-  th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--line); }
-  th { color: var(--muted); font-weight: 600; white-space: nowrap; }
-  td { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 220px; }
-  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
-  .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 12px; }
-  .run { background: rgba(74,222,128,.15); color: var(--ok); }
-  .other { background: rgba(148,163,184,.15); color: var(--muted); }
-  .pending { background: rgba(250,204,21,.15); color: #facc15; }
-  .empty { color: var(--muted); font-size: 13px; padding: 8px; }
-  #events { max-height: 360px; overflow: auto; }
-  #events li { padding: 5px 0; border-bottom: 1px solid var(--line); font-size: 12.5px; }
-  #events .ts { color: var(--muted); margin-right: 8px; font-family: ui-monospace, monospace; }
-  form.inline { display: flex; gap: 8px; margin-bottom: 12px; }
-  input, select, button { background: var(--bg); color: var(--text); border: 1px solid var(--line);
-         border-radius: 6px; padding: 6px 10px; font-size: 13px; }
-  button { cursor: pointer; background: var(--accent); color: #0f172a; font-weight: 600; border: none; }
-  button:hover { filter: brightness(1.08); }
+  :root{--bg:#0f172a;--panel:#1e293b;--panel2:#172033;--line:#334155;--text:#e2e8f0;--muted:#94a3b8;
+    --accent:#38bdf8;--ok:#4ade80;--warn:#facc15;--bad:#f87171;--sidebar:#0b1220;--sidebar-hover:#1b2740;}
+  *{box-sizing:border-box;}
+  body{margin:0;font-family:ui-sans-serif,system-ui,-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+       background:var(--bg);color:var(--text);font-size:14px;}
+  .layout{display:grid;grid-template-columns:238px 1fr;min-height:100vh;}
+  aside{background:var(--sidebar);border-right:1px solid var(--line);padding:16px 12px;position:sticky;top:0;height:100vh;overflow:auto;}
+  .brand{display:flex;align-items:center;gap:10px;padding:6px 10px 16px;font-size:17px;font-weight:700;letter-spacing:.02em;}
+  .brand .dot{width:10px;height:10px;border-radius:3px;background:var(--accent);box-shadow:0 0 10px var(--accent);}
+  .brand .ac{color:var(--accent);}
+  .group{margin:14px 8px 6px;font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:#64748b;}
+  nav a{display:flex;align-items:center;gap:10px;padding:9px 12px;border-radius:8px;color:var(--muted);margin:2px 0;cursor:pointer;}
+  nav a svg{width:17px;height:17px;flex:0 0 17px;stroke:currentColor;fill:none;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round;}
+  nav a:hover{background:var(--sidebar-hover);color:var(--text);}
+  nav a.active{background:linear-gradient(90deg,rgba(56,189,248,.18),rgba(56,189,248,.04));color:#fff;box-shadow:inset 2px 0 0 var(--accent);}
+  .foot{position:sticky;bottom:0;color:#475569;font-size:11px;padding:14px 10px 4px;}
+  .top{display:flex;align-items:center;justify-content:space-between;padding:16px 26px;border-bottom:1px solid var(--line);background:var(--panel2);position:sticky;top:0;z-index:5;}
+  .top h1{font-size:18px;margin:0;font-weight:650;}
+  .top .right{display:flex;align-items:center;gap:16px;color:var(--muted);font-size:13px;}
+  .live{display:inline-flex;align-items:center;gap:6px;} .live i{width:8px;height:8px;border-radius:50%;background:var(--ok);box-shadow:0 0 8px var(--ok);display:inline-block;}
+  .btn{background:var(--accent);color:#08131f;border:none;border-radius:7px;padding:7px 13px;font-weight:650;font-size:13px;cursor:pointer;}
+  .btn.ghost{background:transparent;border:1px solid var(--line);color:var(--text);font-weight:500;}
+  .btn.ok{background:var(--ok);color:#06240f;} .btn.bad{background:var(--bad);color:#2a0d0d;}
+  .btn.sm{padding:4px 9px;font-size:12px;} .btn:hover{filter:brightness(1.1);} .btn:disabled{opacity:.45;cursor:not-allowed;filter:none;}
+  .burger{display:none;}
+  main{padding:24px 26px;min-width:0;}
+  .page{display:none;} .page.on{display:block;}
+  .pbar{display:flex;align-items:center;gap:12px;justify-content:flex-end;margin-bottom:14px;font-size:12.5px;}
+  .pbar select{padding:4px 6px;}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:11px;padding:16px;margin-bottom:18px;min-width:0;}
+  .card h2{font-size:13px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin:0 0 12px;}
+  .grid{display:grid;gap:16px;} .cols-2{grid-template-columns:1fr 1fr;} .cols-3{grid-template-columns:repeat(3,1fr);}
+  .cols-4{grid-template-columns:repeat(4,1fr);} .cols-5{grid-template-columns:repeat(5,1fr);}
+  @media(max-width:1180px){.cols-4,.cols-5{grid-template-columns:repeat(2,1fr);}.cols-2,.cols-3{grid-template-columns:1fr;}}
+  @media(max-width:900px){.layout{grid-template-columns:1fr;}aside{position:fixed;left:-260px;transition:.2s;z-index:20;width:238px;}aside.open{left:0;}.burger{display:inline-flex!important;}}
+  table{width:100%;border-collapse:collapse;font-size:13px;}
+  th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line);}
+  /* Drop the trailing rule so a table is defined by its header line plus row
+     separators, not a lone bottom frame line. */
+  tbody tr:last-child td{border-bottom:none;}
+  th{color:var(--muted);font-weight:600;white-space:nowrap;}
+  td.mono,th.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;}
+  tbody tr:hover{background:rgba(56,189,248,.05);}
+  .muted{color:var(--muted);}
+  .pill{display:inline-block;padding:2px 9px;border-radius:999px;font-size:12px;font-weight:600;}
+  .p-ok{background:rgba(74,222,128,.15);color:var(--ok);}.p-warn{background:rgba(250,204,21,.15);color:var(--warn);}
+  .p-bad{background:rgba(248,113,113,.15);color:var(--bad);}.p-muted{background:rgba(148,163,184,.15);color:var(--muted);}
+  .stat{background:var(--panel);border:1px solid var(--line);border-radius:11px;padding:16px;}
+  .stat .k{font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;}
+  .stat .v{font-size:26px;font-weight:700;margin-top:6px;}
+  .bar{height:8px;border-radius:6px;background:var(--line);margin-top:10px;overflow:hidden;display:flex;}
+  .bar i{display:block;height:100%;}
+  .legend{display:flex;gap:14px;font-size:12px;color:var(--muted);margin-top:8px;flex-wrap:wrap;}
+  .legend b{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:5px;}
+  .chips{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:4px;}
+  .chip{border:1px solid var(--line);background:transparent;color:var(--muted);border-radius:999px;padding:5px 12px;font-size:12.5px;cursor:pointer;}
+  .chip.on{background:var(--accent);color:#08131f;border-color:var(--accent);font-weight:650;}
+  .chip.all{border-style:dashed;}
+  .feed{list-style:none;margin:0;padding:0;max-height:440px;overflow:auto;}
+  .feed li{padding:7px 2px;border-bottom:1px solid var(--line);font-size:13px;display:flex;gap:10px;align-items:baseline;}
+  .feed .ts{color:var(--muted);font-family:ui-monospace,monospace;font-size:12px;min-width:64px;}
+  .feed .cat{font-size:11px;padding:1px 7px;border-radius:6px;min-width:64px;text-align:center;}
+  .cat-system{background:#334155;color:#cbd5e1;}.cat-device{background:rgba(56,189,248,.2);color:var(--accent);}
+  .cat-station{background:rgba(74,222,128,.18);color:var(--ok);}.cat-radio{background:rgba(168,85,247,.2);color:#c084fc;}
+  .cat-security{background:rgba(250,204,21,.18);color:var(--warn);}.cat-firmware{background:rgba(251,146,60,.2);color:#fb923c;}
+  .cat-roaming{background:rgba(244,114,182,.2);color:#f472b6;}.cat-admin{background:rgba(148,163,184,.2);color:var(--muted);}
+  .lv-error{color:var(--bad);}
+  .tabs{display:flex;gap:6px;border-bottom:1px solid var(--line);margin-bottom:16px;}
+  .tabs button{background:transparent;border:none;color:var(--muted);padding:10px 16px;cursor:pointer;font-size:14px;border-bottom:2px solid transparent;}
+  .tabs button.on{color:#fff;border-bottom-color:var(--accent);font-weight:650;}
+  .toolbar{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-bottom:14px;}
+  input,select{background:var(--bg);color:var(--text);border:1px solid var(--line);border-radius:7px;padding:6px 9px;font-size:13px;}
+  input::placeholder{color:#64748b;}
+  .note{font-size:12px;color:var(--muted);margin-top:10px;line-height:1.7;}
+  .kv{display:grid;grid-template-columns:110px 1fr;gap:8px 10px;font-size:13px;}
+  .kv div:nth-child(odd){color:var(--muted);}
+  /* modal */
+  .mask{position:fixed;inset:0;background:rgba(3,7,18,.55);display:none;z-index:30;}
+  .mask.on{display:block;}
+  .modal{position:fixed;top:0;right:0;height:100vh;width:400px;max-width:92vw;background:var(--panel);border-left:1px solid var(--accent);
+         z-index:31;padding:18px;overflow:auto;transform:translateX(100%);transition:.2s;}
+  .modal.on{transform:none;}
+  .modal h3{margin:0 0 4px;font-size:15px;}
+  .modal .sub{color:var(--muted);font-size:12px;margin-bottom:14px;}
+  .field{display:grid;grid-template-columns:112px 1fr;gap:8px 10px;align-items:center;font-size:13px;margin-bottom:10px;}
+  .field label{color:var(--muted);}
+  .hint{font-size:11px;color:#64748b;margin:-4px 0 10px 122px;}
+  .seg{display:inline-flex;gap:14px;} .seg label{color:var(--muted);display:inline-flex;align-items:center;gap:5px;}
+  .mfoot{display:flex;gap:10px;margin-top:16px;padding-top:14px;border-top:1px solid var(--line);}
+  .toast{position:fixed;right:24px;bottom:24px;background:var(--panel);border:1px solid var(--accent);color:var(--text);
+         padding:12px 16px;border-radius:10px;box-shadow:0 8px 24px rgba(0,0,0,.4);font-size:13px;z-index:50;}
 </style>
 </head>
 <body>
-<header>
-  <h1>miniac <span>AC</span> — Management Plane</h1>
-  <div class="stats">
-    <span id="stat-devices">APs —</span>
-    <span id="stat-stations">Stations —</span>
+<div class="layout">
+  <aside id="side">
+    <div class="brand"><span class="dot"></span><span>mini<b class="ac">ac</b></span></div>
+    <div id="nav"></div>
+    <div class="foot">© 2026</div>
+  </aside>
+  <div>
+    <div class="top">
+      <div style="display:flex;align-items:center;gap:12px;">
+        <button class="btn ghost burger" onclick="document.getElementById('side').classList.toggle('open')">☰</button>
+        <h1 id="title" data-i18n="nav.status">状态</h1>
+      </div>
+      <div class="right">
+        <span class="live"><i></i><span id="top-aps" data-i18n="top.apsShort">AP —</span></span>
+        <span><span id="top-sta" data-i18n="top.staShort">客户端 —</span></span>
+      </div>
+    </div>
+
+    <main>
+      <!-- status -->
+      <section class="page" id="p-status">
+        <div class="grid cols-5">
+          <div class="stat"><div class="k" data-i18n="stat.aps">AP 总数</div><div class="v" id="s-aps">—</div></div>
+          <div class="stat"><div class="k" data-i18n="stat.run">已确认</div><div class="v" id="s-run" style="color:var(--ok)">—</div></div>
+          <div class="stat"><div class="k" data-i18n="stat.pend">待确认</div><div class="v" id="s-pend" style="color:var(--warn)">—</div></div>
+          <div class="stat"><div class="k" data-i18n="stat.sta">客户端</div><div class="v" id="s-sta">—</div></div>
+          <div class="stat"><div class="k" data-i18n="stat.fw">固件镜像</div><div class="v" id="s-fw">—</div></div>
+        </div>
+        <div class="card" style="margin-top:18px">
+          <h2 data-i18n="card.apdist">AP 状态分布</h2>
+          <div class="bar" id="s-bar"><i></i><i></i><i></i></div>
+          <div class="legend" id="s-legend"></div>
+        </div>
+        <div class="grid cols-2">
+          <div class="card"><h2 data-i18n="card.recentlog">最近日志</h2><ul class="feed" id="dash-feed"></ul></div>
+          <div class="card"><h2 data-i18n="card.radiooverview">射频概览</h2>
+            <table><thead><tr><th data-i18n="th.ap">AP</th><th data-i18n="th.band">Band</th><th data-i18n="th.channel">信道</th><th data-i18n="th.power">功率</th><th data-i18n="th.clients">客户端</th><th data-i18n="th.state">状态</th></tr></thead>
+              <tbody id="dash-radio"></tbody></table>
+          </div>
+        </div>
+        <div class="card"><h2 data-i18n="card.ssidsum">SSID 简况（仅已启用）</h2>
+          <table><thead><tr><th data-i18n="th.ssid">SSID</th><th data-i18n="th.bandZh">频段</th><th data-i18n="th.aps">覆盖 AP</th><th data-i18n="th.clients">客户端</th></tr></thead><tbody id="dash-ssid"></tbody></table>
+        </div>
+      </section>
+
+      <!-- logs -->
+      <section class="page" id="p-logs">
+        <div class="card">
+          <h2 data-i18n="card.logs">日志 · 分类过滤（可多选）</h2>
+          <div class="chips" id="ev-chips"></div>
+          <div class="note" id="ev-hint"></div>
+          <ul class="feed" id="ev-feed" style="margin-top:12px"></ul>
+          <div class="note" data-i18n-html="logs.noteHtml">刷新语义：本页用 <b>GET /api/events?since=</b> 增量拉取，最新日志显示在最前。</div>
+        </div>
+      </section>
+
+      <!-- clients -->
+      <section class="page" id="p-clients">
+        <div class="card">
+          <h2 data-i18n="card.clients">客户端列表</h2>
+          <div class="toolbar">
+            <input id="sta-q" data-i18n-ph="ph.searchSta" placeholder="搜索 MAC / SSID / AP" style="width:220px">
+            <select id="sta-f"><option value="">全部 AP</option></select>
+            <button class="btn ghost sm" data-i18n="btn.search" onclick="renderClients()">搜索</button>
+          </div>
+          <table><thead><tr><th data-i18n="th.mac">MAC地址</th><th data-i18n="th.apname">AP备注</th><th data-i18n="th.radioUnit">射频单元</th><th data-i18n="th.ssid">SSID</th><th data-i18n="th.ip">IP</th><th data-i18n="th.joined">接入时间</th><th data-i18n="th.signal">信号强度</th><th data-i18n="th.state">状态</th><th data-i18n="th.disconnect">断开</th></tr></thead>
+            <tbody id="sta-rows"></tbody></table>
+          <div class="note" data-i18n="clients.note">状态列保留已断开的客户端（disc），便于排查；断开操作向 AP 下发 Release Client 请求。</div>
+        </div>
+      </section>
+
+      <!-- wireless -->
+      <section class="page" id="p-wireless">
+        <div class="toolbar">
+          <div class="tabs" style="margin:0;border:none">
+            <button class="on" onclick="wSetBand(1,this)">2.4GHz</button><button onclick="wSetBand(2,this)">5GHz</button>
+          </div>
+          <span style="flex:1"></span>
+          <span class="muted" id="w-pending"></span>
+          <button class="btn sm" data-i18n="btn.commit" onclick="commitWcfg()">提交</button>
+        </div>
+        <div class="card">
+          <h2 data-i18n="card.ssidset">SSID 设置（全局）</h2>
+          <table><thead><tr><th data-i18n="th.seq">序号</th><th data-i18n="th.wlanname">无线网络名称</th><th data-i18n="th.security">加密方式</th><th data-i18n="th.psk">密码</th><th data-i18n="th.state">状态</th><th data-i18n="th.clientsnum">客户端数目</th><th data-i18n="th.ops">操作</th></tr></thead>
+            <tbody id="w-ssid-rows"></tbody></table>
+          <div class="toolbar" style="margin:12px 0 0">
+            <button class="btn ghost sm" data-i18n="btn.addSsid" onclick="addSsid()">添加 SSID</button>
+            <button class="btn ghost sm" data-i18n="btn.recommend" onclick="recommendSsid()">按设备能力推荐</button>
+          </div>
+          <div class="note" data-i18n="wireless.ssidNote">全局 SSID 与频段绑定，应用到所有已确认 AP。已有 SSID 以文本显示，点击行尾「编辑」进入弹窗修改（取消即放弃，不产生待提交变更）；在末尾空行输入名称即可新增，并自动追加下一空行。</div>
+        </div>
+        <div class="card">
+          <h2 data-i18n="card.radioset">射频设置（全局）</h2>
+          <div class="toolbar">
+            <label class="muted"><input type="checkbox" id="r-en"> <span data-i18n="radio.enable">启用该射频</span></label>
+            <label class="muted" style="margin-left:14px" data-i18n="th.channel">信道</label>
+            <select id="r-chmode"><option value="0" data-i18n="radio.auto">自动</option><option value="1" data-i18n="radio.manual">手动</option></select>
+            <input type="number" id="r-ch" style="width:80px">
+            <label class="muted" data-i18n="radio.power">功率(%)</label>
+            <input type="number" id="r-pw" style="width:80px">
+            <button class="btn sm" data-i18n="btn.apply" onclick="saveGlobalRadio()">应用</button>
+          </div>
+          <div class="note" data-i18n="wireless.radioNote">全局射频设置应用到所有已确认 AP；信号强度以百分比设置，下发时按机型映射。信道选“自动”由 AP 自行选择（ACS），手动时指定信道号。</div>
+        </div>
+        <div class="card">
+          <h2 data-i18n="card.overrides">AP 覆盖设置</h2>
+          <table><thead><tr><th data-i18n="th.apname2">AP 备注</th><th data-i18n="th.channel">信道</th><th data-i18n="th.power">功率</th><th data-i18n="th.state">状态</th><th data-i18n="th.ops">操作</th></tr></thead>
+            <tbody id="w-ov-rows"></tbody></table>
+          <div class="note" data-i18n="wireless.overNote">某台 AP 可单独覆盖全局的信道/功率；“恢复全局”清除该 AP 的覆盖。</div>
+        </div>
+      </section>
+
+      <!-- device status -->
+      <section class="page" id="p-devices">
+        <div class="card">
+          <h2 data-i18n="card.devstatus">设备状态</h2>
+          <table><thead><tr><th data-i18n="th.apname">AP 备注</th><th data-i18n="th.vendor">厂商</th><th data-i18n="th.model">型号</th><th data-i18n="th.mac">MAC</th><th data-i18n="th.ip">IP</th><th data-i18n="th.state">状态</th><th data-i18n="th.radiosClients">Radios (客户端)</th><th data-i18n="th.ops">操作</th></tr></thead>
+            <tbody id="dev-rows"></tbody></table>
+        </div>
+      </section>
+
+      <!-- device management -->
+      <section class="page" id="p-devmgmt">
+        <div class="card">
+          <h2 data-i18n="card.devmgmt">设备管理</h2>
+          <div class="toolbar">
+            <input id="mgmt-q" data-i18n-ph="ph.searchAp" placeholder="搜索 AP 备注 / MAC" style="width:220px">
+            <select id="mgmt-f"><option value="" data-i18n="opt.allStates">全部状态</option><option value="ok" data-i18n="opt.approved">已确认</option><option value="pending" data-i18n="opt.pending">待确认</option></select>
+            <button class="btn ghost sm" data-i18n="btn.search" onclick="renderDevmgmt()">搜索</button>
+          </div>
+          <table><thead><tr><th data-i18n="th.apname">AP 备注</th><th data-i18n="th.vendor">厂商</th><th data-i18n="th.model">型号</th><th data-i18n="th.mac">MAC</th><th data-i18n="th.hw">硬件</th><th data-i18n="th.sw">软件</th><th data-i18n="th.state">状态</th><th data-i18n="th.ops">操作</th></tr></thead>
+            <tbody id="mgmt-rows"></tbody></table>
+          <div class="note" data-i18n="devmgmt.note">重启 / 停用 需 H3C 私有 Reset / Clear-Configuration 消息号（待反汇编，暂未启用）。</div>
+        </div>
+      </section>
+
+      <!-- firmware -->
+      <section class="page" id="p-firmware">
+        <div class="card">
+          <h2 data-i18n="card.fwupload">上传固件</h2>
+          <div class="toolbar">
+            <input id="fw-vendor" data-i18n-ph="ph.vendor" placeholder="vendor (h3c)"><input id="fw-model" data-i18n-ph="ph.model" placeholder="model (mini-ax60)">
+            <input id="fw-hw" data-i18n-ph="ph.hw" placeholder="hw_version (1.0)"><input type="file" id="fw-file">
+            <button class="btn sm" data-i18n="btn.upload" onclick="uploadFirmware()">上传</button>
+          </div>
+          <div class="note" data-i18n="fw.note">存盘 firmware/{vendor}/{model}/{hw_version}/{file}，上传计算 MD5 入库。</div>
+        </div>
+        <div class="card">
+          <h2 data-i18n="card.fwlist">镜像列表</h2>
+          <table><thead><tr><th>Path</th><th>Size</th><th>MD5</th><th>Uploaded</th></tr></thead>
+            <tbody id="fw-rows"></tbody></table>
+        </div>
+      </section>
+
+      <!-- system -->
+      <section class="page" id="p-system">
+        <div class="grid cols-2">
+          <div class="card"><h2 data-i18n="card.acinfo">AC 信息</h2>
+            <div class="kv"><div data-i18n="kv.acname">AC 名称</div><div>miniac</div>
+              <div data-i18n="kv.ctlport">控制端口</div><div class="mono">5246</div>
+              <div data-i18n="kv.weblisten">Web 监听</div><div class="muted" data-i18n-html="kv.weblistenVal">由启动参数 <b>-l ip[:port]</b> 指定</div></div>
+            <div class="note" data-i18n-html="sys.runNote">运行提示：启动 miniac 测试时绑定内网地址而非 <span class="mono">0.0.0.0</span>。</div>
+          </div>
+          <div class="card"><h2 data-i18n="card.notes">说明</h2>
+            <div class="note" data-i18n="sys.notes">登录鉴权、地址池/租约、日志级别等系统项的后端接口尚未提供（列入后续阶段）。</div>
+          </div>
+        </div>
+      </section>
+    </main>
   </div>
-</header>
-<main>
-  <section id="devices-sec">
-    <h2>Access Points</h2>
-    <table>
-      <thead><tr><th>MAC</th><th>Name</th><th>Address</th><th>SW</th><th>State</th><th>Upgrade</th></tr></thead>
-      <tbody id="devices"></tbody>
-    </table>
-    <div class="empty" id="devices-empty" hidden>No WTPs yet. They appear after joining via CAPWAP.</div>
-  </section>
+</div>
 
-  <section>
-    <h2>Device Metadata</h2>
-    <form class="inline" id="meta-form">
-      <input id="meta-mac" placeholder="aa:bb:cc:dd:ee:ff" class="mono">
-      <input id="meta-name" placeholder="Display name">
-      <input id="meta-desc" placeholder="Description">
-      <button type="submit">Save</button>
-    </form>
-    <div class="empty">Set the user-facing name and description for a known AP.</div>
-  </section>
-
-  <section id="stations-sec">
-    <h2>Client Stations</h2>
-    <table>
-      <thead><tr><th>Client MAC</th><th>WTP</th><th>SSID</th><th>State</th><th>RSSI</th></tr></thead>
-      <tbody id="stations"></tbody>
-    </table>
-    <div class="empty" id="stations-empty" hidden>No associated clients.</div>
-  </section>
-
-  <section id="radios-sec">
-    <h2>Radios</h2>
-    <table>
-      <thead><tr><th>WTP</th><th>Radio</th><th>Band</th><th>Channel</th><th>TX</th></tr></thead>
-      <tbody id="radios"></tbody>
-    </table>
-    <div class="empty" id="radios-empty" hidden>No radio state reported yet.</div>
-  </section>
-
-  <section id="profiles-sec">
-    <h2>Security Profiles</h2>
-    <table>
-      <thead><tr><th>Name</th><th>Method</th><th>Cipher</th><th>Caps</th></tr></thead>
-      <tbody id="profiles"></tbody>
-    </table>
-    <div class="empty" id="profiles-empty" hidden>No profiles defined.</div>
-  </section>
-
-  <section>
-    <h2>Add Security Profile</h2>
-    <form class="inline" id="profile-form">
-      <input id="profile-name" placeholder="name">
-      <select id="profile-method">
-        <option value="wpa2-psk">wpa2-psk</option>
-        <option value="wpa3-sae">wpa3-sae</option>
-        <option value="802.1x">802.1x</option>
-      </select>
-      <select id="profile-cipher">
-        <option value="ccmp">ccmp</option>
-        <option value="tkip">tkip</option>
-      </select>
-      <button type="submit">Add</button>
-    </form>
-  </section>
-
-  <section id="firmware-sec">
-    <h2>Firmware Images</h2>
-    <table>
-      <thead><tr><th>Path</th><th>Size</th><th>MD5</th><th>Uploaded</th></tr></thead>
-      <tbody id="firmware"></tbody>
-    </table>
-    <div class="empty" id="firmware-empty" hidden>No firmware uploaded.</div>
-  </section>
-
-  <section>
-    <h2>Upload Firmware</h2>
-    <form class="inline" id="fw-form" style="flex-wrap:wrap">
-      <input id="fw-vendor" placeholder="vendor (tplink)">
-      <input id="fw-model" placeholder="model (ac100)">
-      <input id="fw-hw" placeholder="hw_version (v3)">
-      <input id="fw-file" type="file">
-      <button type="submit">Upload</button>
-    </form>
-    <div class="empty">Stored as firmwares/{vendor}/{model}/{hw_version}/{file}</div>
-  </section>
-
-  <section id="events-sec">
-    <h2>Management Events</h2>
-    <ul id="events" style="list-style:none; margin:0; padding:0;"></ul>
-    <div class="empty" id="events-empty" hidden>No events recorded.</div>
-  </section>
-</main>
+<!-- shared modal -->
+<div class="mask" id="mask" onclick="closeModal()"></div>
+<div class="modal" id="modal">
+  <h3 id="m-title">—</h3><div class="sub" id="m-sub"></div>
+  <div id="m-body"></div>
+  <div class="mfoot">
+    <button class="btn" id="m-ok" data-i18n="btn.save">保存</button>
+    <button class="btn ghost" data-i18n="btn.cancel" onclick="closeModal()">取消</button>
+  </div>
+</div>
 
 <script>
-const $ = (id) => document.getElementById(id);
-const esc = (s) => String(s ?? '').replace(/[&<>"']/g,
-  c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const $=(id)=>document.getElementById(id);
+const esc=(s)=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 
-async function getJson(url) {
-  const r = await fetch(url);
-  if (!r.ok) throw new Error(url + ' ' + r.status);
-  return r.json();
+/* ---------- i18n: locale picked from the browser, zh-CN or en (no build step) ---------- */
+const I18N={
+'zh-CN':{
+  'doc.title':'miniac AC — 管理面',
+  'top.apsShort':'AP —','top.staShort':'客户端 —',
+  'top.aps':'AP 已确认 {n} / {t}','top.sta':'客户端 {n}',
+  'nav.g.overview':'概览','nav.g.wireless':'无线','nav.g.devices':'设备','nav.g.system':'系统',
+  'nav.status':'状态','nav.logs':'日志','nav.clients':'客户端','nav.wireless':'无线设置',
+  'nav.devices':'设备状态','nav.devmgmt':'设备管理','nav.firmware':'固件存储','nav.system':'系统设置',
+  'stat.aps':'AP 总数','stat.run':'已确认','stat.pend':'待确认','stat.sta':'客户端','stat.fw':'固件镜像',
+  'card.apdist':'AP 状态分布','card.recentlog':'最近日志','card.radiooverview':'射频概览',
+  'th.ap':'AP','th.band':'Band','th.channel':'信道','th.power':'功率','th.clients':'客户端','th.state':'状态',
+  'card.ssidsum':'SSID 简况（仅已启用）','th.ssid':'SSID','th.bandZh':'频段','th.aps':'覆盖 AP',
+  'status.legendOk':'已确认 {n}','status.legendPend':'待确认 {n}','status.fsm':'（运行态 FSM 在内存中，DB 仅存生命周期状态）',
+  'empty.logs':'暂无日志','radio.auto':'自动','radio.manual':'手动','empty.radios':'暂无射频状态','empty.ssidEnabled':'无已启用 SSID',
+  'card.logs':'日志 · 分类过滤（可多选）',
+  'logs.noteHtml':'刷新语义：本页用 <b>GET /api/events?since=</b> 增量拉取，最新日志显示在最前。',
+  'logs.all':'全部','logs.hintNone':'未选择任何分类（点“全部”可一键全开）','logs.hintAll':'已全选 {n} 个分类','logs.hintSel':'已选：{list}',
+  'empty.logsFiltered':'该分类组合下暂无日志',
+  'card.clients':'客户端列表','ph.searchSta':'搜索 MAC / SSID / AP','opt.allAps':'全部 AP','btn.search':'搜索',
+  'th.mac':'MAC地址','th.apname':'AP备注','th.radioUnit':'射频单元','th.ip':'IP','th.joined':'接入时间','th.signal':'信号强度','th.disconnect':'断开',
+  'clients.note':'状态列保留已断开的客户端（disc），便于排查；断开操作向 AP 下发 Release Client 请求。',
+  'empty.clients':'暂无客户端','btn.disconnect':'断开','toast.disconnectSent':'已下发断开：{mac}',
+  'btn.commit':'提交','card.ssidset':'SSID 设置（全局）',
+  'th.seq':'序号','th.wlanname':'无线网络名称','th.security':'加密方式','th.psk':'密码','th.clientsnum':'客户端数目','th.ops':'操作',
+  'btn.addSsid':'添加 SSID','btn.recommend':'按设备能力推荐',
+  'wireless.ssidNote':'全局 SSID 与频段绑定，应用到所有已确认 AP。已有 SSID 以文本显示，点击行尾「编辑」进入弹窗修改（取消即放弃，不产生待提交变更）；在末尾空行输入名称即可新增，并自动追加下一空行。',
+  'card.radioset':'射频设置（全局）','radio.enable':'启用该射频','radio.power':'功率(%)','btn.apply':'应用',
+  'wireless.radioNote':'全局射频设置应用到所有已确认 AP；信号强度以百分比设置，下发时按机型映射。信道选“自动”由 AP 自行选择（ACS），手动时指定信道号。',
+  'card.overrides':'AP 覆盖设置','th.apname2':'AP 备注','wireless.overNote':'某台 AP 可单独覆盖全局的信道/功率；“恢复全局”清除该 AP 的覆盖。',
+  'ssid.enabled':'已启用','ssid.disabled':'已禁用','btn.editSsid':'编辑','ssid.newRow':'新增','ssid.newPlaceholder':'输入名称新增 SSID…','ssid.unconfigured':'未配置',
+  'ov.inherit':'继承','ov.overridden':'已覆盖','ov.global':'全局','btn.modify':'修改','btn.revert':'恢复全局',
+  'empty.approvedAps':'暂无已确认 AP','wireless.pending':'待同步 {n} 台 AP','wireless.synced':'配置已同步',
+  'card.devstatus':'设备状态','th.vendor':'厂商','th.model':'型号','th.hw':'硬件','th.sw':'软件','th.radiosClients':'Radios (客户端)',
+  'empty.devices':'暂无设备','btn.approve':'确认接入','btn.edit':'修改','toast.approved':'已确认 {mac}','dev.pending':'待确认',
+  'card.devmgmt':'设备管理','ph.searchAp':'搜索 AP 备注 / MAC','opt.allStates':'全部状态','opt.approved':'已确认','opt.pending':'待确认',
+  'btn.reset':'重启','btn.disable':'停用','btn.upgrade':'更新固件',
+  'devmgmt.note':'重启 / 停用 需 H3C 私有 Reset / Clear-Configuration 消息号（待反汇编，暂未启用）。',
+  'card.fwupload':'上传固件','ph.vendor':'vendor (h3c)','ph.model':'model (mini-ax60)','ph.hw':'hw_version (1.0)','btn.upload':'上传',
+  'fw.note':'存盘 firmware/{vendor}/{model}/{hw_version}/{file}，上传计算 MD5 入库。','card.fwlist':'镜像列表','empty.fw':'暂无镜像',
+  'toast.fwUploaded':'固件已上传','toast.fwUploadFail':'上传失败：{msg}','toast.noFw':'暂无固件镜像，请先上传',
+  'modal.upgrade':'更新固件','modal.upgradeSub':'目标 AP：{mac}','field.fwImage':'固件镜像','btn.pushUpgrade':'下发升级','toast.upgradeSent':'升级已下发（Image Data）',
+  'card.acinfo':'AC 信息','kv.acname':'AC 名称','kv.ctlport':'控制端口','kv.weblisten':'Web 监听','kv.weblistenVal':'由启动参数 <b>-l ip[:port]</b> 指定',
+  'sys.runNote':'运行提示：启动 miniac 测试时绑定内网地址而非 <span class="mono">0.0.0.0</span>。',
+  'card.notes':'说明','sys.notes':'登录鉴权、地址池/租约、日志级别等系统项的后端接口尚未提供（列入后续阶段）。',
+  'btn.save':'保存','btn.cancel':'取消','toast.loadFail':'加载失败：{msg}','toast.opFail':'操作失败：{msg}','toast.fail':'失败：{msg}',
+  'modal.override':'AP 覆盖设置','field.channelInherit':'信道（留空=继承全局）','field.powerInherit':'功率%（留空=继承全局）',
+  'override.hint':'覆盖会替换该 AP 上对应频段的全局信道/功率；清除请用“恢复全局”。',
+  'toast.overrideSet':'覆盖已设置，待提交同步','toast.overrideCleared':'已恢复全局，待提交同步',
+  'toast.manualChannel':'手动信道需填写信道号','toast.radioApplied':'全局射频已应用，待提交同步','toast.saveFail':'保存失败：{msg}',
+  'toast.noPending':'没有待同步的 AP','toast.committed':'已下发 {n} 台','toast.committedOffline':'，{n} 台离线（下次上线生效）','toast.commitFail':'提交失败：{msg}',
+  'confirm.reset':'确定重启 AP {name} ？','toast.resetSent':'重启已下发：{name}',
+  'confirm.disable':'确定停用 AP {name} ？将清除其配置并重启。','toast.disableSent':'停用已下发：{name}',
+  'modal.editDevice':'修改设备','modal.editDeviceSub':'MAC {mac}','field.name':'备注名称','field.desc':'说明','toast.saved':'已保存',
+  'modal.editSsid':'修改 SSID','modal.addSsid':'新增 SSID','modal.ssidSub':'全局 · {band}',
+  'field.ssidName':'无线网络名称','field.akm':'密钥管理','field.cipher':'加密算法','field.pmf':'管理帧保护','field.psk':'PSK 密码',
+  'field.rekey':'组密钥更新','field.seconds':'秒','field.broadcast':'开启广播','field.broadcastChk':'广播 SSID','field.isolate':'内部隔离','field.isolateChk':'隔离客户端',
+  'field.enable':'启用此网络','field.enableChk':'启用',
+  'ssid.modalHint':'非「不加密」需 8~63 字符；密钥管理与加密算法为两个独立维度',
+  'err.ssidEmpty':'名称不能为空','toast.ssidSaved':'SSID 已保存，待提交同步','toast.ssidWarn':' · 兼容性提示：{msg}',
+  'toast.recommendFail':'无法推荐：{msg}','rec.insufficient':'设备能力不足','rec.note':'推荐：{akm} / {cipher}','rec.legacy':'另建 legacy 独立 SSID：{akm} / {cipher}','toast.recommendErr':'推荐失败：{msg}',
+  'akm.open':'不加密','akm.psk':'WPA2-PSK','akm.psksae':'WPA2/WPA3 混合','akm.sae':'WPA3-SAE',
+  'cipher.tkip':'TKIP','cipher.ccmp':'AES','cipher.both':'TKIP+AES',
+  'pmf.disabled':'关闭','pmf.capable':'可选','pmf.required':'强制',
+  'pbar.updatedLabel':'更新于','pbar.autorefresh':'自动刷新','pbar.off':'关','pbar.refresh':'刷新',
+  'sep.semi':'；',
+},
+'en':{
+  'doc.title':'miniac AC — Management',
+  'top.apsShort':'AP —','top.staShort':'Clients —',
+  'top.aps':'APs approved {n} / {t}','top.sta':'Clients {n}',
+  'nav.g.overview':'Overview','nav.g.wireless':'Wireless','nav.g.devices':'Devices','nav.g.system':'System',
+  'nav.status':'Status','nav.logs':'Logs','nav.clients':'Clients','nav.wireless':'Wireless',
+  'nav.devices':'Devices','nav.devmgmt':'Device Mgmt','nav.firmware':'Firmware','nav.system':'System',
+  'stat.aps':'Total APs','stat.run':'Approved','stat.pend':'Pending','stat.sta':'Clients','stat.fw':'Firmware Images',
+  'card.apdist':'AP State Distribution','card.recentlog':'Recent Logs','card.radiooverview':'Radio Overview',
+  'th.ap':'AP','th.band':'Band','th.channel':'Channel','th.power':'Power','th.clients':'Clients','th.state':'State',
+  'card.ssidsum':'SSID Summary (enabled only)','th.ssid':'SSID','th.bandZh':'Band','th.aps':'APs',
+  'status.legendOk':'Approved {n}','status.legendPend':'Pending {n}','status.fsm':'(Runtime FSM lives in memory; DB stores lifecycle state only)',
+  'empty.logs':'No logs','radio.auto':'Auto','radio.manual':'Manual','empty.radios':'No radio status','empty.ssidEnabled':'No enabled SSID',
+  'card.logs':'Logs · Category filter (multi-select)',
+  'logs.noteHtml':'Refresh: this page pulls incrementally via <b>GET /api/events?since=</b>; newest logs appear first.',
+  'logs.all':'All','logs.hintNone':'No category selected (click “All” to select all)','logs.hintAll':'All {n} categories selected','logs.hintSel':'Selected: {list}',
+  'empty.logsFiltered':'No logs for this category selection',
+  'card.clients':'Clients','ph.searchSta':'Search MAC / SSID / AP','opt.allAps':'All APs','btn.search':'Search',
+  'th.mac':'MAC','th.apname':'AP Name','th.radioUnit':'Radio','th.ip':'IP','th.joined':'Joined','th.signal':'RSSI','th.disconnect':'Disconnect',
+  'clients.note':'The state column keeps disconnected (disc) clients for troubleshooting; disconnect sends a Release Client request to the AP.',
+  'empty.clients':'No clients','btn.disconnect':'Disconnect','toast.disconnectSent':'Disconnect sent: {mac}',
+  'btn.commit':'Commit','card.ssidset':'SSID Settings (Global)',
+  'th.seq':'#','th.wlanname':'Network Name','th.security':'Security','th.psk':'Password','th.clientsnum':'Clients','th.ops':'Actions',
+  'btn.addSsid':'Add SSID','btn.recommend':'Recommend by device capability',
+  'wireless.ssidNote':'Global SSIDs are bound to a band and applied to all approved APs. Existing SSIDs are shown as text; click “Edit” at the row end to modify in a dialog (cancel discards changes, no pending diff). Type a name in the blank row to add one; another blank row follows automatically.',
+  'card.radioset':'Radio Settings (Global)','radio.enable':'Enable this radio','radio.power':'Power (%)','btn.apply':'Apply',
+  'wireless.radioNote':'Global radio settings apply to all approved APs; power is set as a percentage and mapped per model on push. Channel “Auto” lets the AP select itself (ACS); specify a channel number for manual.',
+  'card.overrides':'AP Overrides','th.apname2':'AP Name','wireless.overNote':'A single AP can override the global channel/power; “Revert Global” clears that AP’s override.',
+  'ssid.enabled':'Enabled','ssid.disabled':'Disabled','btn.editSsid':'Edit','ssid.newRow':'New','ssid.newPlaceholder':'Type a name to add SSID…','ssid.unconfigured':'Unconfigured',
+  'ov.inherit':'inherit','ov.overridden':'Override','ov.global':'Global','btn.modify':'Edit','btn.revert':'Revert Global',
+  'empty.approvedAps':'No approved APs','wireless.pending':'{n} AP(s) pending sync','wireless.synced':'Config synced',
+  'card.devstatus':'Device Status','th.vendor':'Vendor','th.model':'Model','th.hw':'HW','th.sw':'SW','th.radiosClients':'Radios (clients)',
+  'empty.devices':'No devices','btn.approve':'Approve','btn.edit':'Edit','toast.approved':'Approved {mac}','dev.pending':'Pending',
+  'card.devmgmt':'Device Management','ph.searchAp':'Search AP name / MAC','opt.allStates':'All states','opt.approved':'Approved','opt.pending':'Pending',
+  'btn.reset':'Reboot','btn.disable':'Disable','btn.upgrade':'Upgrade Firmware',
+  'devmgmt.note':'Reboot / Disable need H3C private Reset / Clear-Configuration message numbers (pending disassembly, not enabled yet).',
+  'card.fwupload':'Upload Firmware','ph.vendor':'vendor (h3c)','ph.model':'model (mini-ax60)','ph.hw':'hw_version (1.0)','btn.upload':'Upload',
+  'fw.note':'Stored at firmware/{vendor}/{model}/{hw_version}/{file}; MD5 is computed on upload.','card.fwlist':'Image List','empty.fw':'No images',
+  'toast.fwUploaded':'Firmware uploaded','toast.fwUploadFail':'Upload failed: {msg}','toast.noFw':'No firmware images; upload one first',
+  'modal.upgrade':'Upgrade Firmware','modal.upgradeSub':'Target AP: {mac}','field.fwImage':'Firmware Image','btn.pushUpgrade':'Push Upgrade','toast.upgradeSent':'Upgrade pushed (Image Data)',
+  'card.acinfo':'AC Info','kv.acname':'AC Name','kv.ctlport':'Control Port','kv.weblisten':'Web Listen','kv.weblistenVal':'Set by startup option <b>-l ip[:port]</b>',
+  'sys.runNote':'Tip: bind an internal address instead of <span class="mono">0.0.0.0</span> when testing miniac.',
+  'card.notes':'Notes','sys.notes':'Backend APIs for login/auth, address pools/leases, and log level are not provided yet (planned for a later phase).',
+  'btn.save':'Save','btn.cancel':'Cancel','toast.loadFail':'Load failed: {msg}','toast.opFail':'Operation failed: {msg}','toast.fail':'Failed: {msg}',
+  'modal.override':'AP Override','field.channelInherit':'Channel (blank = inherit global)','field.powerInherit':'Power % (blank = inherit global)',
+  'override.hint':'Overrides replace the global channel/power for this AP on this band; use “Revert Global” to clear.',
+  'toast.overrideSet':'Override set, pending commit','toast.overrideCleared':'Reverted to global, pending commit',
+  'toast.manualChannel':'A manual channel requires a channel number','toast.radioApplied':'Global radio applied, pending commit','toast.saveFail':'Save failed: {msg}',
+  'toast.noPending':'No APs pending sync','toast.committed':'Pushed to {n}','toast.committedOffline':'; {n} offline (effective on next join)','toast.commitFail':'Commit failed: {msg}',
+  'confirm.reset':'Reboot AP {name}?','toast.resetSent':'Reboot sent: {name}',
+  'confirm.disable':'Disable AP {name}? Its config will be cleared and it will reboot.','toast.disableSent':'Disable sent: {name}',
+  'modal.editDevice':'Edit Device','modal.editDeviceSub':'MAC {mac}','field.name':'Name','field.desc':'Description','toast.saved':'Saved',
+  'modal.editSsid':'Edit SSID','modal.addSsid':'Add SSID','modal.ssidSub':'Global · {band}',
+  'field.ssidName':'Network Name','field.akm':'Key Management','field.cipher':'Cipher','field.pmf':'PMF','field.psk':'PSK',
+  'field.rekey':'Group Rekey','field.seconds':'s','field.broadcast':'Broadcast','field.broadcastChk':'Broadcast SSID','field.isolate':'Client Isolation','field.isolateChk':'Isolate clients',
+  'field.enable':'Enable Network','field.enableChk':'Enable',
+  'ssid.modalHint':'Anything but “Open” needs 8–63 characters; key management and cipher are two independent dimensions',
+  'err.ssidEmpty':'Name cannot be empty','toast.ssidSaved':'SSID saved, pending commit','toast.ssidWarn':' · Compatibility: {msg}',
+  'toast.recommendFail':'Cannot recommend: {msg}','rec.insufficient':'insufficient device capability','rec.note':'Recommended: {akm} / {cipher}','rec.legacy':'Also create a legacy SSID: {akm} / {cipher}','toast.recommendErr':'Recommend failed: {msg}',
+  'akm.open':'Open','akm.psk':'WPA2-PSK','akm.psksae':'WPA2/WPA3 Mixed','akm.sae':'WPA3-SAE',
+  'cipher.tkip':'TKIP','cipher.ccmp':'AES','cipher.both':'TKIP+AES',
+  'pmf.disabled':'Off','pmf.capable':'Capable','pmf.required':'Required',
+  'pbar.updatedLabel':'Updated','pbar.autorefresh':'Auto refresh','pbar.off':'Off','pbar.refresh':'Refresh',
+  'sep.semi':'; ',
+},
+};
+/* Locale is chosen from the browser; unknown/unsupported languages fall back to zh-CN. */
+const browserLang=(navigator.language||navigator.userLanguage||'en');
+const LOC=/^zh/i.test(browserLang)?'zh-CN':'en';
+function t(key,vars){
+  const d=I18N[LOC]||I18N['zh-CN'];
+  let s=d[key]!=null?d[key]:(I18N['zh-CN'][key]!=null?I18N['zh-CN'][key]:key);
+  if(vars)s=s.replace(/\{(\w+)\}/g,(m,k)=>vars[k]!=null?vars[k]:m);
+  return s;
 }
-function setTable(rowEl, emptyEl, rows, cols) {
-  rowEl.innerHTML = rows.length
-    ? rows.map(r => `<tr>${cols.map(c => `<td ${c.mono?'class="mono"':''}>${esc(c.v(r))}</td>`).join('')}</tr>`).join('')
-    : '';
-  emptyEl.hidden = rows.length > 0;
+document.documentElement.lang=LOC;
+function applyStatic(){
+  document.querySelectorAll('[data-i18n]').forEach(el=>{el.textContent=t(el.dataset.i18n);});
+  document.querySelectorAll('[data-i18n-html]').forEach(el=>{el.innerHTML=t(el.dataset.i18nHtml);});
+  document.querySelectorAll('[data-i18n-ph]').forEach(el=>{el.placeholder=t(el.dataset.i18nPh);});
 }
 
-async function loadDevices() {
-  const [rows, fw] = await Promise.all([getJson('/api/devices'), getJson('/api/firmware')]);
-  const fwOpts = (mac) => `<select data-fwfor="${esc(mac)}"><option value="">none</option>` +
-    fw.map(f => `<option value="${f.id}">${esc(f.stored_path)}</option>`).join('') + '</select>';
-  setTable($('devices'), $('devices-empty'), rows, [
-    { v: r => r.mac, mono: true }, { v: r => r.name }, { v: r => r.ip_addr || '-' },
-    { v: r => r.sw_version || '-' },
-    { v: r => r.approved
-      ? `<span class="pill ${r.state === 'run' ? 'run' : 'other'}">${esc(r.state)}</span>`
-      : '<span class="pill pending">待确认</span>' },
-    { v: r => r.approved
-      ? `<span style="display:flex;gap:6px">${fwOpts(r.mac)}<button data-upgrade="${esc(r.mac)}">Upgrade</button></span>`
-      : `<button data-approve="${esc(r.mac)}">确认</button>` },
-  ]);
-  $('stat-devices').textContent = 'APs ' + rows.length;
+const fmtTime=(u)=>u?new Date(u*1000).toLocaleString(LOC,{hour12:false}):'—';
+const fmtClock=(u)=>u?new Date(u*1000).toLocaleTimeString(LOC,{hour12:false}):'—';
+
+async function api(url,opt){
+  const r=await fetch(url,opt);
+  if(!r.ok) throw new Error(url+' → '+r.status+' '+(await r.text().catch(()=>'')));
+  const t=await r.text(); return t?JSON.parse(t):null;
 }
-async function loadFirmware() {
-  const rows = await getJson('/api/firmware');
-  setTable($('firmware'), $('firmware-empty'), rows, [
-    { v: r => r.stored_path, mono: true },
-    { v: r => (r.size / 1024).toFixed(1) + ' KiB' },
-    { v: r => r.hash, mono: true },
-    { v: r => new Date(r.uploaded_at * 1000).toISOString() },
-  ]);
-}
-async function loadStations() {
-  const rows = await getJson('/api/stations');
-  setTable($('stations'), $('stations-empty'), rows, [
-    { v: r => r.mac, mono: true }, { v: r => r.wmac, mono: true },
-    { v: r => r.ssid || '-' }, { v: r => r.state },
-    { v: r => r.rssi ?? '-' },
-  ]);
-  $('stat-stations').textContent = 'Stations ' + rows.length;
-}
-async function loadRadios() {
-  const rows = await getJson('/api/radios');
-  setTable($('radios'), $('radios-empty'), rows, [
-    { v: r => r.mac, mono: true }, { v: r => r.radio_id + 1 },
-    { v: r => r.band || '-' }, { v: r => r.channel ?? '-' }, { v: r => r.tx_power ?? '-' },
-  ]);
-}
-async function loadProfiles() {
-  const rows = await getJson('/api/profiles');
-  setTable($('profiles'), $('profiles-empty'), rows, [
-    { v: r => r.name }, { v: r => r.method }, { v: r => r.cipher },
-    { v: r => '0x' + Number(r.caps).toString(16) },
-  ]);
-}
-async function loadEvents() {
-  const rows = await getJson('/api/events');
-  const ul = $('events');
-  ul.innerHTML = rows.map(r => `<li><span class="ts">${r.ts_unix}</span>[${esc(r.category)}] ${esc(r.message)}</li>`).join('');
-  $('events-empty').hidden = rows.length > 0;
-}
-async function refresh() {
-  try {
-    await Promise.all([loadDevices(), loadStations(), loadRadios(), loadProfiles(), loadFirmware(), loadEvents()]);
-  } catch (e) { console.error(e); }
+async function apiJson(url,method,body){
+  return api(url,{method,headers:{'content-type':'application/json'},body:body!=null?JSON.stringify(body):undefined});
 }
 
-$('meta-form').addEventListener('submit', async (ev) => {
-  ev.preventDefault();
-  const mac = $('meta-mac').value.trim();
-  if (!mac) return;
-  const body = { name: $('meta-name').value, description: $('meta-desc').value };
-  const r = await fetch('/api/devices/' + encodeURIComponent(mac), {
-    method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
-  });
-  if (r.ok) refresh(); else alert('update failed: ' + r.status);
+/* ---------- sidebar ---------- */
+const I={
+ status:'<svg viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>',
+ logs:'<svg viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h10"/></svg>',
+ clients:'<svg viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="12" rx="2"/><path d="M8 21h8"/></svg>',
+ wifi:'<svg viewBox="0 0 24 24"><path d="M2 8.5a15 15 0 0 1 20 0"/><path d="M5.5 12a10 10 0 0 1 13 0"/><path d="M9 15.5a5 5 0 0 1 6 0"/><circle cx="12" cy="19" r="1" fill="currentColor" stroke="none"/></svg>',
+ devices:'<svg viewBox="0 0 24 24"><rect x="4" y="3" width="16" height="18" rx="2"/><path d="M9 7h6M9 11h6"/><circle cx="12" cy="16.5" r="1" fill="currentColor" stroke="none"/></svg>',
+ manage:'<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9l2.1 2.1M17 17l2.1 2.1M19.1 4.9L17 7M7 17l-2.1 2.1"/></svg>',
+ fw:'<svg viewBox="0 0 24 24"><path d="M12 3v12"/><path d="M7 10l5 5 5-5"/><path d="M5 21h14"/></svg>',
+ sys:'<svg viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16"/><circle cx="9" cy="6" r="2" fill="var(--sidebar)"/><circle cx="15" cy="12" r="2" fill="var(--sidebar)"/><circle cx="8" cy="18" r="2" fill="var(--sidebar)"/></svg>',
+};
+const NAV=[
+ {g:'nav.g.overview',items:[{id:'status',k:'nav.status',i:'status'},{id:'logs',k:'nav.logs',i:'logs'}]},
+ {g:'nav.g.wireless',items:[{id:'clients',k:'nav.clients',i:'clients'},{id:'wireless',k:'nav.wireless',i:'wifi'}]},
+ {g:'nav.g.devices',items:[{id:'devices',k:'nav.devices',i:'devices'},{id:'devmgmt',k:'nav.devmgmt',i:'manage'},{id:'firmware',k:'nav.firmware',i:'fw'}]},
+ {g:'nav.g.system',items:[{id:'system',k:'nav.system',i:'sys'}]},
+];
+const TITLES=Object.fromEntries(NAV.flatMap(g=>g.items.map(it=>[it.id,it.k])));
+$('nav').innerHTML=NAV.map(g=>`<div class="group">${t(g.g)}</div><nav>`+
+  g.items.map(it=>`<a data-nav="${it.id}">${I[it.i]}<span>${t(it.k)}</span></a>`).join('')+`</nav>`).join('');
+
+/* ---------- data cache ---------- */
+const DB={devices:[],radios:[],stations:[],wlans:[],firmware:[],events:[],wcfg:null};
+let lastSeq=0;
+const APNAME=(mac)=>{const d=DB.devices.find(x=>x.mac===mac);return d&&d.name?d.name:(d?d.mac:mac);};
+const DEV=(mac)=>DB.devices.find(x=>x.mac===mac);
+const radioBand=(r)=>{const b=(r.band||'').toLowerCase();if(b.includes('5'))return '5';if(b.includes('2'))return '24';return r.radio_id===2?'5':'24';};
+const bandLabel=(b)=>b==='24'?'2.4GHz':'5GHz';
+const ridOfBand=(b)=>b===1?1:2;
+const bandOfRid=(id)=>id===2?'5':'24';
+const wlanBand=(w)=>(w.radio_id===2?'5':'24');
+const staBand=(s)=>{const r=DB.radios.find(x=>x.mac===s.wmac&&x.radio_id===s.radio_id);return r?radioBand(r):bandOfRid(s.radio_id);};
+const devPill=(d)=>d.approved?[d.state||'registered','p-ok']:[t('dev.pending'),'p-warn'];
+
+async function loadDevices(){DB.devices=await api('/api/devices');}
+async function loadRadios(){DB.radios=await api('/api/radios');}
+async function loadStations(){DB.stations=await api('/api/stations');}
+async function loadFirmware(){DB.firmware=await api('/api/firmware');}
+async function loadWlans(mac){DB.wlans=await api('/api/devices/'+mac+'/wlans');}
+async function loadWcfg(){DB.wcfg=await api('/api/wcfg');}
+async function loadAllWlans(){
+  await loadDevices();
+  const lists=await Promise.all(DB.devices.map(d=>api('/api/devices/'+d.mac+'/wlans')));
+  DB.wlans=[].concat(...lists);
+}
+async function loadEvents(){
+  const rows=await api('/api/events?since='+lastSeq);
+  for(const e of rows){DB.events.push(e); if(e.seq>lastSeq)lastSeq=e.seq;}
+  if(DB.events.length>1500) DB.events=DB.events.slice(-500);
+  return rows;
+}
+
+/* ---------- routing + per-page refresh ---------- */
+function show(page){
+  document.querySelectorAll('.page').forEach(s=>s.classList.remove('on'));
+  const el=$('p-'+page); if(!el)return;
+  el.classList.add('on');
+  document.querySelectorAll('nav a').forEach(a=>a.classList.toggle('active',a.dataset.nav===page));
+  $('title').textContent=t(TITLES[page]||page);
+  $('side').classList.remove('open');
+  refresh(page,true);
+}
+function route(){ show(location.hash.replace(/^#\//,'')||'status'); }
+document.querySelectorAll('nav a').forEach(a=>a.addEventListener('click',()=>{location.hash='#/'+a.dataset.nav;}));
+window.addEventListener('hashchange',route);
+
+const REFRESHABLE=['status','logs','clients','wireless','devices','devmgmt','firmware'];
+const iv={},lastMs={};
+document.querySelectorAll('main > .page').forEach(sec=>{
+  const id=sec.id.replace(/^p-/,'');
+  if(!REFRESHABLE.includes(id))return;
+  iv[id]=10000;
+  const bar=document.createElement('div'); bar.className='pbar';
+  bar.innerHTML=`<span class="muted">${t('pbar.updatedLabel')} <b class="last" style="color:var(--text)">--:--:--</b></span>
+    <label class="muted">${t('pbar.autorefresh')}
+      <select class="ivsel"><option value="0">${t('pbar.off')}</option><option value="2000">2s</option>
+        <option value="5000">5s</option><option value="10000" selected>10s</option><option value="30000">30s</option></select></label>
+    <button class="btn ghost sm">${t('pbar.refresh')}</button>`;
+  sec.prepend(bar);
+  bar.querySelector('.ivsel').addEventListener('change',e=>{iv[id]=+e.target.value;});
+  bar.querySelector('button').addEventListener('click',()=>refresh(id));
 });
+/* page id -> renderer; a page absent here (e.g. the system page) renders nothing */
+const RENDER={status:renderStatus,logs:renderLogs,clients:renderClients,wireless:renderWireless,
+  devices:renderDevices,devmgmt:renderDevmgmt,firmware:renderFirmware};
+function refresh(id,atEnter){
+  if(modalOpen&&!atEnter) return;
+  const sec=$('p-'+id); if(sec){const b=sec.querySelector('.pbar .last'); if(b)b.textContent=new Date().toLocaleTimeString(LOC,{hour12:false});}
+  lastMs[id]=Date.now();
+  (RENDER[id]||(()=>{}))().catch(e=>toast(t('toast.loadFail',{msg:e.message})));
+}
+setInterval(()=>{
+  const cur=location.hash.replace(/^#\//,'')||'status';
+  if(!REFRESHABLE.includes(cur)||modalOpen||!iv[cur])return;
+  if(Date.now()-(lastMs[cur]||0)>=iv[cur]) refresh(cur);
+},1000);
 
-$('profile-form').addEventListener('submit', async (ev) => {
-  ev.preventDefault();
-  const body = {
-    name: $('profile-name').value, method: $('profile-method').value,
-    cipher: $('profile-cipher').value, caps: 0,
-  };
-  const r = await fetch('/api/profiles', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
-  });
-  if (r.ok) refresh(); else alert('add failed: ' + r.status);
-});
-
-$('fw-form').addEventListener('submit', async (ev) => {
-  ev.preventDefault();
-  const file = $('fw-file').files[0];
-  if (!file) { alert('choose a file'); return; }
-  const fd = new FormData();
-  fd.append('vendor', $('fw-vendor').value.trim());
-  fd.append('model', $('fw-model').value.trim());
-  fd.append('hw_version', $('fw-hw').value.trim());
-  fd.append('file', file);
-  const r = await fetch('/api/firmware', { method: 'POST', body: fd });
-  if (r.ok) { refresh(); } else { alert('upload failed: ' + r.status + ' ' + (await r.text())); }
-});
-
-document.addEventListener('click', async (ev) => {
-  const ap = ev.target.closest && ev.target.closest('button[data-approve]');
-  if (ap) {
-    const mac = ap.dataset.approve;
-    const r = await fetch('/api/devices/' + encodeURIComponent(mac) + '/approve', { method: 'POST' });
-    if (r.ok) { refresh(); } else { alert('approve failed: ' + r.status + ' ' + (await r.text())); }
-    return;
+/* ---------- status ---------- */
+async function renderStatus(){
+  await Promise.all([loadStations(),loadRadios(),loadFirmware(),loadAllWlans(),loadEvents()]);
+  const aps=DB.devices;
+  const ok=aps.filter(d=>d.approved).length, pend=aps.filter(d=>!d.approved).length;
+  $('s-aps').textContent=aps.length; $('s-run').textContent=ok;
+  $('s-pend').textContent=pend; $('s-sta').textContent=DB.stations.length; $('s-fw').textContent=DB.firmware.length;
+  $('top-aps').textContent=t('top.aps',{n:ok,t:aps.length});
+  $('top-sta').textContent=t('top.sta',{n:DB.stations.length});
+  const total=Math.max(aps.length,1);
+  $('s-bar').innerHTML=`<i style="width:${ok/total*100}%;background:var(--ok)"></i>
+    <i style="width:${pend/total*100}%;background:var(--warn)"></i>`;
+  $('s-legend').innerHTML=`<span><b style="background:var(--ok)"></b>${t('status.legendOk',{n:ok})}</span>
+    <span><b style="background:var(--warn)"></b>${t('status.legendPend',{n:pend})}</span>
+    <span class="muted">${t('status.fsm')}</span>`;
+  $('dash-feed').innerHTML=DB.events.slice(-6).reverse().map(e=>
+    `<li><span class="ts">${fmtClock(e.ts_unix)}</span><span class="cat cat-${e.category}">${e.category}</span><span class="${e.level==='error'?'lv-error':''}">${esc(e.message)}</span></li>`).join('')
+    || `<li class="muted" style="display:block">${t('empty.logs')}</li>`;
+  $('dash-radio').innerHTML=DB.radios.map(r=>{
+    const cl=DB.stations.filter(s=>s.wmac===r.mac&&s.radio_id===r.radio_id).length;
+    return `<tr><td>${esc(APNAME(r.mac))}</td><td>${bandLabel(radioBand(r))}</td><td>${r.channel??t('radio.auto')}</td>
+      <td>${r.tx_power??'—'}</td><td>${cl}</td>
+      <td><span class="pill ${r.admin_state?'p-ok':'p-muted'}">${r.admin_state?'on':'off'}</span></td></tr>`;
+  }).join('') || `<tr><td colspan="6" class="muted">${t('empty.radios')}</td></tr>`;
+  const agg={};
+  for(const w of DB.wlans) if(w.ssid&&w.wlan_enable){
+    const k=w.ssid+'|'+wlanBand(w);
+    const a=agg[k]||(agg[k]={ssid:w.ssid,band:wlanBand(w),aps:0,clients:0});
+    a.aps++; a.clients+=w.client_count||0;
   }
-  const btn = ev.target.closest && ev.target.closest('button[data-upgrade]');
-  if (!btn) return;
-  const mac = btn.dataset.upgrade;
-  const sel = document.querySelector(`select[data-fwfor="${mac}"]`);
-  const imageId = sel ? sel.value : '';
-  if (!imageId) { alert('select a firmware image first'); return; }
-  const r = await fetch('/api/devices/' + encodeURIComponent(mac) + '/upgrade', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ image_id: Number(imageId) }),
-  });
-  if (r.ok) { refresh(); } else { alert('upgrade failed: ' + r.status + ' ' + (await r.text())); }
+  const en=Object.values(agg);
+  $('dash-ssid').innerHTML=en.length?en.map(r=>`<tr><td>${esc(r.ssid)}</td><td>${bandLabel(r.band)}</td><td>${r.aps}</td><td>${r.clients}</td></tr>`).join('')
+    :`<tr><td colspan="4" class="muted">${t('empty.ssidEnabled')}</td></tr>`;
+}
+
+/* ---------- logs ---------- */
+const CATS=['system','device','radio','station','security','firmware','roaming','admin'];
+let selEvents=new Set(CATS);
+$('ev-chips').innerHTML=`<button class="chip all" data-all>${t('logs.all')}</button>`+CATS.map(c=>`<button class="chip" data-c="${c}">${c}</button>`).join('');
+$('ev-chips').addEventListener('click',e=>{
+  const t=e.target.closest('.chip'); if(!t)return;
+  if(t.hasAttribute('data-all')) selEvents=selEvents.size===CATS.length?new Set():new Set(CATS);
+  else {const c=t.dataset.c; selEvents.has(c)?selEvents.delete(c):selEvents.add(c);}
+  renderChips(); drawLogs();
+});
+function renderChips(){
+  document.querySelector('.chip.all').classList.toggle('on',selEvents.size===CATS.length);
+  document.querySelectorAll('.chip[data-c]').forEach(ch=>ch.classList.toggle('on',selEvents.has(ch.dataset.c)));
+  $('ev-hint').textContent=selEvents.size===0?t('logs.hintNone'):
+    (selEvents.size===CATS.length?t('logs.hintAll',{n:CATS.length}):t('logs.hintSel',{list:CATS.filter(c=>selEvents.has(c)).join(' / ')}));
+}
+function feedItem(e){return `<li><span class="ts">${fmtClock(e.ts_unix)}</span><span class="cat cat-${e.category}">${e.category}</span><span class="${e.level==='error'?'lv-error':''}">${esc(e.message)}</span></li>`;}
+function drawLogs(){
+  // Newest first, matching the dashboard feed, so a busy log needs no scrolling.
+  const rows=DB.events.filter(e=>selEvents.has(e.category)).slice(-300).reverse();
+  $('ev-feed').innerHTML=rows.length?rows.map(feedItem).join(''):`<li class="muted" style="display:block">${t('empty.logsFiltered')}</li>`;
+}
+async function renderLogs(){
+  const before=DB.events.length;
+  await loadEvents();
+  // no new events: leave the DOM untouched
+  if(DB.events.length===before) return;
+  drawLogs();
+}
+
+/* ---------- clients ---------- */
+async function renderClients(){
+  if(!DB.devices.length) await loadDevices();
+  if(!DB.radios.length) await loadRadios();
+  await loadStations();
+  const f=$('sta-f'), keep=f.value;
+  f.innerHTML=`<option value="">${t('opt.allAps')}</option>`+DB.devices.map(d=>`<option value="${esc(d.mac)}">${esc(d.name||d.mac)}</option>`).join('');
+  f.value=keep;
+  const q=($('sta-q').value||'').toLowerCase(), fmac=f.value;
+  const rows=DB.stations.filter(s=>(!fmac||s.wmac===fmac)&&
+    (!q||[s.mac,s.ssid||'',APNAME(s.wmac)].some(v=>String(v).toLowerCase().includes(q))));
+  $('sta-rows').innerHTML=rows.map(s=>`<tr>
+    <td class="mono">${esc(s.mac)}</td><td>${esc(APNAME(s.wmac))}</td>
+    <td>${s.radio_id} (${bandLabel(staBand(s))})</td>
+    <td>${esc(s.ssid||'—')}</td><td class="mono">${esc(s.ip_addr||'—')}</td>
+    <td>${fmtTime(s.associated_at)}</td><td>${s.rssi??'—'}</td>
+    <td><span class="pill ${s.state==='associated'||s.state==='assoc'?'p-ok':'p-muted'}">${esc(s.state)}</span></td>
+    <td><button class="btn ghost sm" onclick="disconnect('${esc(s.wmac)}','${esc(s.mac)}')">${t('btn.disconnect')}</button></td></tr>`).join('')
+    || `<tr><td colspan="9" class="muted">${t('empty.clients')}</td></tr>`;
+}
+async function disconnect(wmac,smac){
+  try{ await api(`/api/devices/${wmac}/stations/${smac}/disconnect`,{method:'POST'});
+    toast(t('toast.disconnectSent',{mac:smac}));
+  }catch(e){ toast(t('toast.fail',{msg:e.message})); }
+}
+
+/* ---------- wireless (global config + AP overrides + commit) ---------- */
+let wBandSel=1;              // band: 1=2.4GHz, 2=5GHz (radio_id = band)
+function wSetBand(b,btn){
+  wBandSel=b;
+  document.querySelectorAll('#p-wireless .tabs button').forEach(x=>x.classList.remove('on'));
+  if(btn)btn.classList.add('on');
+  renderWireless();
+}
+const gRadio=()=>(DB.wcfg?.global_radios||[]).find(g=>g.band===wBandSel)||
+  {band:wBandSel,enable:true,channel_mode:0,channel:0,power:6,mode:0};
+const gWlans=()=>(DB.wcfg?.global_wlans||[]).filter(w=>w.band===wBandSel).sort((a,b)=>a.wlan_id-b.wlan_id);
+const ovOf=(mac)=>(DB.wcfg?.overrides||[]).find(o=>o.mac===mac&&o.band===wBandSel);
+async function renderWireless(){
+  await Promise.all([loadDevices(),loadWcfg()]);
+  const rows=gWlans();
+  $('w-ssid-rows').innerHTML=rows.map((w,i)=>`<tr>
+      <td>${i+1}</td>
+      <td>${esc(w.ssid)}</td>
+      <td>${esc(secLabel(w.security))}</td>
+      <td>${esc((w.security&&w.security.psk)||'—')}</td>
+      <td><span class="pill ${w.wlan_enable?'p-ok':'p-muted'}">${w.wlan_enable?t('ssid.enabled'):t('ssid.disabled')}</span></td>
+      <td>${w.client_count}</td>
+      <td><button class="btn ghost sm" onclick="openSsidModal(${w.wlan_id})">${t('btn.editSsid')}</button></td></tr>`).join('')
+    + blankSsidRow();
+  const g=gRadio();
+  $('r-en').checked=!!g.enable;
+  $('r-chmode').value=String(g.channel_mode||0);
+  $('r-ch').value=g.channel_mode?g.channel:'';
+  $('r-pw').value=g.power;
+  const aps=DB.devices.filter(d=>d.approved);
+  $('w-ov-rows').innerHTML=aps.map(d=>{
+    const o=ovOf(d.mac);
+    const ch=o&&o.channel!=null?o.channel:t('ov.inherit');
+    const pw=o&&o.power!=null?o.power:t('ov.inherit');
+    return `<tr><td>${esc(d.name||d.mac)}</td><td>${ch}</td><td>${pw}</td>
+      <td>${o?`<span class="pill p-warn">${t('ov.overridden')}</span>`:`<span class="pill p-muted">${t('ov.global')}</span>`}</td>
+      <td><button class="btn ghost sm" onclick="openOverrideModal('${esc(d.mac)}')">${t('btn.modify')}</button>${o?
+        `<button class="btn ghost sm" onclick="clearOverride('${esc(d.mac)}')">${t('btn.revert')}</button>`:''}</td></tr>`;
+  }).join('') || `<tr><td colspan="5" class="muted">${t('empty.approvedAps')}</td></tr>`;
+  const pend=(DB.wcfg?.pending||[]);
+  $('w-pending').textContent=pend.length?t('wireless.pending',{n:pend.length}):t('wireless.synced');
+  const tb=document.querySelectorAll('#p-wireless .tabs button');
+  if(tb[0])tb[0].classList.toggle('on',wBandSel===1);
+  if(tb[1])tb[1].classList.toggle('on',wBandSel===2);
+}
+/* Security is two orthogonal dimensions (key management vs. cipher) plus PMF;
+   label each part on its own and join for compact display. */
+const AKMK={open:'akm.open',psk:'akm.psk','psk-sae':'akm.psksae',sae:'akm.sae'};
+const CIPHERK={tkip:'cipher.tkip',ccmp:'cipher.ccmp','tkip+ccmp':'cipher.both'};
+const PMFK={disabled:'pmf.disabled',capable:'pmf.capable',required:'pmf.required'};
+const lbl=(map,v)=>(v!=null&&map[v])?t(map[v]):(v||'—');
+function secLabel(s){
+  s=s||{};
+  let tt=lbl(AKMK,s.akm)+' / '+lbl(CIPHERK,s.cipher);
+  if(s.pmf&&s.pmf!=='disabled')tt+=' · PMF '+lbl(PMFK,s.pmf);
+  return tt;
+}
+function optHtml(map,cur){return Object.entries(map).map(([v,k])=>`<option value="${v}" ${v===cur?'selected':''}>${t(k)}</option>`).join('');}
+function blankSsidRow(){
+  return `<tr class="muted"><td class="muted">${t('ssid.newRow')}</td>
+    <td><input placeholder="${t('ssid.newPlaceholder')}" style="width:100%" onchange="ssidCreate(this.value)"></td>
+    <td>—</td><td>—</td><td><span class="pill p-muted">${t('ssid.unconfigured')}</span></td><td>0</td><td></td></tr>`;
+}
+function nextWlanId(){
+  const rows=gWlans();
+  return rows.length?Math.max(...rows.map(r=>r.wlan_id))+1:1;
+}
+function ssidCreate(val){
+  if(!val||!val.trim())return;
+  openSsidModal(nextWlanId(),{create:true,ssid:val});
+}
+function addSsid(){ openSsidModal(nextWlanId(),{create:true}); }
+/* Ask the AC for the strongest policy the fleet can express while still
+   serving the default WPA2+ client group (never below WPA-PSK + AES). */
+async function recommendSsid(){
+  try{ const r=await apiJson('/api/wcfg/security/recommend','GET');
+    const msgs=(r&&r.messages||[]), SEP=t('sep.semi');
+    if(r.level==='error'){ toast(t('toast.recommendFail',{msg:msgs.join(SEP)||t('rec.insufficient')})); return; }
+    let note=t('rec.note',{akm:lbl(AKMK,r.akm),cipher:lbl(CIPHERK,r.cipher)});
+    if(msgs.length)note+=' · '+msgs.join(SEP);
+    if(r.legacy_akm)note+=SEP+t('rec.legacy',{akm:lbl(AKMK,r.legacy_akm),cipher:lbl(CIPHERK,r.legacy_cipher)});
+    openSsidModal(nextWlanId(),{create:true,akm:r.akm,cipher:r.cipher,pmf:r.pmf,note});
+  }catch(e){ toast(t('toast.recommendErr',{msg:e.message})); }
+}
+
+/* ---------- global radio ---------- */
+async function saveGlobalRadio(){
+  const manual=$('r-chmode').value==='1';
+  const channel=manual?(+$('r-ch').value||0):0;
+  if(manual&&!channel){ toast(t('toast.manualChannel')); return; }
+  const body={enable:$('r-en').checked,channel_mode:manual?1:0,channel,
+    power:+($('r-pw').value||0),mode:gRadio().mode||0};
+  try{ await apiJson(`/api/wcfg/global/radio/${wBandSel}`,'PUT',body);
+    toast(t('toast.radioApplied')); await loadWcfg(); renderWireless();
+  }catch(e){ toast(t('toast.saveFail',{msg:e.message})); }
+}
+
+/* ---------- AP overrides ---------- */
+function openOverrideModal(mac){
+  const o=ovOf(mac)||{};
+  openModal(t('modal.override'),`${esc(APNAME(mac))} · ${bandLabel(bandOfRid(wBandSel))}`,
+    `<div class="field"><label>${t('field.channelInherit')}</label><input type="number" id="o-ch" value="${o.channel!=null?o.channel:''}" style="width:110px"></div>
+     <div class="field"><label>${t('field.powerInherit')}</label><input type="number" id="o-pw" value="${o.power!=null?o.power:''}" style="width:110px"></div>
+     <div class="hint">${t('override.hint')}</div>`,
+    async()=>{
+      const body={channel:$('o-ch').value===''?null:+$('o-ch').value,
+        power:$('o-pw').value===''?null:+$('o-pw').value,
+        mode:o.mode!=null?o.mode:null};
+      await apiJson(`/api/wcfg/override/${mac}/${wBandSel}`,'PUT',body);
+      toast(t('toast.overrideSet')); await loadWcfg(); renderWireless();
+    });
+}
+async function clearOverride(mac){
+  try{ await apiJson(`/api/wcfg/override/${mac}/${wBandSel}`,'DELETE');
+    toast(t('toast.overrideCleared')); await loadWcfg(); renderWireless();
+  }catch(e){ toast(t('toast.opFail',{msg:e.message})); }
+}
+
+/* ---------- commit (Configuration Update) ---------- */
+async function commitWcfg(){
+  const pend=(DB.wcfg?.pending||[]);
+  if(!pend.length){ toast(t('toast.noPending')); return; }
+  try{
+    const r=await apiJson('/api/wcfg/commit','POST',{});
+    toast(t('toast.committed',{n:r.pushed.length})+(r.offline.length?t('toast.committedOffline',{n:r.offline.length}):''));
+    await loadWcfg(); renderWireless();
+  }catch(e){ toast(t('toast.commitFail',{msg:e.message})); }
+}
+
+/* ---------- devices ---------- */
+async function renderDevices(){
+  await Promise.all([loadDevices(),loadRadios(),loadStations()]);
+  const rows=DB.devices.map(d=>{
+    const rs=DB.radios.filter(r=>r.mac===d.mac).map(r=>
+      `${bandLabel(radioBand(r))}:${DB.stations.filter(s=>s.wmac===r.mac&&s.radio_id===r.radio_id).length}`).join('  ')||'—';
+    const st=devPill(d);
+    return `<tr><td>${esc(d.name||'—')}</td><td>${esc(d.vendor||'—')}</td><td>${esc(d.model||'—')}</td><td class="mono">${esc(d.mac)}</td><td class="mono">${esc(d.ip_addr||'—')}</td>
+      <td><span class="pill ${st[1]}">${esc(st[0])}</span></td><td>${rs}</td>
+      <td>${!d.approved?`<button class="btn ok sm" onclick="approve('${esc(d.mac)}')">${t('btn.approve')}</button> `:''}
+        <button class="btn ghost sm" onclick="editDevice('${esc(d.mac)}')">${t('btn.edit')}</button></td></tr>`;
+  }).join('') || `<tr><td colspan="8" class="muted">${t('empty.devices')}</td></tr>`;
+  $('dev-rows').innerHTML=rows;
+}
+async function approve(mac){ try{await api(`/api/devices/${mac}/approve`,{method:'POST'});toast(t('toast.approved',{mac}));renderDevices();}catch(e){toast(t('toast.fail',{msg:e.message}));} }
+
+/* ---------- device management ---------- */
+async function renderDevmgmt(){
+  await loadDevices();
+  const q=($('mgmt-q').value||'').toLowerCase(), f=$('mgmt-f').value;
+  const rows=DB.devices.filter(d=>{
+    const st=d.approved?'ok':'pending';
+    return (!q||[d.mac,d.name||''].some(v=>v.toLowerCase().includes(q)))&&(!f||f===st);
+  }).map(d=>{
+    const st=devPill(d);
+    const ops=!d.approved
+      ? `<button class="btn ok sm" onclick="approve('${esc(d.mac)}')">${t('btn.approve')}</button>`
+      : `<button class="btn ghost sm" onclick="editDevice('${esc(d.mac)}')">${t('btn.edit')}</button>
+         <button class="btn ghost sm" onclick="resetAp('${esc(d.mac)}')">${t('btn.reset')}</button>
+         <button class="btn ghost sm" onclick="disableAp('${esc(d.mac)}')">${t('btn.disable')}</button>
+         <button class="btn ghost sm" onclick="upgradeDialog('${esc(d.mac)}')">${t('btn.upgrade')}</button>`;
+    return `<tr><td>${esc(d.name||'—')}</td><td>${esc(d.vendor||'—')}</td><td>${esc(d.model||'—')}</td><td class="mono">${esc(d.mac)}</td>
+      <td>${esc(d.hw_version||'—')}</td><td>${esc(d.sw_version||'—')}</td>
+      <td><span class="pill ${st[1]}">${esc(st[0])}</span></td>
+      <td><span style="display:flex;gap:8px;flex-wrap:wrap">${ops}</span></td></tr>`;
+  }).join('') || `<tr><td colspan="8" class="muted">${t('empty.devices')}</td></tr>`;
+  $('mgmt-rows').innerHTML=rows;
+}
+
+/* ---------- firmware ---------- */
+async function renderFirmware(){
+  await loadFirmware();
+  $('fw-rows').innerHTML=DB.firmware.map(f=>`<tr><td class="mono">${esc(f.stored_path)}</td>
+    <td>${(f.size/1024).toFixed(1)} KiB</td><td class="mono">${esc((f.hash||'').slice(0,16))}…</td>
+    <td>${fmtTime(f.uploaded_at)}</td></tr>`).join('') || `<tr><td colspan="4" class="muted">${t('empty.fw')}</td></tr>`;
+}
+async function uploadFirmware(){
+  const fd=new FormData();
+  fd.append('vendor',$('fw-vendor').value); fd.append('model',$('fw-model').value);
+  fd.append('hw_version',$('fw-hw').value);
+  const file=$('fw-file').files[0]; if(file)fd.append('file',file);
+  try{ await api('/api/firmware',{method:'POST',body:fd}); toast(t('toast.fwUploaded')); renderFirmware(); }
+  catch(e){ toast(t('toast.fwUploadFail',{msg:e.message})); }
+}
+function upgradeDialog(mac){
+  const opts=DB.firmware.map(f=>`<option value="${f.id}">${esc(f.stored_path)}</option>`).join('');
+  if(!opts){ toast(t('toast.noFw')); return; }
+  openModal(t('modal.upgrade'),t('modal.upgradeSub',{mac:esc(APNAME(mac))}),
+    `<div class="field"><label>${t('field.fwImage')}</label><select id="d-fw">${opts}</select></div>`,
+    async()=>{ await apiJson(`/api/devices/${mac}/upgrade`,'POST',{image_id:+$('d-fw').value});
+      toast(t('toast.upgradeSent')); },
+    t('btn.pushUpgrade'));
+}
+async function resetAp(mac){
+  if(!confirm(t('confirm.reset',{name:APNAME(mac)}))) return;
+  try{ await api(`/api/devices/${mac}/reset`,{method:'POST'}); toast(t('toast.resetSent',{name:APNAME(mac)})); }
+  catch(e){ toast(t('toast.fail',{msg:e.message})); }
+}
+async function disableAp(mac){
+  if(!confirm(t('confirm.disable',{name:APNAME(mac)}))) return;
+  try{ await api(`/api/devices/${mac}/disable`,{method:'POST'}); toast(t('toast.disableSent',{name:APNAME(mac)})); }
+  catch(e){ toast(t('toast.fail',{msg:e.message})); }
+}
+function editDevice(mac){
+  const d=DEV(mac)||{};
+  openModal(t('modal.editDevice'),t('modal.editDeviceSub',{mac:esc(mac)}),
+    `<div class="field"><label>${t('field.name')}</label><input id="d-name" value="${esc(d.name||'')}" style="width:100%"></div>
+     <div class="field"><label>${t('field.desc')}</label><input id="d-desc" value="${esc(d.description||'')}" style="width:100%"></div>`,
+    async()=>{ await apiJson('/api/devices/'+mac,'PUT',{name:$('d-name').value,description:$('d-desc').value});
+      toast(t('toast.saved')); await loadDevices(); renderDevices(); renderDevmgmt(); });
+}
+
+/* ---------- SSID modal (global SSID template) ---------- */
+function openSsidModal(wlanId,opt={}){
+  const w=gWlans().find(x=>x.wlan_id===wlanId)||
+    {ssid:opt.ssid||'',security:{akm:opt.akm||'psk-sae',cipher:opt.cipher||'ccmp',pmf:opt.pmf||'disabled',psk:''},
+     wlan_enable:true,isolate:false,broadcast:true,vlan_id:0,rekey_period:0,client_count:0};
+  const s=w.security||{};
+  const note=opt.note?`<div class="hint">${esc(opt.note)}</div>`:'';
+  openModal(wlanId>0&&!opt.create?t('modal.editSsid'):t('modal.addSsid'),
+    t('modal.ssidSub',{band:bandLabel(bandOfRid(wBandSel))}),
+    `${note}
+     <div class="field"><label>${t('field.ssidName')}</label><input id="d-ssid" value="${esc(w.ssid)}" style="width:100%"></div>
+     <div class="field"><label>${t('field.akm')}</label><select id="d-akm">${optHtml(AKMK,s.akm)}</select></div>
+     <div class="field"><label>${t('field.cipher')}</label><select id="d-cipher">${optHtml(CIPHERK,s.cipher)}</select></div>
+     <div class="field"><label>${t('field.pmf')}</label><select id="d-pmf">${optHtml(PMFK,s.pmf)}</select></div>
+     <div class="field"><label>${t('field.psk')}</label><input id="d-psk" value="${esc(s.psk||'')}" style="width:100%"></div>
+     <div class="hint">${t('ssid.modalHint')}</div>
+     <div class="field"><label>${t('field.rekey')}</label><div style="display:flex;align-items:center;gap:8px"><input type="number" id="d-rekey" value="${w.rekey_period}" style="width:110px"><span class="muted">${t('field.seconds')}</span></div></div>
+     <div class="field"><label>${t('field.broadcast')}</label><label class="muted"><input type="checkbox" id="d-bc" ${w.broadcast?'checked':''}> ${t('field.broadcastChk')}</label></div>
+     <div class="field"><label>${t('field.isolate')}</label><label class="muted"><input type="checkbox" id="d-iso" ${w.isolate?'checked':''}> ${t('field.isolateChk')}</label></div>
+     <div class="field"><label>${t('field.enable')}</label><label class="muted"><input type="checkbox" id="d-en" ${w.wlan_enable?'checked':''}> ${t('field.enableChk')}</label></div>`,
+    async()=>{
+      const ssid=$('d-ssid').value.trim(); if(!ssid){throw new Error(t('err.ssidEmpty'));}
+      const body={band:wBandSel,wlan_id:wlanId,ssid,
+        akm:$('d-akm').value,cipher:$('d-cipher').value,pmf:$('d-pmf').value,
+        psk:$('d-psk').value||null,
+        wlan_enable:$('d-en').checked,isolate:$('d-iso').checked,broadcast:$('d-bc').checked,
+        client_count:w.client_count||0,vlan_id:w.vlan_id||0,rekey_period:+$('d-rekey').value||0};
+      const r=await apiJson('/api/wcfg/global/wlan','POST',body);
+      let m=t('toast.ssidSaved'); const wn=r&&r.warnings;
+      if(wn&&wn.length)m+=t('toast.ssidWarn',{msg:wn.join(t('sep.semi'))});
+      toast(m); await loadWcfg(); renderWireless();
+    });
+}
+
+/* ---------- modal ---------- */
+let modalOpen=false, modalOk=null;
+function openModal(title,sub,bodyHtml,onOk,okLabel){
+  $('m-title').textContent=title; $('m-sub').innerHTML=sub; $('m-body').innerHTML=bodyHtml;
+  $('m-ok').textContent=okLabel||t('btn.save');
+  modalOk=onOk; modalOpen=true;
+  $('mask').classList.add('on'); $('modal').classList.add('on');
+}
+function closeModal(){ modalOpen=false; modalOk=null; $('mask').classList.remove('on'); $('modal').classList.remove('on'); }
+$('m-ok').addEventListener('click',async()=>{
+  if(!modalOk){closeModal();return;}
+  try{ await modalOk(); closeModal(); }
+  catch(e){ toast(t('toast.opFail',{msg:e.message})); }
 });
 
-refresh();
-setInterval(refresh, 5000);
+function toast(msg){const t=document.createElement('div');t.className='toast';t.textContent=msg;document.body.appendChild(t);setTimeout(()=>t.remove(),2400);}
+
+/* ---------- startup ---------- */
+$('sta-f').addEventListener('change',()=>renderClients());
+$('sta-q').addEventListener('keydown',e=>{if(e.key==='Enter')renderClients();});
+$('mgmt-q').addEventListener('keydown',e=>{if(e.key==='Enter')renderDevmgmt();});
+$('mgmt-f').addEventListener('change',()=>renderDevmgmt());
+applyStatic();
+renderChips();
+route();
 </script>
 </body>
 </html>

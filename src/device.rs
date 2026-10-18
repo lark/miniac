@@ -182,6 +182,28 @@ impl DeviceStore {
         Ok(())
     }
 
+    /// Record the identity learned from the join exchange: the vendor family,
+    /// the WTP model and the descriptor's hardware/software version strings.
+    /// Only the fields passed as `Some` are written, so a repeat join never
+    /// clears what an earlier one learned.
+    pub fn set_identity(
+        &self,
+        mac: Mac,
+        vendor: Option<&str>,
+        model: Option<&str>,
+        hw_version: Option<&str>,
+        sw_version: Option<&str>,
+    ) -> Result<()> {
+        let conn = self.db.lock();
+        conn.execute(
+            "UPDATE devices SET vendor=COALESCE(?2,vendor), model=COALESCE(?3,model),
+                hw_version=COALESCE(?4,hw_version), sw_version=COALESCE(?5,sw_version)
+             WHERE mac=?1",
+            params![&mac[..], vendor, model, hw_version, sw_version],
+        )?;
+        Ok(())
+    }
+
     /// Set the user-managed metadata: `name` and `description`.
     pub fn set_metadata(&self, mac: Mac, name: &str, description: &str) -> Result<()> {
         let conn = self.db.lock();

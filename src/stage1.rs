@@ -9,7 +9,7 @@
 //! fixed 548-byte frame and holds LE network-order IP fields at the given
 //! offsets.
 
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::net::UdpSocket;
@@ -66,10 +66,6 @@ pub struct AcPool {
     gateway: Ipv4Addr,
     netmask: Ipv4Addr,
     ac_ip: Ipv4Addr,
-    /// Subnet directed-broadcast address, used because the WTP broadcasts its
-    /// discovery request from 0.0.0.0 (no assigned address yet) and must be
-    /// answered on the LAN broadcast to its source port.
-    broadcast: Ipv4Addr,
 }
 
 fn now() -> i64 {
@@ -107,8 +103,6 @@ impl AcPool {
                 ],
             )?;
         }
-        let netmask_n = u32::from(netmask);
-        let broadcast = Ipv4Addr::from((u32::from(start) & netmask_n) | !netmask_n);
         Ok(AcPool {
             db,
             start_ip: u32::from(start),
@@ -116,7 +110,6 @@ impl AcPool {
             gateway,
             netmask,
             ac_ip,
-            broadcast,
         })
     }
 
@@ -255,9 +248,60 @@ pub fn build_reply(request: &[u8], lease: &Lease) -> Option<[u8; FRAME_LEN]> {
     Some(frame)
 }
 
+/// Broadcast a stage-1 reply to the WTP, pinning the egress interface to the one
+/// that owns `src`.
+///
+/// The WTP has no address yet, so the reply must reach it on the AC's own L2
+/// segment. The kernel picks the limited-broadcast route by route lookup, which
+/// is wrong when several routes cover the subnet (e.g. dormant tap devices);
+/// carrying the source address in an `IP_PKTINFO` control message forces the
+/// send out the interface that owns `src`, without needing elevated privileges.
+fn send_broadcast_reply(sock: &UdpSocket, src: Ipv4Addr, port: u16, payload: &[u8]) -> std::io::Result<()> {
+    use std::mem::size_of;
+    use std::os::unix::io::AsRawFd;
+
+    let fd = sock.as_raw_fd();
+    let mut dst: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+    dst.sin_family = libc::AF_INET as libc::sa_family_t;
+    dst.sin_port = port.to_be();
+    dst.sin_addr = libc::in_addr {
+        s_addr: u32::from(Ipv4Addr::BROADCAST).to_be(),
+    };
+    let mut iov = libc::iovec {
+        iov_base: payload.as_ptr() as *mut libc::c_void,
+        iov_len: payload.len(),
+    };
+    let mut control = [0u8; 64];
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_name = &mut dst as *mut _ as *mut libc::c_void;
+    msg.msg_namelen = size_of::<libc::sockaddr_in>() as libc::socklen_t;
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
+    msg.msg_controllen = unsafe { libc::CMSG_SPACE(size_of::<libc::in_pktinfo>() as u32) } as usize;
+    unsafe {
+        let cmsg = libc::CMSG_FIRSTHDR(&msg);
+        (*cmsg).cmsg_level = libc::IPPROTO_IP;
+        (*cmsg).cmsg_type = libc::IP_PKTINFO;
+        (*cmsg).cmsg_len = libc::CMSG_LEN(size_of::<libc::in_pktinfo>() as u32) as usize;
+        let pi = libc::CMSG_DATA(cmsg) as *mut libc::in_pktinfo;
+        (*pi).ipi_ifindex = 0; // derived from the source address
+        (*pi).ipi_spec_dst = libc::in_addr {
+            s_addr: u32::from(src).to_be(),
+        };
+        (*pi).ipi_addr = libc::in_addr { s_addr: 0 };
+        if libc::sendmsg(fd, &msg, 0) < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
 /// Run the stage-1 discovery loop: bind the private port, lease each WTP that
 /// presents a valid discovery frame, and reply with the lease.
 pub async fn serve(bind_addr: &str, pool: Arc<AcPool>) -> anyhow::Result<()> {
+    // Bind the wildcard so the WTP's broadcast request (dst 255.255.255.255) is
+    // delivered: a socket bound to a specific address does not receive it.
     let sock = UdpSocket::bind(bind_addr).await?;
     sock.set_broadcast(true)?;
     info!(
@@ -293,23 +337,21 @@ pub async fn serve(bind_addr: &str, pool: Arc<AcPool>) -> anyhow::Result<()> {
             dhcp_msg_type(&buf)
         );
         // The WTP broadcasts from 0.0.0.0 (no assigned address yet), so it may
-        // only accept the limited broadcast; reply to 255.255.255.255 rather
-        // than a subnet directed broadcast on a network the WTP has not joined.
-        let bcast = SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::BROADCAST), peer.port());
-        let directed = SocketAddr::new(std::net::IpAddr::V4(pool.broadcast), peer.port());
-        let bcast87 = SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::BROADCAST), STAGE1_PORT);
-        let directed87 = SocketAddr::new(std::net::IpAddr::V4(pool.broadcast), STAGE1_PORT);
+        // only accept the limited broadcast; reply to 255.255.255.255 on both the
+        // port it asked from and the well-known stage-1 port.
         match pool.lease_for_mac(mac) {
             Ok(Some(lease)) => {
                 if let Some(reply) = build_reply(&buf, &lease) {
-                    for addr in [bcast, directed, bcast87, directed87] {
-                        if let Err(e) = sock.send_to(&reply, addr).await {
-                            warn!("[!] stage-1 send reply to {} failed: {}", addr, e);
-                        } else {
-                            info!(
-                                "[>] stage-1 lease {} -> {} (ac {})",
-                                lease.wtp_ip, addr, lease.ac_ip
-                            );
+                    for port in [peer.port(), STAGE1_PORT] {
+                        match send_broadcast_reply(&sock, lease.ac_ip, port, &reply) {
+                            Ok(()) => info!(
+                                "[>] stage-1 lease {} -> 255.255.255.255:{} (ac {})",
+                                lease.wtp_ip, port, lease.ac_ip
+                            ),
+                            Err(e) => warn!(
+                                "[!] stage-1 reply to 255.255.255.255:{} failed: {}",
+                                port, e
+                            ),
                         }
                     }
                 }

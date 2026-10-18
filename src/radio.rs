@@ -13,6 +13,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use rusqlite::{params, OptionalExtension};
 
+use crate::config::{Akm, Cipher, Pmf, SecurityPolicy};
 use crate::db::Db;
 use crate::device::{mac_to_str, Mac};
 
@@ -46,19 +47,16 @@ pub struct RadioWlan {
     pub radio_id: u8,
     pub wlan_id: u8,
     pub ssid: String,
-    /// Security policy: "open" | "wpa2" | "wpa3" | "wpa2-wpa3".
-    pub security: String,
-    /// WPA passphrase (8..63 chars); `None` for open networks.
-    pub psk: Option<String>,
+    /// Key-management and cipher policy, kept as two orthogonal dimensions,
+    /// plus the WPA passphrase for a secured network.
+    pub security: SecurityPolicy,
     /// Record slot up (CFG_SetWifiSsidEnable), client isolate, SSID visibility
-    /// (broadcast 1 / hidden 0), client limit, VLAN id, WPA cipher
-    /// (1 TKIP / 2 AES / 3 TKIP+AES) and WPA rekey period.
+    /// (broadcast 1 / hidden 0), client limit, VLAN id and WPA rekey period.
     pub wlan_enable: bool,
     pub isolate: bool,
     pub broadcast: bool,
     pub client_count: u32,
     pub vlan_id: u32,
-    pub cipher: u32,
     pub rekey_period: u32,
 }
 
@@ -69,14 +67,12 @@ impl Default for RadioWlan {
             radio_id: 0,
             wlan_id: 1,
             ssid: String::new(),
-            security: "open".into(),
-            psk: None,
+            security: SecurityPolicy::default(),
             wlan_enable: true,
             isolate: false,
             broadcast: true,
             client_count: 0,
             vlan_id: 0,
-            cipher: 2,
             rekey_period: 0,
         }
     }
@@ -84,9 +80,9 @@ impl Default for RadioWlan {
 
 /// H3C per-band radio header settings carried by the leading 7 x u32 of each
 /// band's 0xfde8 section: enable (word0), power (word2), mode (word3) and
-/// channel (word5). `channel` is the AX60 5G channel *index* (0..12 ->
-/// 149/153/157/161/165/36/40/44/48/52/56/60/64 MHz), not a frequency. Stored
-/// per (mac, radio_id); radio_id 1 = 2.4G, 2 = 5G.
+/// channel (word5). `channel` is the IEEE channel number (0 = auto / ACS),
+/// carried verbatim on the wire. Stored per (mac, radio_id); radio_id 1 = 2.4G,
+/// 2 = 5G.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct H3cRadioHeader {
     pub radio_id: u8,
@@ -199,34 +195,35 @@ impl RadioStore {
     }
 
     /// Set (insert or overwrite) a per-radio WLAN configuration, including the
-    /// H3C 0xfde8 record fields. `security` is a validated policy string; the
+    /// H3C 0xfde8 record fields. The security policy is validated upstream; the
     /// empty set is allowed so a radio can be reconfigured (e.g. cleared)
     /// through the API.
     pub fn set_wlan(&self, w: &RadioWlan) -> Result<()> {
         let conn = self.db.lock();
         conn.execute(
-            "INSERT INTO radio_wlans (mac,radio_id,wlan_id,ssid,security,psk,
-                wlan_enable,isolate,broadcast,client_count,vlan_id,cipher,rekey_period)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
+            "INSERT INTO radio_wlans (mac,radio_id,wlan_id,ssid,akm,cipher,pmf,psk,
+                wlan_enable,isolate,broadcast,client_count,vlan_id,rekey_period)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)
              ON CONFLICT(mac,radio_id,wlan_id) DO UPDATE SET
-                ssid=excluded.ssid, security=excluded.security, psk=excluded.psk,
+                ssid=excluded.ssid, akm=excluded.akm, cipher=excluded.cipher,
+                pmf=excluded.pmf, psk=excluded.psk,
                 wlan_enable=excluded.wlan_enable, isolate=excluded.isolate,
                 broadcast=excluded.broadcast, client_count=excluded.client_count,
-                vlan_id=excluded.vlan_id, cipher=excluded.cipher,
-                rekey_period=excluded.rekey_period",
+                vlan_id=excluded.vlan_id, rekey_period=excluded.rekey_period",
             params![
                 &w.mac[..],
                 w.radio_id,
                 w.wlan_id,
                 w.ssid,
-                w.security,
-                w.psk,
+                w.security.akm.as_str(),
+                w.security.cipher.wire() as i64,
+                w.security.pmf.as_str(),
+                w.security.psk,
                 i64::from(w.wlan_enable),
                 i64::from(w.isolate),
                 i64::from(w.broadcast),
                 w.client_count as i64,
                 w.vlan_id as i64,
-                w.cipher as i64,
                 w.rekey_period as i64,
             ],
         )?;
@@ -237,8 +234,8 @@ impl RadioStore {
     pub fn list_wlans(&self, mac: Mac) -> Result<Vec<RadioWlan>> {
         let conn = self.db.lock();
         let mut stmt = conn.prepare(
-            "SELECT mac,radio_id,wlan_id,ssid,security,psk,
-                wlan_enable,isolate,broadcast,client_count,vlan_id,cipher,rekey_period
+            "SELECT mac,radio_id,wlan_id,ssid,akm,cipher,pmf,psk,
+                wlan_enable,isolate,broadcast,client_count,vlan_id,rekey_period
              FROM radio_wlans WHERE mac=?1 ORDER BY radio_id, wlan_id",
         )?;
         let rows = stmt.query_map(params![&mac[..]], row_wlan)?;
@@ -251,8 +248,8 @@ impl RadioStore {
     pub fn list_wlans_enabled(&self, mac: Mac) -> Result<Vec<RadioWlan>> {
         let conn = self.db.lock();
         let mut stmt = conn.prepare(
-            "SELECT mac,radio_id,wlan_id,ssid,security,psk,
-                wlan_enable,isolate,broadcast,client_count,vlan_id,cipher,rekey_period
+            "SELECT mac,radio_id,wlan_id,ssid,akm,cipher,pmf,psk,
+                wlan_enable,isolate,broadcast,client_count,vlan_id,rekey_period
              FROM radio_wlans WHERE mac=?1 AND wlan_enable != 0
              ORDER BY radio_id, wlan_id",
         )?;
@@ -260,13 +257,24 @@ impl RadioStore {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    /// Remove every WLAN row for one radio of a WTP, so a global template that
+    /// shrank (SSID deleted) fully replaces the band's per-WTP rows.
+    pub fn delete_wlans_for_band(&self, mac: Mac, radio_id: u8) -> Result<()> {
+        let conn = self.db.lock();
+        conn.execute(
+            "DELETE FROM radio_wlans WHERE mac=?1 AND radio_id=?2",
+            params![&mac[..], radio_id],
+        )?;
+        Ok(())
+    }
+
     /// Look up a single per-radio WLAN configuration.
     pub fn get_wlan(&self, mac: Mac, radio_id: u8, wlan_id: u8) -> Result<Option<RadioWlan>> {
         let conn = self.db.lock();
         let w = conn
             .query_row(
-                "SELECT mac,radio_id,wlan_id,ssid,security,psk,
-                    wlan_enable,isolate,broadcast,client_count,vlan_id,cipher,rekey_period
+                "SELECT mac,radio_id,wlan_id,ssid,akm,cipher,pmf,psk,
+                    wlan_enable,isolate,broadcast,client_count,vlan_id,rekey_period
                  FROM radio_wlans
                  WHERE mac=?1 AND radio_id=?2 AND wlan_id=?3",
                 params![&mac[..], radio_id, wlan_id],
@@ -276,10 +284,10 @@ impl RadioStore {
         Ok(w)
     }
 
-    /// The H3C band-header config for a radio. Falls back to per-band defaults
-    /// when no row has been stored yet: both bands up (enable=1, power=6,
-    /// mode=0); 5G (radio 2) pins channel index 4 (165 MHz) so the band comes
-    /// up on a stable channel without extra configuration.
+    /// The H3C band-header config for a radio. The row is written by
+    /// [`crate::wcfg::WirelessConfigStore::materialize`] before a WTP's config
+    /// is pushed, so a missing row is an error rather than a silent default: the
+    /// defaults live in the `global_radio` seed, not here.
     pub fn h3c_header(&self, mac: Mac, radio_id: u8) -> Result<H3cRadioHeader> {
         let conn = self.db.lock();
         let h = conn
@@ -298,13 +306,13 @@ impl RadioStore {
                 },
             )
             .optional()?;
-        Ok(h.unwrap_or(H3cRadioHeader {
-            radio_id,
-            enable: true,
-            power: 6,
-            mode: 0,
-            channel: if radio_id == 2 { 4 } else { 0 },
-        }))
+        h.ok_or_else(|| {
+            anyhow::anyhow!(
+                "radio header for {} radio {} not materialized",
+                mac_to_str(mac),
+                radio_id
+            )
+        })
     }
 
     /// Store the H3C band-header config for a radio. Inserts a row with the
@@ -358,6 +366,9 @@ impl RadioStore {
 
 fn row_wlan(r: &rusqlite::Row) -> rusqlite::Result<RadioWlan> {
     let mac: Vec<u8> = r.get(0)?;
+    let akm: String = r.get(4)?;
+    let cipher: i64 = r.get(5)?;
+    let pmf: String = r.get(6)?;
     Ok(RadioWlan {
         mac: mac
             .try_into()
@@ -365,15 +376,18 @@ fn row_wlan(r: &rusqlite::Row) -> rusqlite::Result<RadioWlan> {
         radio_id: r.get::<_, i64>(1)? as u8,
         wlan_id: r.get::<_, i64>(2)? as u8,
         ssid: r.get(3)?,
-        security: r.get(4)?,
-        psk: r.get(5)?,
-        wlan_enable: r.get::<_, i64>(6)? != 0,
-        isolate: r.get::<_, i64>(7)? != 0,
-        broadcast: r.get::<_, i64>(8)? != 0,
-        client_count: r.get::<_, i64>(9)? as u32,
-        vlan_id: r.get::<_, i64>(10)? as u32,
-        cipher: r.get::<_, i64>(11)? as u32,
-        rekey_period: r.get::<_, i64>(12)? as u32,
+        security: SecurityPolicy {
+            akm: Akm::from_str(&akm).unwrap_or_default(),
+            cipher: Cipher::from_wire(cipher as u32).unwrap_or_default(),
+            psk: r.get(7)?,
+            pmf: Pmf::from_str(&pmf).unwrap_or_default(),
+        },
+        wlan_enable: r.get::<_, i64>(8)? != 0,
+        isolate: r.get::<_, i64>(9)? != 0,
+        broadcast: r.get::<_, i64>(10)? != 0,
+        client_count: r.get::<_, i64>(11)? as u32,
+        vlan_id: r.get::<_, i64>(12)? as u32,
+        rekey_period: r.get::<_, i64>(13)? as u32,
     })
 }
 
@@ -417,8 +431,12 @@ mod tests {
             radio_id: 1,
             wlan_id: 1,
             ssid: "minimac".into(),
-            security: "wpa2-wpa3".into(),
-            psk: Some("person0finterest".into()),
+            security: SecurityPolicy {
+                akm: Akm::PskSae,
+                cipher: Cipher::Ccmp,
+                psk: Some("person0finterest".into()),
+                pmf: Pmf::Disabled,
+            },
             ..RadioWlan::default()
         })
         .unwrap();
@@ -427,56 +445,54 @@ mod tests {
             radio_id: 2,
             wlan_id: 1,
             ssid: "minimac".into(),
-            security: "wpa3".into(),
-            psk: Some("person0finterest".into()),
+            security: SecurityPolicy {
+                akm: Akm::Sae,
+                cipher: Cipher::Ccmp,
+                psk: Some("person0finterest".into()),
+                pmf: Pmf::Required,
+            },
             ..RadioWlan::default()
         })
         .unwrap();
         let wlans = s.list_wlans(w).unwrap();
         assert_eq!(wlans.len(), 2);
         assert_eq!(wlans[0].radio_id, 1);
-        assert_eq!(wlans[0].security, "wpa2-wpa3");
-        assert_eq!(wlans[0].psk.as_deref(), Some("person0finterest"));
+        assert_eq!(wlans[0].security.akm, Akm::PskSae);
+        assert_eq!(wlans[0].security.cipher, Cipher::Ccmp);
+        assert_eq!(wlans[0].security.psk.as_deref(), Some("person0finterest"));
         // H3C record defaults: SSID visible, AES cipher.
         assert!(wlans[0].broadcast);
-        assert_eq!(wlans[0].cipher, 2);
         assert!(wlans[0].wlan_enable);
         assert_eq!(wlans[1].radio_id, 2);
         assert_eq!(wlans[1].ssid, "minimac");
+        assert_eq!(wlans[1].security.akm, Akm::Sae);
+        assert_eq!(wlans[1].security.pmf, Pmf::Required);
         // Overwrite (upsert) keeps a single row per (radio, wlan).
         s.set_wlan(&RadioWlan {
             mac: w,
             radio_id: 1,
             wlan_id: 1,
             ssid: "renamed".into(),
-            security: "open".into(),
-            psk: None,
+            security: SecurityPolicy::default(),
             broadcast: false,
-            cipher: 0,
             ..RadioWlan::default()
         })
         .unwrap();
         let one = s.get_wlan(w, 1, 1).unwrap().unwrap();
         assert_eq!(one.ssid, "renamed");
-        assert_eq!(one.security, "open");
-        assert!(one.psk.is_none());
+        assert_eq!(one.security.akm, Akm::Open);
+        assert!(one.security.psk.is_none());
+        assert_eq!(one.security.cipher, Cipher::Ccmp);
         assert!(!one.broadcast);
-        assert_eq!(one.cipher, 0);
         assert_eq!(s.list_wlans(w).unwrap().len(), 2);
     }
 
     #[test]
-    fn h3c_header_default_and_set() {
+    fn h3c_header_requires_materialized_row_and_set() {
         let s = store();
         let w = mac(1);
-        // No stored row -> per-band defaults (5G pins channel index 4).
-        let g24 = s.h3c_header(w, 1).unwrap();
-        assert!(g24.enable);
-        assert_eq!(g24.power, 6);
-        assert_eq!(g24.channel, 0);
-        let g5 = s.h3c_header(w, 2).unwrap();
-        assert!(g5.enable);
-        assert_eq!(g5.channel, 4);
+        // No stored row -> error; defaults come from the global_radio seed.
+        assert!(s.h3c_header(w, 1).is_err());
         // Stored row wins.
         s.set_h3c_header(
             w,

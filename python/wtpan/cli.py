@@ -35,7 +35,14 @@ from .subst import Substitution
 from .wtp import Session
 
 _PKG = os.path.dirname(os.path.abspath(__file__))
-_DEFAULT_TEMPLATES = os.path.join(_PKG, "templates.py")
+#: Default template file per framing variant: the H3C templates carry the
+#: AX60/miniac session, the TP-Link ones the real TL-AP1300GI plaintext.
+_H3C_TEMPLATES = os.path.join(_PKG, "templates.py")
+_DEFAULT_TEMPLATES = {
+    "rfc": _H3C_TEMPLATES,
+    "h3c": _H3C_TEMPLATES,
+    "tplink": os.path.join(_PKG, "tplink_templates.py"),
+}
 _CAPWAP_CERTS = os.path.expanduser(
     "~/firmware/h3c-mini-ax60/extract/squashfs-root/etc/capwap")
 _DEFAULT_TLS_CLIENT = os.path.join(_CAPWAP_CERTS, "client.pem")
@@ -84,8 +91,9 @@ def cmd_gen_templates(args):
         sys.exit(f"no parseable control frames found in {srcs}")
     text = to_code(script, frm, args.name or os.path.basename(srcs[0]),
                    ", ".join(srcs))
-    write_templates(args.out, text)
-    print(f"wrote {len(text.splitlines())} lines to {args.out}")
+    out = args.out or _DEFAULT_TEMPLATES[args.frame]
+    write_templates(out, text)
+    print(f"wrote {len(text.splitlines())} lines to {out}")
 
 
 def cmd_parse_dump(args):
@@ -130,8 +138,10 @@ def _parse_sub(pairs):
 
 
 def _load_templates(args):
-    if os.path.exists(args.templates):
-        return load_templates(args.templates)
+    path = args.templates or _DEFAULT_TEMPLATES.get(args.frame,
+                                                    _H3C_TEMPLATES)
+    if os.path.exists(path):
+        return load_templates(path)
     return {}
 
 
@@ -151,7 +161,8 @@ def _make_session(args):
                    timeout=args.timeout, keep_seq=args.keep_seq,
                    seq_start=args.seq_start,
                    require_discovery=getattr(args, "require_discovery",
-                                             False))
+                                             False),
+                   trace=args.trace, dtls_proto=args.dtls_version)
 
 
 def cmd_phase(args):
@@ -187,9 +198,10 @@ def build_parser():
                    help="dump source (repeatable; comma-separated ok)")
     g.add_argument("--src-type", choices=["auto", "miniac-log", "pcap",
                                           "dumpfile"], default="auto")
-    g.add_argument("--frame", choices=["rfc", "h3c"], default="h3c")
-    g.add_argument("--out", default=_DEFAULT_TEMPLATES,
-                   help="output templates.py path")
+    g.add_argument("--frame", choices=["rfc", "h3c", "tplink"], default="h3c")
+    g.add_argument("--out", default=None,
+                   help="output templates.py path (default: the built-in "
+                        "templates file for --frame)")
     g.add_argument("--name", help="templates.py docstring source name")
 
     d = sub.add_parser("parse-dump", help="summarize a dump")
@@ -197,7 +209,7 @@ def build_parser():
                    help="dump source (repeatable; comma-separated ok)")
     d.add_argument("--src-type", choices=["auto", "miniac-log", "pcap",
                                           "dumpfile"], default="auto")
-    d.add_argument("--frame", choices=["rfc", "h3c"], default="h3c")
+    d.add_argument("--frame", choices=["rfc", "h3c", "tplink"], default="h3c")
 
     for name in ("discover", "join", "config-status", "echo", "chan-util",
                  "session", "send"):
@@ -225,11 +237,12 @@ def build_parser():
 
 
 def _add_session_args(pp):
-    pp.add_argument("--templates", default=_DEFAULT_TEMPLATES,
-                    help="templates.py path (default %(default)s)")
+    pp.add_argument("--templates", default=None,
+                    help="templates.py path (default: the built-in templates "
+                         "file for --frame)")
     pp.add_argument("--target", default="127.0.0.1:5246",
                     help="AC address host:port (default %(default)s)")
-    pp.add_argument("--frame", choices=["rfc", "h3c"], default="h3c")
+    pp.add_argument("--frame", choices=["rfc", "h3c", "tplink"], default="h3c")
     pp.add_argument("--local-ip", help="WTP-side IP for runtime elements")
     pp.add_argument("--ac-ip", help="AC control IP for tag 10 elements")
     pp.add_argument("--wtp-mac", metavar="HEX",
@@ -241,6 +254,9 @@ def _add_session_args(pp):
     pp.add_argument("--seq-start", type=int, default=1,
                     help="first sequence number when re-sequencing")
     pp.add_argument("--dtls", choices=["auto", "on", "off"], default="auto")
+    pp.add_argument("--dtls-version", choices=["1.0", "1.2"], default=None,
+                    help="force an exact DTLS version (TP-Link AC100 wants "
+                         "1.0); default is the H3C/miniac DTLS 1.2 path")
     pp.add_argument("--tls-client", default=_DEFAULT_TLS_CLIENT,
                     help="client cert+key PEM (default: AX60 client.pem)")
     pp.add_argument("--tls-ca", default=_DEFAULT_TLS_CA,
@@ -249,6 +265,9 @@ def _add_session_args(pp):
                     help="verify the AC certificate against --tls-ca")
     pp.add_argument("--timeout", type=float, default=5.0,
                     help="reply wait in seconds (default %(default)s)")
+    pp.add_argument("--trace", default=None,
+                    help="append every datagram to this file in miniac's -D "
+                         "dump convention (RX = WTP->AC, TX = AC->WTP)")
     pp.add_argument("--out", help="append the reply to a JSON transcript")
 
 

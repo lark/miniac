@@ -1,16 +1,18 @@
-"""CAPWAP control framing: RFC 5415 and H3C AX60 wire layouts.
+"""CAPWAP control framing: RFC 5415, H3C AX60 and TP-Link wire layouts.
 
 Copyright (c) 2026  Wang Jian
 
-RFC 5415 control messages are
-  [base header 8B][Message Type 4B][Seq 1B][MsgElemLen 2B][Flags 1B][elements]
-with elements at byte 16 of the wire. H3C AX60-style WTPs use the same shape
-for the whole control session (not just discovery) but widen Seq to 4 bytes
-and make MsgElemLen self-inclusive:
-  [base header 8B][Message Type 4B][Seq 4B][MsgElemLen 2B][Flags 1B][elements]
-with elements at byte 19 and MsgElemLen = elements + 3. All decode functions
-here operate on the control payload that follows the 8-byte base header
-(i.e. app_data[8..]); `frame()` produces the full wire bytes.
+All forms share the RFC 5415 control header layout
+  [Message Type 4B][Seq][MsgElemLen 2B][Flags 1B][elements]
+where MsgElemLen is self-inclusive: it counts from the Sequence Number
+field onward, i.e. elements + 3 (RFC 5415 4.5.1.3). RFC messages are bare,
+with a 1-byte Seq and elements at byte 8. H3C AX60-style WTPs carry an
+8-byte base header over the whole control session and widen Seq to 4 bytes,
+with elements at byte 19. TP-Link WTPs (e.g. TL-AP1300GI) combine both: an
+8-byte base header, a 1-byte Seq and elements at byte 16. All decode
+functions here operate on the control payload that follows the 8-byte base
+header (i.e. app_data[8..]) for the framed variants; `frame()` produces the
+full wire bytes.
 """
 
 from .ctrl_names import MsgElemType
@@ -20,15 +22,20 @@ from .ctrl_names import MsgElemType
 #: offset, so a fixed valid value is enough for responses.
 BASE_HEADER = bytes([0x00, 0x10, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00])
 
+#: Base header a TP-Link WTP (TL-AP1300GI) puts on every control datagram;
+#: captured verbatim from its Join Request/Configuration Status Request.
+TPLINK_HEADER = bytes([0x01, 0x10, 0x43, 0x00, 0x00, 0x00, 0x00, 0x00])
+
 
 class CtrlFrame:
-    """Vendor CAPWAP control framing (RFC or H3C AX60)."""
+    """Vendor CAPWAP control framing (RFC, H3C AX60 or TP-Link)."""
 
     RFC = "rfc"
     H3C = "h3c"
+    TPLINK = "tplink"
 
     def __init__(self, name):
-        if name not in (self.RFC, self.H3C):
+        if name not in (self.RFC, self.H3C, self.TPLINK):
             raise ValueError(f"unknown frame {name!r}")
         self.name = name
 
@@ -38,9 +45,23 @@ class CtrlFrame:
     def __repr__(self):
         return f"CtrlFrame({self.name!r})"
 
+    def base_header(self):
+        """The 8-byte base header this variant prepends to every control
+        datagram (empty for a bare RFC 5415 message)."""
+        if self.name == self.H3C:
+            return BASE_HEADER
+        if self.name == self.TPLINK:
+            return TPLINK_HEADER
+        return b""
+
+    def self_inclusive_elem_len(self):
+        """MsgElemLen counts from the Sequence Number field onward, i.e. the
+        element bytes plus the 3 trailing header bytes, for every variant."""
+        return True
+
     def seq_len(self):
-        """Width of the Seq field (1 byte RFC, 4 bytes H3C)."""
-        return 1 if self.name == self.RFC else 4
+        """Width of the Seq field (1 byte RFC/TP-Link, 4 bytes H3C)."""
+        return 4 if self.name == self.H3C else 1
 
     def elem_off(self):
         """Byte offset of the first element inside the control payload
@@ -55,11 +76,8 @@ class CtrlFrame:
         if len(buf) < off:
             raise ValueError("control header too short")
         msg_type = int.from_bytes(buf[0:4], "big")
-        if self.name == self.RFC:
-            seq = buf[4]
-        else:
-            seq = int.from_bytes(buf[4:8], "big")
         s = self.seq_len()
+        seq = int.from_bytes(buf[4:4 + s], "big")
         elem_len = int.from_bytes(buf[4 + s:6 + s], "big")
         flags = buf[6 + s]
         return msg_type, seq, elem_len, flags
@@ -82,19 +100,18 @@ class CtrlFrame:
         return elems, pos
 
     def wire_elem_len(self, tag, data):
-        """On-wire byte count of one element. The AX60 Result-Code element is
-        a 4-byte value (unlike the RFC 1-octet form), so the length must
-        account for that widening."""
+        """On-wire byte count of one element. The Result-Code element is a
+        4-byte value on this wire (unlike the RFC 1-octet form), so a 1-byte
+        value is widened before it is counted."""
         data_len = 4 if (tag == MsgElemType.RESULT_CODE and len(data) == 1) else len(data)
         return 4 + data_len
 
     def append_elems(self, out, elems):
-        """Append elements in t2l2 framing, widening the Result Code element
-        under H3C framing."""
-        h3c = self.name == self.H3C
+        """Append elements in t2l2 framing, widening a 1-byte Result Code to
+        the 4-byte on-wire form."""
         for tag, data in elems:
             out += tag.to_bytes(2, "big")
-            if h3c and tag == MsgElemType.RESULT_CODE and len(data) == 1:
+            if tag == MsgElemType.RESULT_CODE and len(data) == 1:
                 out += (4).to_bytes(2, "big")
                 out += data[0].to_bytes(4, "big")
             else:
@@ -103,21 +120,12 @@ class CtrlFrame:
 
     def frame(self, msg_type, seq, elems, flags=0):
         """Serialize a control message back to wire bytes (including the
-        8-byte base header under H3C framing) for transmission."""
-        if self.name == self.RFC:
-            body_len = sum(4 + len(d) for _, d in elems)
-            out = bytearray()
-            out += msg_type.to_bytes(4, "big")
-            out += bytes([seq & 0xFF])
-            out += body_len.to_bytes(2, "big")
-            out += bytes([flags])
-            self.append_elems(out, elems)
-            return bytes(out)
+        8-byte base header for the H3C/TP-Link variants) for transmission."""
         body_len = sum(self.wire_elem_len(t, d) for t, d in elems)
         out = bytearray()
-        out += BASE_HEADER
+        out += self.base_header()
         out += msg_type.to_bytes(4, "big")
-        out += seq.to_bytes(4, "big")
+        out += seq.to_bytes(self.seq_len(), "big")
         out += (3 + body_len).to_bytes(2, "big")
         out += bytes([flags])
         self.append_elems(out, elems)
@@ -125,13 +133,12 @@ class CtrlFrame:
 
     def wire_to_control(self, wire):
         """Control payload (after the base header) from a full wire frame."""
-        return bytes(wire[8:]) if self.name == self.H3C else bytes(wire)
+        hdr = self.base_header()
+        return bytes(wire[len(hdr):]) if hdr else bytes(wire)
 
     def control_to_wire(self, control):
         """Full wire bytes from a control payload (adds the base header)."""
-        if self.name == self.H3C:
-            return BASE_HEADER + bytes(control)
-        return bytes(control)
+        return self.base_header() + bytes(control)
 
 
 def parse_hdr(frame, buf):

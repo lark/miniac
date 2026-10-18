@@ -11,6 +11,7 @@ mod dtls_local;
 mod dump;
 mod elements;
 mod firmware;
+mod fleet;
 mod logx;
 mod radio;
 mod roaming;
@@ -18,7 +19,9 @@ mod security;
 mod stage1;
 mod station;
 mod vendor;
+mod wcfg;
 mod web;
+mod wtpcmd;
 
 use anyhow::{anyhow, Result};
 use std::{
@@ -33,15 +36,35 @@ use tokio::{
 };
 use tracing::{debug, error, info, warn};
 
-use capwap::{CtrlMsg, CwElem, CwResult, MsgElemType, MsgType, WtpContext, WtpState};
+use capwap::{CtrlMsg, CwElem, MsgElemType, MsgType, WtpContext, WtpState};
+use elements::BaseElem;
 
 const CTRL_PORT: u16 = 5246;
 const HTTP_DEFAULT_PORT: &str = "8080";
 
-/// Framing used for the whole DTLS control session. H3C AX60-style WTPs widen
-/// the control header Seq to 4 bytes and expect the 8-byte base header on
-/// every message (not just discovery), so responses are framed accordingly.
-const FRAME: vendor::framing::CtrlFrame = vendor::framing::CtrlFrame::H3c;
+/// Image name carried by a Reset Request's Image Identifier on the RFC and
+/// TP-Link paths (AC100 names its own software version there). H3C ignores it:
+/// its reset requests carry the fixed `all_version` image identifier.
+const RESET_IMAGE_NAME: &[u8] = b"all_version";
+
+/// How long to wait for the WTP's reply to a serialized vendor push frame
+/// before releasing the next one (`WtpContext::push_queue`). AC100's own pacing
+/// is ~2.3s; this leaves margin for a slower WTP without stalling the push.
+const PUSH_REPLY_TIMEOUT: Duration = Duration::from_secs(12);
+
+/// Framing used for a session's control messages. It is the detected profile of
+/// the peer's device, so several vendors' WTPs can share one miniac.
+fn frame(profile: vendor::profile::VendorProfile) -> vendor::framing::CtrlFrame {
+    profile.frame()
+}
+
+/// Whether an inbound datagram is a DTLS record for a session on the control
+/// port. RFC 5415 §4.1/§4.2 prefix every DTLS-carried CAPWAP datagram with the
+/// 4-byte CAPWAP DTLS Header, whose first byte is 1 (Preamble Version 0, Type 1
+/// = DTLS). Clear-text CAPWAP uses Preamble Type 0, i.e. a first byte of 0.
+fn is_dtls_frame(pkt: &[u8]) -> bool {
+    pkt.first() == Some(&1)
+}
 
 /// Command-line settings: `-a` (repeatable) names the CAPWAP control bind
 /// addresses (the control port 5246 is fixed by RFC 5415), `-l` gives the
@@ -150,7 +173,23 @@ async fn main() -> Result<()> {
         info!("[*] plaintext control dump -> {dump_path}");
     }
 
-    let dtls_config = generate_dtls_config()?;
+    // One DTLS identity per vendor profile: the detected device profile picks
+    // the certificate directory (and whether the client certificate is pinned).
+    let dtls_configs: Arc<HashMap<vendor::profile::VendorProfile, Arc<rtc_dtls::config::HandshakeConfig>>> = {
+        use vendor::profile::VendorProfile;
+        let mut m = HashMap::new();
+        for p in [VendorProfile::H3c, VendorProfile::TpLink, VendorProfile::Rfc] {
+            m.insert(p, generate_dtls_config(p)?);
+        }
+        Arc::new(m)
+    };
+
+    // Peer IP -> profile detected from the device's Discovery/Join Request. Keyed
+    // by IP, not the full socket address: some WTPs (TP-Link TL-AP1300GI, H3C
+    // AX60) start DTLS from a different source port than their Discovery, so a
+    // port-keyed map would miss and misdetect the profile at DTLS time.
+    let peer_profiles: Arc<Mutex<HashMap<IpAddr, vendor::profile::VendorProfile>>> =
+        Arc::new(Mutex::new(HashMap::new()));
 
     let dispatcher_map: Arc<Mutex<HashMap<SocketAddr, mpsc::Sender<Vec<u8>>>>> =
         Arc::new(Mutex::new(HashMap::new()));
@@ -163,6 +202,10 @@ async fn main() -> Result<()> {
     let fw = Arc::new(firmware::FirmwareStore::with_root(db.clone(), "firmware")); // image catalog + upgrade audit
     std::fs::create_dir_all("firmware")?;
     let upgrade_reg = Arc::new(firmware::UpgradeRegistry::new()); // web -> live-session firmware trigger
+    let cfg_update_reg = Arc::new(config::ConfigUpdateRegistry::new()); // web -> live-session config-update trigger
+    let wtp_cmd_reg = Arc::new(wtpcmd::WtpCmdRegistry::new()); // web -> live-session reset/disable/release-client trigger
+    let wcfg = Arc::new(wcfg::WirelessConfigStore::new(db.clone())); // global wireless config + overrides + pending set
+    let caps = Arc::new(fleet::ProductCapsStore::new(db.clone())); // product capability registry for the security recommender
     info!("[*] persistence ready (miniac.db)");
     logx::system("persistence initialized (miniac.db)".to_string());
 
@@ -176,6 +219,10 @@ async fn main() -> Result<()> {
         profiles.clone(),
         fw.clone(),
         upgrade_reg.clone(),
+        cfg_update_reg.clone(),
+        wtp_cmd_reg.clone(),
+        wcfg.clone(),
+        caps.clone(),
     ));
     tokio::spawn(web::serve(web_state, http_addr));
 
@@ -201,8 +248,17 @@ async fn main() -> Result<()> {
             .ok()
             .and_then(|v| v.parse::<std::net::Ipv4Addr>().ok())
             .unwrap_or(ac_ip);
-        let pool_start = add_ip(base, 50);
-        let pool_end = add_ip(base, 80);
+        // The pool defaults to base+50..base+80; override the bounds individually
+        // (MINIAC_WTP_POOL_START / MINIAC_WTP_POOL_END) so a site with a fixed,
+        // small range can be pinned without shifting the network base.
+        let pool_ip = |key: &str, default: std::net::Ipv4Addr| {
+            std::env::var(key)
+                .ok()
+                .and_then(|v| v.parse::<std::net::Ipv4Addr>().ok())
+                .unwrap_or(default)
+        };
+        let pool_start = pool_ip("MINIAC_WTP_POOL_START", add_ip(base, 50));
+        let pool_end = pool_ip("MINIAC_WTP_POOL_END", add_ip(base, 80));
         let netmask = std::net::Ipv4Addr::from(0xffff_ffffu32 << (32 - prefix));
         let pool = std::sync::Arc::new(stage1::AcPool::prefill(
             db.clone(),
@@ -235,12 +291,16 @@ async fn main() -> Result<()> {
         control_tasks.push(tokio::spawn(run_control_socket(
             socket,
             dispatcher_map.clone(),
-            dtls_config.clone(),
+            peer_profiles.clone(),
+            dtls_configs.clone(),
             devices.clone(),
             radios.clone(),
             stations.clone(),
             fw.clone(),
             upgrade_reg.clone(),
+            cfg_update_reg.clone(),
+            wtp_cmd_reg.clone(),
+            wcfg.clone(),
         )));
     }
 
@@ -257,17 +317,29 @@ async fn main() -> Result<()> {
 async fn run_control_socket(
     socket: Arc<UdpSocket>,
     dispatcher_map: Arc<Mutex<HashMap<SocketAddr, mpsc::Sender<Vec<u8>>>>>,
-    dtls_config: Arc<rtc_dtls::config::HandshakeConfig>,
+    peer_profiles: Arc<Mutex<HashMap<IpAddr, vendor::profile::VendorProfile>>>,
+    dtls_configs: Arc<HashMap<vendor::profile::VendorProfile, Arc<rtc_dtls::config::HandshakeConfig>>>,
     devices: Arc<device::DeviceStore>,
     radios: Arc<radio::RadioStore>,
     stations: Arc<station::StationStore>,
     fw: Arc<firmware::FirmwareStore>,
     upgrade_reg: Arc<firmware::UpgradeRegistry>,
+    cfg_update_reg: Arc<config::ConfigUpdateRegistry>,
+    wtp_cmd_reg: Arc<wtpcmd::WtpCmdRegistry>,
+    wcfg: Arc<wcfg::WirelessConfigStore>,
 ) -> Result<()> {
     let mut buf = [0u8; 2048];
     loop {
         let (n, peer) = socket.recv_from(&mut buf).await?;
         let pkt = buf[..n].to_vec();
+        use vendor::profile::VendorProfile;
+
+        // Profile already detected for this peer's device, if any (in-session
+        // traffic and DTLS handshakes reuse it, even from a new source port).
+        let known_profile = {
+            let map = peer_profiles.lock().await;
+            map.get(&peer.ip()).copied()
+        };
 
         let tx = {
             let map = dispatcher_map.lock().await;
@@ -275,7 +347,7 @@ async fn run_control_socket(
         };
 
         if let Some(tx) = tx {
-            if pkt.get(0) == Some(&1) {
+            if is_dtls_frame(&pkt) {
                 let _ = tx.try_send(pkt);
             }
             continue;
@@ -286,6 +358,12 @@ async fn run_control_socket(
             if pkt.get(11) == Some(&1) {
                 // MsgType: 1 (Discovery Request)
                 info!("[<] from {}: disc req", peer);
+
+                // The profile is detected from the device's own Discovery
+                // Request; an operator override (`MINIAC_VENDOR`) wins.
+                let prof =
+                    VendorProfile::forced().unwrap_or_else(|| VendorProfile::detect(&pkt));
+                peer_profiles.lock().await.insert(peer.ip(), prof);
 
                 // The AC advertises its own control address (AC IPv4 List) so
                 // the WTP knows which destination to start DTLS/Join against.
@@ -301,28 +379,46 @@ async fn run_control_socket(
                         })
                     })
                     .unwrap_or(Ipv4Addr::new(192, 168, 0, 2));
-                match vendor::h3c::discovery_response(&pkt, ac_ip, b"My AC") {
+                match prof.discovery_response(&pkt, ac_ip, b"My AC") {
                     Some(resp) => {
                         logx::device(format!("Discovery response to {} ({}B)", peer, resp.len()));
                         socket.send_to(&resp, peer).await?;
                     }
-                    None => warn!("[?] disc req from {} not H3C-framed, dropped", peer),
+                    None => warn!(
+                        "[?] disc req from {} not {:?}-framed, dropped",
+                        peer, prof
+                    ),
                 }
             }
         }
 
-        if pkt.get(0) == Some(&1) {
-            info!("[<] from {}: direct dtls hello", peer);
+        // A fresh DTLS hello: reuse the profile detected at Discovery for this
+        // peer's address (WTPs often start DTLS from a new source port), else the
+        // operator override. A ClientHello carries no vendor information, so an
+        // unknown peer falls back to the vendor-neutral RFC profile until a
+        // Discovery refines it.
+        let prof = VendorProfile::forced().or(known_profile).unwrap_or_default();
+        if is_dtls_frame(&pkt) {
+            info!("[<] from {}: direct dtls hello ({:?})", peer, prof);
+            peer_profiles.lock().await.insert(peer.ip(), prof);
+            let config = dtls_configs
+                .get(&prof)
+                .cloned()
+                .unwrap_or_else(|| dtls_configs[&VendorProfile::Rfc].clone());
             let tx = start_new_session(
                 peer,
+                prof,
                 &dispatcher_map,
                 &socket,
-                &dtls_config,
+                &config,
                 devices.clone(),
                 radios.clone(),
                 stations.clone(),
                 fw.clone(),
                 upgrade_reg.clone(),
+                cfg_update_reg.clone(),
+                wtp_cmd_reg.clone(),
+                wcfg.clone(),
             )
             .await;
             let _ = tx.send(pkt).await;
@@ -331,35 +427,61 @@ async fn run_control_socket(
     }
 }
 
-/// Extract a WTP board MAC from a decoded element map, when present.
+/// Device identifier (board MAC) of a WTP that is joining.
 ///
-/// H3C AX60 carries the WTP MAC in private element 54 (value = 6-byte MAC);
-/// the RFC WTP Board Data element head is not the MAC, so check the vendor
-/// element first and fall back to the Board Data head for other WTPs.
-fn wtp_mac_from_elems(elems: &HashMap<u16, Vec<CwElem>>) -> Option<device::Mac> {
-    const H3C_WTP_MAC: u16 = 54;
-    if let Some(v) = elems.get(&H3C_WTP_MAC).and_then(|e| e.first()) {
-        if let CwElem::Unknown(_, body) = v {
-            if body.len() >= 6 {
-                let mut mac = [0u8; 6];
-                mac.copy_from_slice(&body[..6]);
-                return Some(mac);
-            }
-        }
-    }
-    let v = elems.get(&MsgElemType::WTP_BOARD_DATA)?.first()?;
-    if let CwElem::Unknown(_, body) = v {
-        if body.len() >= 6 {
-            let mut mac = [0u8; 6];
-            mac.copy_from_slice(&body[..6]);
+/// The RFC path reads the WTP Board Data element (38) as RFC 5415 4.6.40
+/// defines it - a vendor identifier followed by board data sub-elements - and
+/// takes the Base MAC Address sub-element (type 4). Vendors that do not report
+/// the MAC there are consulted first through their own module, so the RFC path
+/// stays protocol-conformant.
+fn wtp_mac_from_elems(
+    elems: &HashMap<u16, Vec<CwElem>>,
+    profile: vendor::profile::VendorProfile,
+) -> Option<device::Mac> {
+    use vendor::profile::VendorProfile;
+    if profile == VendorProfile::H3c {
+        if let Some(mac) = vendor::h3c::wtp_mac(elems) {
             return Some(mac);
         }
     }
-    None
+    match elems.get(&MsgElemType::WTP_BOARD_DATA).and_then(|v| v.first()) {
+        Some(CwElem::Unknown(_, body)) => elements::WtpBoardData::decode(body)?.base_mac(),
+        _ => None,
+    }
+}
+
+/// WTP model string from the WTP Board Data model number (RFC 5415 §4.6.40
+/// sub-element 0). WTPs report it either as a NUL-padded text name (H3C
+/// "SWBA1B0") or as a binary model code, which is rendered as hex.
+fn wtp_model_from_elems(elems: &HashMap<u16, Vec<CwElem>>) -> Option<String> {
+    let Some(CwElem::Unknown(_, body)) =
+        elems.get(&MsgElemType::WTP_BOARD_DATA).and_then(|v| v.first())
+    else {
+        return None;
+    };
+    let board = elements::WtpBoardData::decode(body)?;
+    let value = board
+        .sub_elems
+        .iter()
+        .find(|(t, _)| *t == elements::board_data::MODEL_NUMBER)
+        .map(|(_, v)| v.as_slice())?;
+    Some(render_model(value))
+}
+
+/// Text when the model number is a printable, NUL-terminated string (H3C),
+/// else the hexadecimal code the device reported (TP-Link).
+fn render_model(value: &[u8]) -> String {
+    let text: Vec<u8> = value.iter().copied().take_while(|b| *b != 0).collect();
+    if !text.is_empty() && text.iter().all(|b| (0x20..0x7f).contains(b)) {
+        String::from_utf8_lossy(&text).into_owned()
+    } else {
+        value.iter().map(|b| format!("{b:02x}")).collect()
+    }
 }
 
 async fn start_new_session(
     peer: SocketAddr,
+    profile: vendor::profile::VendorProfile,
     map: &Arc<Mutex<HashMap<SocketAddr, mpsc::Sender<Vec<u8>>>>>,
     socket: &Arc<UdpSocket>,
     config: &Arc<rtc_dtls::config::HandshakeConfig>,
@@ -368,6 +490,9 @@ async fn start_new_session(
     stations: Arc<station::StationStore>,
     fw: Arc<firmware::FirmwareStore>,
     upgrade: Arc<firmware::UpgradeRegistry>,
+    cfg_update: Arc<config::ConfigUpdateRegistry>,
+    wtp_cmd: Arc<wtpcmd::WtpCmdRegistry>,
+    wcfg: Arc<wcfg::WirelessConfigStore>,
 ) -> mpsc::Sender<Vec<u8>> {
     let (tx, rx) = mpsc::channel(100);
     map.lock().await.insert(peer, tx.clone());
@@ -376,9 +501,10 @@ async fn start_new_session(
     let conf_clone = Arc::clone(config);
 
     tokio::spawn(async move {
-        info!("[*] with {}: session thread spawned", peer);
+        info!("[*] with {}: session thread spawned ({:?})", peer, profile);
         if let Err(e) = handle_session(
-            peer, rx, sock_clone, conf_clone, devices, radios, stations, fw, upgrade,
+            peer, profile, rx, sock_clone, conf_clone, devices, radios, stations, fw, upgrade,
+            cfg_update, wtp_cmd, wcfg,
         )
         .await
         {
@@ -399,13 +525,7 @@ fn configs_from_store(
 ) -> Result<Vec<config::WlanConfig>> {
     let mut out = Vec::new();
     for rw in radios.list_wlans_enabled(mac)? {
-        let method = config::SecurityMethod::from_policy(&rw.security)
-            .unwrap_or(config::SecurityMethod::Open);
-        let auth_type = if method == config::SecurityMethod::Open {
-            config::AuthType::Open
-        } else {
-            config::AuthType::Rsn
-        };
+        let auth_type = rw.security.auth_type();
         out.push(config::WlanConfig {
             radio_id: rw.radio_id,
             wlan_id: rw.wlan_id,
@@ -416,16 +536,12 @@ fn configs_from_store(
             tunnel_mode: 0,
             suppress_ssid: false,
             ssid: rw.ssid.clone().into_bytes(),
-            security: config::WlanSecurity {
-                method,
-                psk: rw.psk.clone(),
-            },
+            security: rw.security.clone(),
             wlan_enable: rw.wlan_enable,
             isolate: rw.isolate,
             broadcast: rw.broadcast,
             client_count: rw.client_count,
             vlan_id: rw.vlan_id,
-            cipher: rw.cipher,
             rekey_period: rw.rekey_period,
         });
     }
@@ -434,6 +550,7 @@ fn configs_from_store(
 
 async fn handle_session(
     peer: SocketAddr,
+    profile: vendor::profile::VendorProfile,
     mut rx: mpsc::Receiver<Vec<u8>>,
     socket: Arc<UdpSocket>,
     config: Arc<rtc_dtls::config::HandshakeConfig>,
@@ -442,10 +559,20 @@ async fn handle_session(
     stations: Arc<station::StationStore>,
     fw: Arc<firmware::FirmwareStore>,
     upgrade: Arc<firmware::UpgradeRegistry>,
+    cfg_update: Arc<config::ConfigUpdateRegistry>,
+    wtp_cmd: Arc<wtpcmd::WtpCmdRegistry>,
+    wcfg: Arc<wcfg::WirelessConfigStore>,
 ) -> Result<()> {
     let local_addr = socket.local_addr()?;
     let mut capdtls = connection::CapwapDtls::new(local_addr, peer, socket, config);
     let mut handshake_logged = false;
+
+    // Vendor form for the configuration message families (Configuration Status
+    // Response, Configuration Update Request, Reset Request, Clear
+    // Configuration Request), detected from this device's Discovery/Join Request.
+    if profile != vendor::profile::VendorProfile::H3c {
+        info!("[!] with {}: vendor profile {:?} active", peer, profile);
+    }
 
     let mut ctx = WtpContext::new(peer);
     // Session-scoped state for configuration push-down tracking and the
@@ -457,6 +584,16 @@ async fn handle_session(
     // keyed by WTP MAC (via `upgrade`); we register after the join identifies
     // the MAC and act on a Start command by running the Image Data download.
     let (upgrade_tx, mut upgrade_rx) = mpsc::channel::<firmware::UpgradeCmd>(8);
+    // Management-plane configuration trigger: the web/API layer pushes a
+    // ConfigUpdateCmd keyed by WTP MAC; we register after the join identifies the
+    // MAC and act on a Push command by sending a Configuration Update Request.
+    let (cfg_update_tx, mut cfg_update_rx) = mpsc::channel::<config::ConfigUpdateCmd>(8);
+    // Management-plane WTP command trigger (Reset / Disable / ReleaseClient),
+    // registered after the join identifies the MAC.
+    let (wtp_cmd_tx, mut wtp_cmd_rx) = mpsc::channel::<wtpcmd::WtpCmd>(8);
+    // UI-issued command awaiting its WTP response; a firmware-driven reset is
+    // tracked separately by `fw_upgrade`/`fw_record_id`.
+    let mut pending_cmd: Option<wtpcmd::WtpCmd> = None;
 
     loop {
         let retrans_duration = ctx
@@ -471,8 +608,18 @@ async fn handle_session(
         let idle_duration = ctx.echo_interval.saturating_sub(ctx.last_seen.elapsed());
         // Also wake in time to send the next keep-alive Echo Request in Run state.
         let next_echo = ctx.echo_interval.saturating_sub(ctx.last_echo_sent.elapsed());
-        let mut sleep_duration =
-            std::cmp::min(retrans_duration, std::cmp::min(idle_duration, next_echo));
+        // Also wake in time to release the next serialized vendor push frame if
+        // the WTP's reply does not arrive.
+        let next_push = if ctx.push_queue.is_empty() {
+            Duration::from_secs(60)
+        } else {
+            ctx.push_last_sent
+                .map_or(Duration::ZERO, |t| PUSH_REPLY_TIMEOUT.saturating_sub(t.elapsed()))
+        };
+        let mut sleep_duration = std::cmp::min(
+            retrans_duration,
+            std::cmp::min(idle_duration, std::cmp::min(next_echo, next_push)),
+        );
         // Keep the DTLS retransmit timer ahead of the sleep, so handshake
         // flights are resent even while no CAPWAP message is due.
         if let Some(t) = capdtls.next_timeout() {
@@ -494,7 +641,7 @@ async fn handle_session(
                     if n < 16 { continue }
                     ctx.keep_alive();
 
-                    let msg = match CtrlMsg::decode(FRAME, &app_data[8..n]) {
+                    let msg = match CtrlMsg::decode(frame(profile), &app_data[8..n]) {
                         Ok(m) => m,
                         // A frame below the control-header minimum is not fatal:
                         // logging and carrying on keeps the session (and its
@@ -512,7 +659,7 @@ async fn handle_session(
 
                     // Elements begin after the 8-byte base header plus the framed
                     // control header (RFC: 16; H3C: 19).
-                    let elem_off = 8 + FRAME.elem_off();
+                    let elem_off = 8 + frame(profile).elem_off();
                     let ac_ip = std::env::var("MINIAC_WTP_AC")
                         .ok()
                         .and_then(|v| v.parse::<Ipv4Addr>().ok())
@@ -558,17 +705,27 @@ async fn handle_session(
                     match (ctx.state, m_type) {
                         (WtpState::Join, MsgType::JOIN_REQ) => {
                             info!("[<] from {}: join req (seq {})", peer, seq);
+                            let mut hw_ver: Option<String> = None;
+                            let mut sw_ver: Option<String> = None;
                             if let Some(CwElem::WtpDescriptor { hardware, software }) = elems.get(&MsgElemType::WTP_DESCRIPTOR).and_then(|v| v.first()) {
                                 info!("[*] wtp hw: {:08x}, sw: {:08x}", hardware, software);
                                 ctx.hardware_version = *hardware;
                                 ctx.software_version = *software;
+                                hw_ver = Some(format!("{:08x}", hardware));
+                                sw_ver = Some(format!("{:08x}", software));
                             }
                             // Persist device learned from the join exchange (keyed by MAC).
-                            if let Some(mac) = wtp_mac_from_elems(&elems) {
+                            if let Some(mac) = wtp_mac_from_elems(&elems, profile) {
                                 ctx.mac = Some(mac);
                                 let ip = peer.ip().to_string();
-                                let sw = format!("{:08x}", ctx.software_version);
-                                let created = devices.register(mac, Some(&ip), Some(&sw), None, None, "registered")?;
+                                let created = devices.register(mac, Some(&ip), sw_ver.as_deref(), None, None, "registered")?;
+                                devices.set_identity(
+                                    mac,
+                                    Some(profile.vendor_name()),
+                                    wtp_model_from_elems(&elems).as_deref(),
+                                    hw_ver.as_deref(),
+                                    None,
+                                )?;
                                 logx::device(format!(
                                     "WTP {} {} (ip {})",
                                     device::mac_to_str(mac),
@@ -580,12 +737,8 @@ async fn handle_session(
                                 // WTP keeps retrying and joins once approved.
                                 let approved = devices.get(mac)?.map(|d| d.approved).unwrap_or(false);
                                 if !approved {
-                                    let resp_msg = CtrlMsg::new(MsgType::JOIN_RESP, seq)
-                                        .with_result(CwResult::Failure)
-                                        .add_elem(MsgElemType::AC_NAME, b"miniac")
-                                        .add_elem(MsgElemType::CAPWAP_CTRL_IPV4_ADDR, &[127, 0, 0, 1])
-                                        .add_elem(MsgElemType::CAPWAP_LOCAL_IPV4_ADDR, &[127, 0, 0, 1]);
-                                    let resp_buf = resp_msg.encode_for(FRAME);
+                                    let resp_msg = profile.join_response(seq, ac_ip, b"miniac", false);
+                                    let resp_buf = resp_msg.encode_for(frame(profile));
                                     capdtls.write(&resp_buf).await?;
                                     logx::device(format!(
                                         "WTP {} refused: pending approval",
@@ -596,24 +749,19 @@ async fn handle_session(
                                 // Advertise this session so the web plane can
                                 // trigger firmware upgrades for this WTP.
                                 upgrade.register(mac, upgrade_tx.clone());
+                                cfg_update.register(mac, cfg_update_tx.clone());
+                                wtp_cmd.register(mac, wtp_cmd_tx.clone());
                             } else {
                                 debug!("[*] join: no WTP Board Data MAC present");
                             }
                             // response
-                            // The AX60 JoinResponse parser (WTP.dis 0x23754)
-                            // counts tag-10 entries to size its AC list and then
-                            // re-parses each as [4B IP][2B] (0x1df5c); a missing or
-                            // 4-byte tag 10 makes it malloc(0)/desync and reject,
-                            // so the tag 10 value must be the 6-byte AC IPv4 entry.
-                            let resp_msg = CtrlMsg::new(MsgType::JOIN_RESP, seq)
-                                .with_result_success()
-                                .add_elem(MsgElemType::AC_DESCRIPTOR, &vendor::h3c::ac_descriptor("1.0", "1.0"))
-                                .add_elem(MsgElemType::AC_NAME, b"miniac")
-                                .add_elem(MsgElemType::ECN_SUPPORT, &[1])
-                                .add_element(elements::BaseElem::MaxMessageLen(2048))
-                                .add_elem(MsgElemType::CAPWAP_CTRL_IPV4_ADDR, &vendor::h3c::ac_ipv4_entry(ac_ip))
-                                .add_elem(MsgElemType::CAPWAP_LOCAL_IPV4_ADDR, &ac_ip.octets());
-                            let resp_buf = resp_msg.encode_for(FRAME);
+                            // The H3C join form keeps the AX60-specific element
+                            // set (the tag-10 value must be the 6-byte AC IPv4
+                            // entry; WTP.dis 0x23754 counts entries and re-parses
+                            // each at 0x1df5c). The RFC / TP-Link form uses the
+                            // standards-shaped builder.
+                            let resp_msg = profile.join_response(seq, ac_ip, b"miniac", true);
+                            let resp_buf = resp_msg.encode_for(frame(profile));
                             capdtls.write(&resp_buf).await?;
                             ctx.set_last_sent(&resp_msg, resp_buf);
 
@@ -623,17 +771,6 @@ async fn handle_session(
 
                         (WtpState::Configure, MsgType::CONFIG_STATUS_REQ) => {
                             info!("[<] from {}: config status req (seq {})", peer, seq);
-                            // TEMP debug: dump raw config status request wire bytes and
-                            // each parsed element for reverse-engineering analysis.
-                            {
-                                let hx: String =
-                                    app_data.iter().map(|b| format!("{:02x}", b)).collect();
-                                info!("[DBG] cfg-status-req app_data ({}B): {}", app_data.len(), hx);
-                                for e in &msg.elems {
-                                    info!("[DBG]   elem tag={:#06x} len={} val={}", e.tag, e.data.len(),
-                                        e.data.iter().map(|b| format!("{:02x}", b)).collect::<String>());
-                                }
-                            }
                             // Decode the WTP-reported name, radio operational states
                             // and declared radios (vendor::h3c::ConfigStatusReq). The
                             // AX60 reports each radio as admin_state=1 (Disabled) in
@@ -657,47 +794,36 @@ async fn handle_session(
                                 declared_radios.push((1, 1));
                             }
 
-                            // Build the WTP's WLAN list first (from the radio_wlans
-                            // store; a single default WLAN if none is configured yet).
-                            let mut wlans = configs_from_store(&*radios, ctx.mac.unwrap_or([0; 6]))?;
-                            if wlans.is_empty() {
-                                // Empty configuration template: push the default
-                                // SSID to both radios. The AX60 maps radio id to
-                                // band as band = radio_id - 1 (0x3ff20), so radio 1
-                                // is 2.4G and radio 2 is 5G.
-                                for radio_id in [1u8, 2u8] {
-                                    wlans.push(config::WlanConfig {
-                                        radio_id,
-                                        wlan_id: 1,
-                                        capability: 0x0001, // ESS
-                                        qos: 0,
-                                        auth_type: config::AuthType::Rsn,
-                                        mac_mode: 0,
-                                        tunnel_mode: 0,
-                                        suppress_ssid: false,
-                                        ssid: b"miniac".to_vec(),
-                                        security: config::WlanSecurity {
-                                            method: config::SecurityMethod::Wpa2Wpa3,
-                                            psk: Some("person0finterest".into()),
-                                        },
-                                        ..config::WlanConfig::default()
-                                    });
-                                }
-                            }
-                            // Rebuild the Config Status Response to mirror the M60
-                            // AC's assembly order (AC.dis 0x1001d6a0-0x1001feec):
-                            // [2][3][12][32][16][23][40][55] then one 0xfde8 per
-                            // radio/WLAN. The full assembly (H3C base elements,
-                            // radio records, the tag31 echo and the 0xfde8 WLAN
-                            // config, with the MINIAC_H3C_EXP bisection switches)
-                            // lives in vendor::h3c::config_status_response.
                             let mac = ctx.mac.unwrap_or([0; 6]);
+                            // On first contact with a WTP that carries no per-AP
+                            // rows yet, seed them from the AC-wide global template
+                            // so the Configure push reflects the global config;
+                            // WTPs already carrying rows (materialized or legacy)
+                            // are left as-is.
+                            if radios.list_wlans(mac)?.is_empty() {
+                                wcfg.materialize(&radios, mac)?;
+                            }
+                            // Build the WTP's WLAN list from the radio_wlans store,
+                            // which `materialize` above seeded from the AC-wide
+                            // global template (the initialization defaults live in
+                            // the DB, so there is no hardcoded fallback here).
+                            let wlans = configs_from_store(&*radios, mac)?;
+                            if wlans.is_empty() {
+                                anyhow::bail!(
+                                    "no WLAN configuration for {} (global_wlan default missing)",
+                                    device::mac_to_str(mac)
+                                );
+                            }
+                            // Build the Config Status Response in the M60 AC's
+                            // assembly order: [2][3][12][32][16][23][40][55] then
+                            // one 0xfde8 per radio/WLAN. The full assembly lives
+                            // in vendor::h3c::config_status_response.
                             let g24_hdr = radios.h3c_header(mac, 1)?;
                             let g5_hdr = radios.h3c_header(mac, 2)?;
                             // Advanced radio features (fe28 OFDMA/MU-MIMO, fe31
                             // band navigation): driven by env overrides until a
-                            // DB source exists; None keeps the m60 wire layout
-                            // byte-identical to the M60 718B capture.
+                            // DB source exists; all-zero or unset omits the
+                            // element.
                             let ofdma = std::env::var("MINIAC_H3C_OFDMA")
                                 .ok()
                                 .and_then(|v| v.parse::<u32>().ok())
@@ -715,28 +841,40 @@ async fn handle_session(
                                 .ok()
                                 .and_then(|v| v.parse::<u32>().ok())
                                 .filter(|&v| v != 0);
-                            let resp_msg = vendor::h3c::config_status_response(
-                                &vendor::h3c::ConfigStatusResp {
-                                    seq,
-                                    ac_ip,
-                                    peer,
-                                    declared_radios: &declared_radios,
-                                    wlans: &wlans,
-                                    g24_hdr: &g24_hdr,
-                                    g5_hdr: &g5_hdr,
-                                    wtp_mac: ctx.mac,
-                                    fe28,
-                                    fe31,
-                                },
-                            );
-                            let resp_buf = resp_msg.encode_for(FRAME);
-                            // TEMP debug: dump the exact wire bytes sent as the
-                            // Configuration Status Response (head + control + elems).
-                            {
-                                let hx: String =
-                                    resp_buf.iter().map(|b| format!("{:02x}", b)).collect();
-                                info!("[DBG] cfg-status-resp wire ({}B): {}", resp_buf.len(), hx);
-                            }
+                            let resp_msg = match profile {
+                                // TP-Link WTPs accept only a narrow set of base
+                                // element types here (2/3/12/16/23/32/37/40) and
+                                // drop the whole message on anything else; the
+                                // response carries no WLAN configuration. The
+                                // form is built by vendor::tplink. The echo
+                                // interval stays below miniac's 30s Run-state
+                                // inbound deadline (see the builder's doc).
+                                vendor::profile::VendorProfile::TpLink => {
+                                    vendor::tplink::config_status_response(
+                                        &vendor::tplink::ConfigStatusResp {
+                                            seq,
+                                            timers: (20, 20),
+                                            ac_ip,
+                                            ap_user: &[],
+                                        },
+                                    )
+                                }
+                                _ => vendor::h3c::config_status_response(
+                                    &vendor::h3c::ConfigStatusResp {
+                                        seq,
+                                        ac_ip,
+                                        peer,
+                                        declared_radios: &declared_radios,
+                                        wlans: &wlans,
+                                        g24_hdr: &g24_hdr,
+                                        g5_hdr: &g5_hdr,
+                                        wtp_mac: ctx.mac,
+                                        fe28,
+                                        fe31,
+                                    },
+                                ),
+                            };
+                            let resp_buf = resp_msg.encode_for(frame(profile));
                             capdtls.write(&resp_buf).await?;
                             ctx.set_last_sent(&resp_msg, resp_buf);
                             cfg_status.mark_pushed([vendor::h3c::WLAN_CFG_H3C]);
@@ -762,7 +900,7 @@ async fn handle_session(
                                 }
                             }
                             let resp_msg = CtrlMsg::new(MsgType::CHANGE_STATE_EV_RESP, seq);
-                            let resp_buf = resp_msg.encode_for(FRAME);
+                            let resp_buf = resp_msg.encode_for(frame(profile));
                             capdtls.write(&resp_buf).await?;
                             ctx.set_last_sent(&resp_msg, resp_buf);
 
@@ -778,18 +916,128 @@ async fn handle_session(
                             // retransmitted.
                             cfg_status.mark_acked(cfg_status.pending().collect::<Vec<u16>>());
                             ctx.last_sent = None;
+
+                            // TP-Link accepts WLAN configuration only in this
+                            // private message and only while the WTP runs: its
+                            // RFC Configuration Update Request parser drops the
+                            // IEEE 802.11 Add WLAN element. One message carries
+                            // one WLAN, so the set is pushed as a sequence. The
+                            // message is not queued for retransmission - a
+                            // vendor-form reply is not guaranteed, and a
+                            // retransmit miss would tear the session down.
+                            if profile == vendor::profile::VendorProfile::TpLink {
+                                let mac = ctx.mac.unwrap_or([0; 6]);
+                                // Seed per-AP rows from the AC-wide global template
+                                // on first contact; the initialization defaults live
+                                // in the DB, so there is no hardcoded fallback.
+                                if radios.list_wlans(mac)?.is_empty() {
+                                    wcfg.materialize(&radios, mac)?;
+                                }
+                                let wlans = configs_from_store(&*radios, mac)?;
+                                if wlans.is_empty() {
+                                    anyhow::bail!(
+                                        "no WLAN configuration for {} (global_wlan default missing)",
+                                        device::mac_to_str(mac)
+                                    );
+                                }
+                                // Each radio starts administratively down and the
+                                // WTP's apply chain silently drops per-radio
+                                // WLAN/SSID configuration while it is down, so the
+                                // AC must bring the radio up before pushing WLANs.
+                                // AC100 does this with two Configuration Update
+                                // Requests per radio (a bare RADIO_ADMIN_STATE
+                                // then the private radio record), reproduced here
+                                // with the band channel taken from the AC's
+                                // channel config (ACS by default, fixed only when
+                                // the band is set manual), sent strictly one per
+                                // reply:
+                                // the WTP admits a single in-flight radio
+                                // operation and drops a record that arrives while
+                                // one is still running, which AC100's pacing
+                                // avoids. See `WtpContext::push_queue`.
+                                for radio_id in 1..=2u8 {
+                                    let channel = wcfg.effective_channel(mac, radio_id)?;
+                                    let channel = vendor::tplink::channel_field(channel);
+                                    for msg in [
+                                        vendor::tplink::radio_admin_state_request(
+                                            ctx.next_seq(),
+                                            radio_id,
+                                            2,
+                                        ),
+                                        vendor::tplink::radio_config_request(
+                                            ctx.next_seq(),
+                                            radio_id,
+                                            channel,
+                                        ),
+                                    ] {
+                                        ctx.push_msg(msg.encode_for(frame(profile)));
+                                    }
+                                }
+                                // The WTP keeps its own WLAN table and Add WLAN
+                                // only appends to it, so the SSIDs its own table
+                                // still holds (the factory Guest_*) survive a
+                                // plain push. Del WLAN addresses those entries by
+                                // `{radio, wlan}` and Delete is the only message
+                                // that reaches them, so clear every slot on both
+                                // radios before adding the AC's set. Note this
+                                // cannot touch the WLANs held outside that table
+                                // (the built-in office1_*), which Add/Del never
+                                // see.
+                                for radio_id in 1..=2u8 {
+                                    for wlan_id in 1..=vendor::tplink::WLAN_IDS_PER_RADIO {
+                                        let del = vendor::tplink::wlan_config_del_request(
+                                            ctx.next_seq(),
+                                            radio_id,
+                                            wlan_id,
+                                        );
+                                        ctx.burst_msg(del.encode_for(frame(profile)));
+                                    }
+                                }
+                                for w in &wlans {
+                                    let req =
+                                        vendor::tplink::wlan_config_update_request(ctx.next_seq(), w);
+                                    ctx.burst_msg(req.encode_for(frame(profile)));
+                                }
+                                let radios_queued = ctx.push_queue.len();
+                                let burst_queued = ctx.push_burst.len();
+                                for buf in ctx.release_push() {
+                                    capdtls.write(&buf).await?;
+                                }
+                                info!(
+                                    "[>] to {}: {} radio bring-up message(s) serialized, {} WLAN/delete message(s) queued",
+                                    peer, radios_queued, burst_queued
+                                );
+                                logx::device(format!(
+                                    "pushed {} WLAN config(s) to {} in Run state",
+                                    wlans.len(),
+                                    peer
+                                ));
+                            }
                         }
 
                         (WtpState::Run, MsgType::ECHO_REQ) => {
                             debug!("[<] from {}: echo req (seq {})", peer, seq);
                             let resp_msg = CtrlMsg::new(MsgType::ECHO_RESP, seq);
-                            let resp_buf = resp_msg.encode_for(FRAME);
+                            let resp_buf = resp_msg.encode_for(frame(profile));
                             capdtls.write(&resp_buf).await?;
                             ctx.set_last_sent(&resp_msg, resp_buf);
                             debug!("[>] to {}: echo resp", peer);
                         }
                         (WtpState::Run, MsgType::ECHO_RESP) => {
                             debug!("[<] from {}: echo resp (seq {})", peer, seq);
+                        }
+
+                        (WtpState::Run, t) if t == vendor::tplink::WLAN_CONFIG_UPDATE_RESP => {
+                            // Reply to the private WLAN Configuration Update
+                            // Request (0x0033DD02). It echoes the private
+                            // arguments the WTP accepted; the push itself is not
+                            // queued, so this only records that the WTP answered.
+                            info!("[<] from {}: WLAN configuration update resp (seq {})", peer, seq);
+                            // Release the next serialized push, if any is due.
+                            for buf in ctx.release_push() {
+                                debug!("[>] to {}: next serialized push sent", peer);
+                                capdtls.write(&buf).await?;
+                            }
                         }
 
                         (WtpState::Run, t) if t == vendor::h3c::WTP_CHAN_UTIL_REQ => {
@@ -800,7 +1048,7 @@ async fn handle_session(
                             debug!("[<] from {}: chan util report (seq {})", peer, seq);
                             let resp_msg = CtrlMsg::new(vendor::h3c::WTP_CHAN_UTIL_RESP, seq)
                                 .with_result_success();
-                            let resp_buf = resp_msg.encode_for(FRAME);
+                            let resp_buf = resp_msg.encode_for(frame(profile));
                             capdtls.write(&resp_buf).await?;
                             ctx.set_last_sent(&resp_msg, resp_buf);
                             debug!("[>] to {}: chan util ack", peer);
@@ -826,7 +1074,7 @@ async fn handle_session(
                             }
                             logx::device(format!("WTP {} reported events", peer));
                             let resp_msg = CtrlMsg::new(MsgType::WTP_EVENT_RESP, seq);
-                            let resp_buf = resp_msg.encode_for(FRAME);
+                            let resp_buf = resp_msg.encode_for(frame(profile));
                             capdtls.write(&resp_buf).await?;
                             ctx.set_last_sent(&resp_msg, resp_buf);
                             info!("[>] to {}: wtp event resp", peer);
@@ -907,7 +1155,7 @@ async fn handle_session(
                             }
                             let resp_msg = CtrlMsg::new(MsgType::STATION_CONFIG_RESP, seq)
                                 .with_result_success();
-                            let resp_buf = resp_msg.encode_for(FRAME);
+                            let resp_buf = resp_msg.encode_for(frame(profile));
                             capdtls.write(&resp_buf).await?;
                             ctx.set_last_sent(&resp_msg, resp_buf);
                             info!("[>] to {}: station config resp", peer);
@@ -915,12 +1163,41 @@ async fn handle_session(
 
                         (_, MsgType::CONFIG_UPDATE_RESP) => {
                             info!("[<] from {}: config update resp (seq {})", peer, seq);
-                            for _ in elems.get(&MsgElemType::RESULT_CODE).into_iter().flatten() {
-                                // any result confirms the WTP received our update
+                            // H3C WTPs answer with tag 33 (Result Code) as a 4-byte
+                            // big-endian value (AX60 CWAssembleConfigurationUpdateResponse
+                            // 0x3029c); 0 means applied, non-zero rejects the update.
+                            match vendor::h3c::ConfigUpdateResp::decode(&msg) {
+                                Ok(resp) if resp.is_success() => {
+                                    cfg_status.mark_acked(cfg_status.pending().collect::<Vec<u16>>());
+                                    // Acknowledged: this WTP's materialized config is
+                                    // now in sync, so it leaves the pending-sync set.
+                                    if let Some(mac) = ctx.mac {
+                                        if let Err(e) = wcfg.clear_pending(mac) {
+                                            warn!("[!] clear pending for {} failed: {}", peer, e);
+                                        }
+                                    }
+                                    logx::device(format!("WTP {} acknowledged configuration update", peer));
+                                }
+                                Ok(resp) => {
+                                    warn!("[!] from {}: config update rejected (result {})", peer, resp.result_code);
+                                    logx::device(format!(
+                                        "WTP {} rejected configuration update (result {})",
+                                        peer, resp.result_code
+                                    ));
+                                }
+                                Err(e) => warn!("[!] from {}: malformed config update resp: {}", peer, e),
                             }
-                            cfg_status.mark_acked(cfg_status.pending().collect::<Vec<u16>>());
-                            ctx.last_sent = None;
-                            logx::device(format!("WTP {} acknowledged configuration update", peer));
+                            // Clear the outstanding request only if it was our Config
+                            // Update Request, so an unrelated response cannot drop a
+                            // pending retransmission.
+                            if ctx.last_sent.as_ref().map(|l| l.msg_type) == Some(MsgType::CONFIG_UPDATE_REQ) {
+                                ctx.last_sent = None;
+                            }
+                            // Release the next serialized radio bring-up message.
+                            for buf in ctx.release_push() {
+                                debug!("[>] to {}: next serialized push sent", peer);
+                                capdtls.write(&buf).await?;
+                            }
                         }
 
                         (WtpState::Run, MsgType::IMAGE_DATA_REQ) => {
@@ -946,7 +1223,7 @@ async fn handle_session(
                             if let Some(blk) = fw_upgrade.current() {
                                 let dl = CtrlMsg::new(MsgType::IMAGE_DATA_REQ, ctx.next_seq())
                                     .add_elem(MsgElemType::IMAGE_DATA, &blk.encode());
-                                let buf = dl.encode_for(FRAME);
+                                let buf = dl.encode_for(frame(profile));
                                 capdtls.write(&buf).await?;
                                 ctx.set_last_sent(&dl, buf);
                                 info!("[>] to {}: image data block ({}B) sent", peer, blk.data.len());
@@ -963,17 +1240,23 @@ async fn handle_session(
                             if let Some(blk) = fw_upgrade.current() {
                                 let dl = CtrlMsg::new(MsgType::IMAGE_DATA_REQ, ctx.next_seq())
                                     .add_elem(MsgElemType::IMAGE_DATA, &blk.encode());
-                                let buf = dl.encode_for(FRAME);
+                                let buf = dl.encode_for(frame(profile));
                                 capdtls.write(&buf).await?;
                                 ctx.set_last_sent(&dl, buf);
                                 info!("[>] to {}: image data block ({}B) sent", peer, blk.data.len());
                             } else if fw_upgrade.state == firmware::UpgradeState::AwaitReset {
                                 // All blocks acknowledged; order the WTP to reset
                                 // onto the delivered image.
+                                // The H3C image-name field is NUL-terminated: the
+                                // AX60 parser forces the last value byte to 0, so
+                                // an unterminated name is truncated (and never
+                                // matches the delivered image).
                                 let name = firmware::ImageIdentifier { vendor_id: 1916, name: "miniac-boot".to_string() };
+                                let mut id_body = name.encode();
+                                id_body.push(0);
                                 let reset = CtrlMsg::new(MsgType::RESET_REQ, ctx.next_seq())
-                                    .add_elem(MsgElemType::IMAGE_ID, &name.encode());
-                                let buf = reset.encode_for(FRAME);
+                                    .add_elem(MsgElemType::IMAGE_ID, &id_body);
+                                let buf = reset.encode_for(frame(profile));
                                 capdtls.write(&buf).await?;
                                 ctx.set_last_sent(&reset, buf);
                                 if let Some(id) = fw_record_id {
@@ -986,10 +1269,68 @@ async fn handle_session(
 
                         (WtpState::Run, MsgType::RESET_RESP) => {
                             info!("[<] from {}: reset resp (seq {})", peer, seq);
-                            if let Some(id) = fw_record_id {
-                                let _ = fw.mark_done(id);
+                            if pending_cmd.take() == Some(wtpcmd::WtpCmd::Reset) {
+                                // UI-issued reset acknowledged; the WTP reboots and
+                                // the session drops shortly after.
+                                let code = vendor::h3c::result_code(&msg).unwrap_or(0);
+                                logx::device(format!(
+                                    "WTP {} reset acknowledged (result {})",
+                                    device::mac_to_str(ctx.mac.unwrap_or([0; 6])),
+                                    code
+                                ));
+                                ctx.last_sent = None;
+                            } else {
+                                // Firmware-driven reset completing the upgrade.
+                                if let Some(id) = fw_record_id {
+                                    let _ = fw.mark_done(id);
+                                }
+                                logx::firmware(format!("WTP {} acked reset; upgrade complete", peer));
+                                ctx.last_sent = None;
                             }
-                            logx::firmware(format!("WTP {} acked reset; upgrade complete", peer));
+                        }
+
+                        (WtpState::Run, MsgType::CLEAR_CONFIG_RESP) => {
+                            info!("[<] from {}: clear config resp (seq {})", peer, seq);
+                            let code = vendor::h3c::result_code(&msg).unwrap_or(0);
+                            if pending_cmd == Some(wtpcmd::WtpCmd::Disable) {
+                                if code == 0 {
+                                    // Defaults restored; now restart the WTP.
+                                    logx::device(format!(
+                                        "WTP {} cleared to factory defaults; restarting",
+                                        device::mac_to_str(ctx.mac.unwrap_or([0; 6]))
+                                    ));
+                                    pending_cmd = Some(wtpcmd::WtpCmd::Reset);
+                                    let reset =
+                                        profile.reset_request(ctx.next_seq(), RESET_IMAGE_NAME);
+                                    let buf = reset.encode_for(frame(profile));
+                                    capdtls.write(&buf).await?;
+                                    ctx.set_last_sent(&reset, buf);
+                                } else {
+                                    warn!("[!] with {}: clear config rejected (result {})", peer, code);
+                                    logx::device(format!(
+                                        "WTP {} clear configuration rejected (result {})",
+                                        device::mac_to_str(ctx.mac.unwrap_or([0; 6])),
+                                        code
+                                    ));
+                                    pending_cmd = None;
+                                    ctx.last_sent = None;
+                                }
+                            }
+                        }
+
+                        (WtpState::Run, MsgType::RELEASE_CLIENT_RESP) => {
+                            info!("[<] from {}: release client resp (seq {})", peer, seq);
+                            let code = vendor::h3c::result_code(&msg).unwrap_or(0);
+                            if let Some(wtpcmd::WtpCmd::ReleaseClient(smac)) = pending_cmd.take() {
+                                // The station stays visible until the WTP reports
+                                // the de-association through its own state events.
+                                logx::device(format!(
+                                    "client {} released from WTP {} (result {})",
+                                    device::mac_to_str(smac),
+                                    device::mac_to_str(ctx.mac.unwrap_or([0; 6])),
+                                    code
+                                ));
+                            }
                             ctx.last_sent = None;
                         }
 
@@ -1019,6 +1360,24 @@ async fn handle_session(
                         }
                     }
                 }
+                // Serialized vendor push: release the next frame if the WTP
+                // never replied to the one in flight, so one missing reply
+                // cannot stall the whole configuration push.
+                if !ctx.push_queue.is_empty() {
+                    let due = ctx
+                        .push_last_sent
+                        .is_none_or(|t| now >= t + PUSH_REPLY_TIMEOUT);
+                    if due {
+                        warn!(
+                            "[>] to {}: no reply to serialized push, releasing next ({} left)",
+                            peer,
+                            ctx.push_queue.len()
+                        );
+                        for buf in ctx.release_push() {
+                            capdtls.write(&buf).await?;
+                        }
+                    }
+                }
                 if ctx.state == WtpState::Run && now >= ctx.last_echo_sent + ctx.echo_interval {
                     // Active keep-alive: send an Echo Request each interval. It is
                     // not queued in `last_sent` (so unacknowledged echoes do not
@@ -1026,7 +1385,7 @@ async fn handle_session(
                     // inbound-traffic deadline below, which tolerates vendor
                     // keep-alives that are not standard Echo Responses.
                     let echo = CtrlMsg::new(MsgType::ECHO_REQ, ctx.next_seq());
-                    let echo_buf = echo.encode_for(FRAME);
+                    let echo_buf = echo.encode_for(frame(profile));
                     capdtls.write(&echo_buf).await?;
                     ctx.last_echo_sent = now;
                     debug!("[>] to {}: echo keep-alive (seq {})", peer, echo.hdr.seq_num);
@@ -1045,11 +1404,60 @@ async fn handle_session(
                         if let Some(blk) = fw_upgrade.current() {
                             let dl = CtrlMsg::new(MsgType::IMAGE_DATA_REQ, ctx.next_seq())
                                 .add_elem(MsgElemType::IMAGE_DATA, &blk.encode());
-                            let buf = dl.encode_for(FRAME);
+                            let buf = dl.encode_for(frame(profile));
                             capdtls.write(&buf).await?;
                             ctx.set_last_sent(&dl, buf);
                             info!("[>] to {}: image data block ({}B) sent", peer, blk.data.len());
                         }
+                    }
+                    None => {}
+                }
+            }
+
+            cmd = cfg_update_rx.recv() => {
+                match cmd {
+                    Some(config::ConfigUpdateCmd::Push { elems }) => {
+                        info!("[>] to {}: configuration update triggered via management plane", peer);
+                        let req = config::config_update(ctx.next_seq(), &[], &elems);
+                        // Remember which tags are now outstanding so the response
+                        // handler can confirm (or reject) the push.
+                        cfg_status.mark_pushed(elems.iter().map(|e| e.tag()));
+                        let buf = req.encode_for(frame(profile));
+                        capdtls.write(&buf).await?;
+                        ctx.set_last_sent(&req, buf);
+                    }
+                    None => {}
+                }
+            }
+
+            cmd = wtp_cmd_rx.recv() => {
+                match cmd {
+                    Some(wtpcmd::WtpCmd::Reset) => {
+                        info!("[>] to {}: reset requested via management plane", peer);
+                        pending_cmd = Some(wtpcmd::WtpCmd::Reset);
+                        let req = profile.reset_request(ctx.next_seq(), RESET_IMAGE_NAME);
+                        let buf = req.encode_for(frame(profile));
+                        capdtls.write(&buf).await?;
+                        ctx.set_last_sent(&req, buf);
+                    }
+                    Some(wtpcmd::WtpCmd::Disable) => {
+                        // Restore defaults first; the Reset Request follows once
+                        // the WTP acknowledges the Clear Configuration Response.
+                        info!("[>] to {}: clear configuration requested via management plane", peer);
+                        pending_cmd = Some(wtpcmd::WtpCmd::Disable);
+                        let req = profile.clear_config_request(ctx.next_seq());
+                        let buf = req.encode_for(frame(profile));
+                        capdtls.write(&buf).await?;
+                        ctx.set_last_sent(&req, buf);
+                    }
+                    Some(wtpcmd::WtpCmd::ReleaseClient(smac)) => {
+                        info!("[>] to {}: release client {} requested via management plane",
+                            peer, device::mac_to_str(smac));
+                        pending_cmd = Some(wtpcmd::WtpCmd::ReleaseClient(smac));
+                        let req = vendor::h3c::release_client_request(ctx.next_seq(), smac);
+                        let buf = req.encode_for(frame(profile));
+                        capdtls.write(&buf).await?;
+                        ctx.set_last_sent(&req, buf);
                     }
                     None => {}
                 }
@@ -1060,12 +1468,15 @@ async fn handle_session(
 
 /// Builds the DTLS handshake configuration.
 ///
-/// When `certs/h3c/` holds the CAPWAP CA identity (`server.pem` + `root.pem`),
-/// the server presents that 1024-bit RSA certificate and accepts clients whose
-/// chain is signed by `root.pem`, ignoring validity periods — required by H3C
-/// (and other legacy-vendor) APs. Otherwise a self-signed Ed25519 certificate
-/// is used and no client certificate is requested.
-fn generate_dtls_config() -> Result<Arc<rtc_dtls::config::HandshakeConfig>> {
+/// When the profile's certificate directory (`certs/h3c`, or `certs/tplink` for
+/// TP-Link) holds the CAPWAP identity (`server.pem` + `root.pem`), the server
+/// presents that RSA certificate. H3C also requires and pins the client chain
+/// against `root.pem`, ignoring validity periods; the RFC / TP-Link forms keep
+/// server-only authentication. Otherwise a self-signed Ed25519 certificate is
+/// used and no client certificate is requested.
+fn generate_dtls_config(
+    prof: vendor::profile::VendorProfile,
+) -> Result<Arc<rtc_dtls::config::HandshakeConfig>> {
     use rtc_dtls::config::{ClientAuthType, ConfigBuilder};
     use rtc_dtls::crypto::Certificate;
     use rtc_dtls::crypto_provider;
@@ -1074,12 +1485,11 @@ fn generate_dtls_config() -> Result<Arc<rtc_dtls::config::HandshakeConfig>> {
     let provider =
         crypto_provider::default_provider().map_err(|e| anyhow!("crypto provider: {e}"))?;
 
-    let cert_dir = std::path::Path::new("certs/h3c");
+    let cert_dir = prof.cert_dir();
     if cert_dir.exists() {
         let identity = dtls_local::load_identity(cert_dir)?;
-        let root_der = dtls_local::load_root_cert_der(cert_dir)?;
         let cert = Certificate::from_signing_key(identity.certificate_chain, identity.signing_key);
-        let config = ConfigBuilder::default()
+        let mut builder = ConfigBuilder::default()
             .with_crypto_provider(provider)
             .with_certificates(vec![cert])
             .with_cipher_suites(vec![
@@ -1088,17 +1498,37 @@ fn generate_dtls_config() -> Result<Arc<rtc_dtls::config::HandshakeConfig>> {
             .with_signature_schemes(vec![
                 SignatureScheme::Pkcs1WithSha256,
                 SignatureScheme::Pkcs1WithSha1,
-            ])
-            .with_client_auth(ClientAuthType::RequireAnyClientCert)
+            ]);
+        if prof.requires_client_cert() {
+            let root_der = dtls_local::load_root_cert_der(cert_dir)?;
+            builder = builder
+                .with_client_auth(ClientAuthType::RequireAnyClientCert)
+                .with_verify_peer_certificate(Some(dtls_local::verify_client_chain_callback(root_der)));
+        }
+        let config = builder
             .with_insecure_hashes(true)
             .with_insecure_verification(true)
-            .with_verify_peer_certificate(Some(dtls_local::verify_client_chain_callback(root_der)))
             .build(false, None)
             .map_err(|e| anyhow!("DTLS config: {e}"))?;
         return Ok(Arc::new(config));
     }
 
     // Fallback: self-signed Ed25519 identity, no client certificate policy.
+    //
+    // This identity offers only the default ECDHE suites, so a WTP that offers
+    // static-RSA CBC suites alone (TP-Link TL-AP1300GI: 0x002f/0x000a) can never
+    // negotiate with it - the failure surfaces only later as
+    // `ErrCipherSuiteNoIntersection`. The identity is resolved relative to the
+    // working directory, so a run that does not carry the cert tree with it lands
+    // here, which is why the miss is reported loudly.
+    warn!(
+        "DTLS identity {} not found (cwd {}); falling back to a self-signed Ed25519 key, \
+         which cannot negotiate with WTPs offering only static-RSA CBC suites",
+        cert_dir.display(),
+        std::env::current_dir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default()
+    );
     let cert =
         Certificate::generate_self_signed(vec!["miniac.local".to_string()], provider.crypto())
             .map_err(|e| anyhow!("self-signed certificate: {e}"))?;

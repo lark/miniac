@@ -113,13 +113,13 @@ impl SigningKey for RsaLegacySigningKey {
 }
 
 /// Server identity loaded from `server.pem` (certificate chain + PKCS#1/PKCS#8 RSA key).
-pub struct H3cIdentity {
+pub struct ServerIdentity {
     pub certificate_chain: Vec<rustls::pki_types::CertificateDer<'static>>,
     pub signing_key: Arc<RsaLegacySigningKey>,
 }
 
 /// Loads the CAPWAP server identity from `dir/server.pem`.
-pub fn load_identity(dir: &Path) -> Result<H3cIdentity> {
+pub fn load_identity(dir: &Path) -> Result<ServerIdentity> {
     let path = dir.join("server.pem");
     let text = std::fs::read_to_string(&path)
         .with_context(|| format!("read {} failed", path.display()))?;
@@ -144,7 +144,7 @@ pub fn load_identity(dir: &Path) -> Result<H3cIdentity> {
     if certificate_chain.is_empty() {
         return Err(anyhow!("no CERTIFICATE block in {}", path.display()));
     }
-    Ok(H3cIdentity {
+    Ok(ServerIdentity {
         certificate_chain,
         signing_key: Arc::new(signing_key),
     })

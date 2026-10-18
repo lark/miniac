@@ -20,12 +20,18 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 
+use crate::config::{Akm, Cipher, Pmf, SecurityPolicy, ConfigUpdateCmd, ConfigUpdateRegistry};
+use crate::fleet::{ClientGroup, ProductCapsStore};
+use crate::vendor::h3c::ConfigUpdateElem;
+use crate::vendor::profile::VendorProfile;
 use crate::device::{self, DeviceStore};
 use crate::firmware::{FirmwareStore, UpgradeCmd, UpgradeRegistry};
 use crate::logx;
 use crate::radio::{H3cRadioHeader, RadioStore, RadioWlan};
 use crate::security::ProfileStore;
 use crate::station::StationStore;
+use crate::wcfg::{ApOverride, Band, GlobalRadio, GlobalWlan, WirelessConfigStore};
+use crate::wtpcmd::{WtpCmd, WtpCmdRegistry};
 
 /// Shared store handles handed to every handler via axum state.
 #[derive(Clone)]
@@ -36,6 +42,11 @@ pub struct AppData {
     pub profiles: Arc<ProfileStore>,
     pub fw: Arc<FirmwareStore>,
     pub upgrade: Arc<UpgradeRegistry>,
+    pub cfg_update: Arc<ConfigUpdateRegistry>,
+    pub wtp_cmd: Arc<WtpCmdRegistry>,
+    pub wcfg: Arc<WirelessConfigStore>,
+    /// Product capability registry, read by the security recommender.
+    pub caps: Arc<ProductCapsStore>,
 }
 
 impl AppData {
@@ -46,6 +57,10 @@ impl AppData {
         profiles: Arc<ProfileStore>,
         fw: Arc<FirmwareStore>,
         upgrade: Arc<UpgradeRegistry>,
+        cfg_update: Arc<ConfigUpdateRegistry>,
+        wtp_cmd: Arc<WtpCmdRegistry>,
+        wcfg: Arc<WirelessConfigStore>,
+        caps: Arc<ProductCapsStore>,
     ) -> Self {
         AppData {
             devices,
@@ -54,6 +69,10 @@ impl AppData {
             profiles,
             fw,
             upgrade,
+            cfg_update,
+            wtp_cmd,
+            wcfg,
+            caps,
         }
     }
 }
@@ -114,6 +133,29 @@ fn router(state: Arc<AppData>) -> Router {
         .route("/api/profiles", get(list_profiles).post(create_profile))
         .route("/api/firmware", get(list_firmware).post(upload_firmware))
         .route("/api/devices/{mac}/upgrade", post(trigger_upgrade))
+        .route("/api/devices/{mac}/config-update", post(trigger_config_update))
+        .route("/api/devices/{mac}/reset", post(reset_device))
+        .route("/api/devices/{mac}/disable", post(disable_device))
+        .route(
+            "/api/devices/{mac}/stations/{smac}/disconnect",
+            post(disconnect_station),
+        )
+        .route("/api/wcfg", get(get_wcfg))
+        .route("/api/wcfg/global/radio/{band}", get(get_global_radio).put(set_global_radio))
+        .route(
+            "/api/wcfg/global/wlan",
+            get(list_global_wlans).post(set_global_wlan),
+        )
+        .route(
+            "/api/wcfg/global/wlan/{band}/{wlan_id}",
+            axum::routing::delete(delete_global_wlan),
+        )
+        .route(
+            "/api/wcfg/override/{mac}/{band}",
+            get(get_override).put(set_override).delete(clear_override),
+        )
+        .route("/api/wcfg/commit", post(commit_wcfg))
+        .route("/api/wcfg/security/recommend", get(recommend_security))
         .route("/api/events", get(list_events))
         .with_state(state)
 }
@@ -244,6 +286,7 @@ impl From<&crate::security::SecurityProfile> for ProfileDto {
 
 #[derive(Serialize)]
 struct EventDto {
+    seq: u64,
     ts_unix: u64,
     category: &'static str,
     level: &'static str,
@@ -253,6 +296,7 @@ struct EventDto {
 impl From<logx::MgmtEvent> for EventDto {
     fn from(e: logx::MgmtEvent) -> Self {
         EventDto {
+            seq: e.seq,
             ts_unix: e.ts_unix,
             category: e.category,
             level: e.level,
@@ -383,23 +427,41 @@ struct RadioWlanDto {
     radio_id: u8,
     wlan_id: u8,
     ssid: String,
-    security: String,
-    psk: Option<String>,
+    security: SecurityDto,
     wlan_enable: bool,
     isolate: bool,
     broadcast: bool,
     client_count: u32,
     vlan_id: u32,
-    cipher: u32,
     rekey_period: u32,
+    /// Compatibility caveats; empty unless the set involved a trade-off.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<String>,
+}
+
+/// API view of a WLAN security policy, keeping the two dimensions apart.
+#[derive(Serialize)]
+struct SecurityDto {
+    akm: String,
+    cipher: String,
+    pmf: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    psk: Option<String>,
+}
+
+impl From<&SecurityPolicy> for SecurityDto {
+    fn from(p: &SecurityPolicy) -> Self {
+        SecurityDto {
+            akm: p.akm.as_str().into(),
+            cipher: p.cipher.as_str().into(),
+            pmf: p.pmf.as_str().into(),
+            psk: p.psk.clone(),
+        }
+    }
 }
 
 fn serde_default_true() -> bool {
     true
-}
-
-fn serde_default_cipher() -> u32 {
-    2
 }
 
 #[derive(Deserialize)]
@@ -407,10 +469,14 @@ struct RadioWlanReq {
     radio_id: u8,
     wlan_id: Option<u8>,
     ssid: String,
-    security: String,
+    /// Key-management ("open" | "psk" | "psk-sae" | "sae") and cipher
+    /// ("tkip" | "ccmp" | "tkip+ccmp"); pmf defaults to disabled.
+    akm: String,
+    cipher: Option<String>,
+    pmf: Option<String>,
     psk: Option<String>,
     /// H3C 0xfde8 record fields; optional with DB-matching defaults
-    /// (record up, SSID visible, AES cipher).
+    /// (record up, SSID visible).
     #[serde(default = "serde_default_true")]
     wlan_enable: bool,
     #[serde(default)]
@@ -421,8 +487,6 @@ struct RadioWlanReq {
     client_count: u32,
     #[serde(default)]
     vlan_id: u32,
-    #[serde(default = "serde_default_cipher")]
-    cipher: u32,
     #[serde(default)]
     rekey_period: u32,
 }
@@ -442,89 +506,73 @@ async fn list_device_wlans(
                 radio_id: w.radio_id,
                 wlan_id: w.wlan_id,
                 ssid: w.ssid.clone(),
-                security: w.security.clone(),
-                psk: w.psk.clone(),
+                security: (&w.security).into(),
                 wlan_enable: w.wlan_enable,
                 isolate: w.isolate,
                 broadcast: w.broadcast,
                 client_count: w.client_count,
                 vlan_id: w.vlan_id,
-                cipher: w.cipher,
                 rekey_period: w.rekey_period,
+                warnings: Vec::new(),
             })
             .collect(),
     ))
 }
 
 /// Set (insert or overwrite) a per-radio WLAN configuration for a WTP. The new
-/// value takes effect on the WTP's next Configure-phase push.
+/// value takes effect on the WTP's next Configure-phase push. Compatibility
+/// caveats are returned in `warnings`.
 async fn set_device_wlan(
     State(st): State<Arc<AppData>>,
     Path(mac): Path<String>,
     Json(req): Json<RadioWlanReq>,
 ) -> Result<Json<RadioWlanDto>, ApiError> {
     let mac = device::mac_from_str(&mac).map_err(ApiError::from)?;
-    if crate::config::SecurityMethod::from_policy(&req.security).is_none() {
-        return Err(ApiError {
-            status: StatusCode::BAD_REQUEST,
-            msg: format!(
-                "invalid security method '{}' (open|wpa2|wpa3|wpa2-wpa3)",
-                req.security
-            ),
-        });
-    }
-    // PSK policy requires an 8..63 char passphrase; open allows none and
-    // ignores any supplied key.
-    let is_open = req.security == "open";
-    if !is_open {
-        let len = req.psk.as_deref().map(str::len).unwrap_or(0);
-        if !(8..=63).contains(&len) {
-            return Err(ApiError {
-                status: StatusCode::BAD_REQUEST,
-                msg: "psk must be 8..63 characters for a secured network".into(),
-            });
-        }
-    }
+    let security = parse_security_policy(
+        &req.akm,
+        req.cipher.as_deref(),
+        req.pmf.as_deref(),
+        req.psk.as_deref(),
+    )?;
+    let warnings = policy_warnings(&st, &security);
     let wlan_id = req.wlan_id.unwrap_or(1);
-    st.radios
-        .set_wlan(&RadioWlan {
-            mac,
-            radio_id: req.radio_id,
-            wlan_id,
-            ssid: req.ssid.clone(),
-            security: req.security.clone(),
-            psk: if is_open { None } else { req.psk.clone() },
-            wlan_enable: req.wlan_enable,
-            isolate: req.isolate,
-            broadcast: req.broadcast,
-            client_count: req.client_count,
-            vlan_id: req.vlan_id,
-            cipher: req.cipher,
-            rekey_period: req.rekey_period,
-        })?;
+    let w = RadioWlan {
+        mac,
+        radio_id: req.radio_id,
+        wlan_id,
+        ssid: req.ssid.clone(),
+        security: security.clone(),
+        wlan_enable: req.wlan_enable,
+        isolate: req.isolate,
+        broadcast: req.broadcast,
+        client_count: req.client_count,
+        vlan_id: req.vlan_id,
+        rekey_period: req.rekey_period,
+    };
+    st.radios.set_wlan(&w)?;
     logx::admin(format!(
-        "WLAN config set for {} radio {}: ssid={}, security={}, broadcast={}, cipher={}",
+        "WLAN config set for {} radio {}: ssid={}, akm={}, cipher={}, pmf={}, broadcast={}",
         device::mac_to_str(mac),
         req.radio_id,
         req.ssid,
-        req.security,
-        req.broadcast,
-        req.cipher
+        security.akm.as_str(),
+        security.cipher.as_str(),
+        security.pmf.as_str(),
+        req.broadcast
     ));
     Ok(Json(RadioWlanDto {
         mac: device::mac_to_str(mac),
         radio_id: req.radio_id,
         wlan_id,
         ssid: req.ssid,
-        security: req.security,
-        psk: if is_open { None } else { req.psk },
+        security: (&security).into(),
         wlan_enable: req.wlan_enable,
         isolate: req.isolate,
         broadcast: req.broadcast,
         client_count: req.client_count,
         vlan_id: req.vlan_id,
-        cipher: req.cipher,
         rekey_period: req.rekey_period,
+        warnings,
     }))
 }
 
@@ -655,9 +703,19 @@ async fn create_profile(
     }
 }
 
-async fn list_events() -> Result<Json<Vec<EventDto>>, ApiError> {
+#[derive(Deserialize)]
+struct EventsQuery {
+    /// Return events with `seq > since` (default 0 = full buffer). Non-destructive.
+    since: Option<u64>,
+}
+
+async fn list_events(Query(q): Query<EventsQuery>) -> Result<Json<Vec<EventDto>>, ApiError> {
+    let since = q.since.unwrap_or(0);
     Ok(Json(
-        logx::drain().into_iter().map(EventDto::from).collect(),
+        logx::snapshot(since)
+            .into_iter()
+            .map(EventDto::from)
+            .collect(),
     ))
 }
 
@@ -756,6 +814,717 @@ async fn trigger_upgrade(
     Ok(Json((&img).into()))
 }
 
+/// Request body for a management-plane Configuration Update push: the list of
+/// H3C config-update elements to place in a Configuration Update Request (mtype
+/// 7). Only the element types the AX60 request parser recognizes are exposed;
+/// WLAN runtime config uses the opaque 0xfdf1 batch blob (not yet decoded) and
+/// firmware image signalling rides the Image Data exchange instead.
+#[derive(Deserialize)]
+struct ConfigUpdateReq {
+    elements: Vec<ConfigUpdateElemReq>,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ConfigUpdateElemReq {
+    KeepAlive { value: u32 },
+    ApName { name: String },
+    Led { value: u32 },
+    Telnet { value: u32 },
+    Roaming { value: u32 },
+    Channel { radio: u8, channel: u8 },
+    Power { radio: u8, power: u32 },
+    AcAddressChange { ip: String },
+}
+
+impl ConfigUpdateElemReq {
+    fn into_elem(self) -> Result<ConfigUpdateElem, ApiError> {
+        Ok(match self {
+            ConfigUpdateElemReq::KeepAlive { value } => ConfigUpdateElem::KeepAlive(value),
+            ConfigUpdateElemReq::ApName { name } => ConfigUpdateElem::ApName(name.into_bytes()),
+            ConfigUpdateElemReq::Led { value } => ConfigUpdateElem::Led(value),
+            ConfigUpdateElemReq::Telnet { value } => ConfigUpdateElem::Telnet(value),
+            ConfigUpdateElemReq::Roaming { value } => ConfigUpdateElem::Roaming(value),
+            ConfigUpdateElemReq::Channel { radio, channel } => {
+                ConfigUpdateElem::Channel { radio, channel }
+            }
+            ConfigUpdateElemReq::Power { radio, power } => ConfigUpdateElem::Power { radio, power },
+            ConfigUpdateElemReq::AcAddressChange { ip } => ConfigUpdateElem::AcAddressChange(
+                ip.parse().map_err(|_| ApiError {
+                    status: StatusCode::BAD_REQUEST,
+                    msg: format!("invalid AC address: {ip}"),
+                })?,
+            ),
+        })
+    }
+}
+
+#[derive(Serialize)]
+struct ConfigUpdateAck {
+    queued: bool,
+}
+
+/// Queue a Configuration Update Request for a WTP's live CAPWAP session. The
+/// session sends it and matches the WTP's Configuration Update Response (mtype
+/// 8), whose Result Code (tag 33) confirms or rejects the push.
+async fn trigger_config_update(
+    State(st): State<Arc<AppData>>,
+    Path(mac): Path<String>,
+    Json(req): Json<ConfigUpdateReq>,
+) -> Result<Json<ConfigUpdateAck>, ApiError> {
+    let mac = device::mac_from_str(&mac).map_err(ApiError::from)?;
+    if req.elements.is_empty() {
+        return Err(ApiError {
+            status: StatusCode::BAD_REQUEST,
+            msg: "elements must not be empty".into(),
+        });
+    }
+    let mut elems = Vec::with_capacity(req.elements.len());
+    for e in req.elements {
+        elems.push(e.into_elem()?);
+    }
+    if !st.cfg_update.trigger(mac, ConfigUpdateCmd::Push { elems }) {
+        return Err(ApiError::not_found(format!(
+            "WTP {} is not in a live session",
+            device::mac_to_str(mac)
+        )));
+    }
+    logx::device(format!(
+        "configuration update queued for WTP {}",
+        device::mac_to_str(mac)
+    ));
+    Ok(Json(ConfigUpdateAck { queued: true }))
+}
+
+// --- G1/G3: AP lifecycle (reset / disable) and client eviction ---
+
+#[derive(Serialize)]
+struct WtpCmdAck {
+    queued: bool,
+}
+
+/// Error for a WTP whose live CAPWAP session is absent.
+fn not_live(mac: &device::Mac) -> ApiError {
+    ApiError::not_found(format!(
+        "WTP {} is not in a live session",
+        device::mac_to_str(*mac)
+    ))
+}
+
+/// Restart a WTP (Reset Request, mtype 17); it reboots on its current image.
+async fn reset_device(
+    State(st): State<Arc<AppData>>,
+    Path(mac): Path<String>,
+) -> Result<Json<WtpCmdAck>, ApiError> {
+    let mac = device::mac_from_str(&mac).map_err(ApiError::from)?;
+    if !st.wtp_cmd.trigger(mac, WtpCmd::Reset) {
+        return Err(not_live(&mac));
+    }
+    logx::device(format!("reset queued for WTP {}", device::mac_to_str(mac)));
+    Ok(Json(WtpCmdAck { queued: true }))
+}
+
+/// Disable a WTP: restore factory defaults (Clear Configuration Request, mtype
+/// 23) and, once acknowledged, restart it (Reset Request, mtype 17).
+async fn disable_device(
+    State(st): State<Arc<AppData>>,
+    Path(mac): Path<String>,
+) -> Result<Json<WtpCmdAck>, ApiError> {
+    let mac = device::mac_from_str(&mac).map_err(ApiError::from)?;
+    if !st.wtp_cmd.trigger(mac, WtpCmd::Disable) {
+        return Err(not_live(&mac));
+    }
+    logx::device(format!(
+        "disable queued for WTP {} (clear configuration, then reset)",
+        device::mac_to_str(mac)
+    ));
+    Ok(Json(WtpCmdAck { queued: true }))
+}
+
+#[derive(Serialize)]
+struct DisconnectAck {
+    queued: bool,
+    client: String,
+}
+
+/// Evict one station from a WTP by MAC (Release Client by AC Request, mtype
+/// 139). The station must belong to the named AP; the AC does not remove the
+/// local record — it disappears when the WTP reports the de-association.
+async fn disconnect_station(
+    State(st): State<Arc<AppData>>,
+    Path((mac, smac)): Path<(String, String)>,
+) -> Result<Json<DisconnectAck>, ApiError> {
+    let wmac = device::mac_from_str(&mac).map_err(ApiError::from)?;
+    let smac = device::mac_from_str(&smac).map_err(ApiError::from)?;
+    if st.stations.get(wmac, smac)?.is_none() {
+        return Err(ApiError::not_found(format!(
+            "station {} is not associated with AP {}",
+            device::mac_to_str(smac),
+            device::mac_to_str(wmac)
+        )));
+    }
+    if !st.wtp_cmd.trigger(wmac, WtpCmd::ReleaseClient(smac)) {
+        return Err(not_live(&wmac));
+    }
+    logx::device(format!(
+        "client {} release queued for WTP {}",
+        device::mac_to_str(smac),
+        device::mac_to_str(wmac)
+    ));
+    Ok(Json(DisconnectAck {
+        queued: true,
+        client: device::mac_to_str(smac),
+    }))
+}
+
+// --- D1: global wireless config, per-AP overrides and commit ---
+
+/// Shared WLAN security/PSK validation. The key-management and cipher
+/// dimensions are parsed separately (they are orthogonal); a secured network
+/// requires an 8..63 char passphrase, an open one ignores any supplied key.
+fn parse_security_policy(
+    akm: &str,
+    cipher: Option<&str>,
+    pmf: Option<&str>,
+    psk: Option<&str>,
+) -> Result<SecurityPolicy, ApiError> {
+    let akm = Akm::from_str(akm).ok_or_else(|| ApiError {
+        status: StatusCode::BAD_REQUEST,
+        msg: format!("invalid akm '{akm}' (open|psk|psk-sae|sae)"),
+    })?;
+    let cipher = match cipher {
+        Some(c) => Cipher::from_str(c).ok_or_else(|| ApiError {
+            status: StatusCode::BAD_REQUEST,
+            msg: format!("invalid cipher '{c}' (tkip|ccmp|tkip+ccmp)"),
+        })?,
+        None => Cipher::default(),
+    };
+    let pmf = match pmf {
+        Some(p) => Pmf::from_str(p).ok_or_else(|| ApiError {
+            status: StatusCode::BAD_REQUEST,
+            msg: format!("invalid pmf '{p}' (disabled|capable|required)"),
+        })?,
+        None => Pmf::default(),
+    };
+    let psk = if akm.secured() {
+        let len = psk.map(str::len).unwrap_or(0);
+        if !(8..=63).contains(&len) {
+            return Err(ApiError {
+                status: StatusCode::BAD_REQUEST,
+                msg: "psk must be 8..63 characters for a secured network".into(),
+            });
+        }
+        psk.map(str::to_string)
+    } else {
+        None
+    };
+    Ok(SecurityPolicy {
+        akm,
+        cipher,
+        psk,
+        pmf,
+    })
+}
+
+/// Set-time compatibility caveats for a chosen policy: the floor and
+/// client-group check plus every characterized product the push may target.
+fn policy_warnings(st: &AppData, policy: &SecurityPolicy) -> Vec<String> {
+    match st.caps.list() {
+        Ok(caps) => crate::fleet::assess_choice(policy, ClientGroup::Wpa2Plus, &caps).messages,
+        Err(_) => Vec::new(),
+    }
+}
+
+/// The vendor profiles of the APs in the fleet, used by the recommender.
+fn fleet_profiles(st: &AppData) -> Vec<VendorProfile> {
+    let mut out = Vec::new();
+    if let Ok(devices) = st.devices.list() {
+        for d in devices {
+            if !d.approved {
+                continue;
+            }
+            let profile = match d.vendor.as_deref() {
+                Some(v) if v.eq_ignore_ascii_case("h3c") => Some(VendorProfile::H3c),
+                Some(v) if v.eq_ignore_ascii_case("tp-link") || v.eq_ignore_ascii_case("tplink") => {
+                    Some(VendorProfile::TpLink)
+                }
+                _ => None,
+            };
+            if let Some(p) = profile {
+                if !out.contains(&p) {
+                    out.push(p);
+                }
+            }
+        }
+    }
+    out
+}
+
+#[derive(Serialize)]
+struct GlobalRadioDto {
+    band: u8,
+    enable: bool,
+    channel_mode: u8,
+    channel: u32,
+    power: u32,
+    mode: u32,
+}
+
+impl From<GlobalRadio> for GlobalRadioDto {
+    fn from(g: GlobalRadio) -> Self {
+        GlobalRadioDto {
+            band: g.band,
+            enable: g.enable,
+            // The DB stores a single IEEE channel (0 = auto); the UI still works
+            // in mode+channel terms, so derive the mode for display.
+            channel_mode: u8::from(g.channel != 0),
+            channel: g.channel,
+            power: g.power,
+            mode: g.mode,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct GlobalWlanDto {
+    band: u8,
+    wlan_id: u8,
+    ssid: String,
+    security: SecurityDto,
+    wlan_enable: bool,
+    isolate: bool,
+    broadcast: bool,
+    client_count: u32,
+    vlan_id: u32,
+    rekey_period: u32,
+    /// Compatibility caveats; empty unless the set involved a trade-off.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<String>,
+}
+
+impl GlobalWlanDto {
+    fn new(w: &GlobalWlan, warnings: Vec<String>) -> Self {
+        GlobalWlanDto {
+            band: w.band,
+            wlan_id: w.wlan_id,
+            ssid: w.ssid.clone(),
+            security: (&w.security).into(),
+            wlan_enable: w.wlan_enable,
+            isolate: w.isolate,
+            broadcast: w.broadcast,
+            client_count: w.client_count,
+            vlan_id: w.vlan_id,
+            rekey_period: w.rekey_period,
+            warnings,
+        }
+    }
+}
+
+impl From<GlobalWlan> for GlobalWlanDto {
+    fn from(w: GlobalWlan) -> Self {
+        GlobalWlanDto::new(&w, Vec::new())
+    }
+}
+
+#[derive(Serialize)]
+struct ApOverrideDto {
+    mac: String,
+    band: u8,
+    channel: Option<u32>,
+    power: Option<u32>,
+    mode: Option<u32>,
+}
+
+impl From<ApOverride> for ApOverrideDto {
+    fn from(o: ApOverride) -> Self {
+        ApOverrideDto {
+            mac: device::mac_to_str(o.mac),
+            band: o.band,
+            channel: o.channel,
+            power: o.power,
+            mode: o.mode,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct WcfgDto {
+    global_radios: Vec<GlobalRadioDto>,
+    global_wlans: Vec<GlobalWlanDto>,
+    overrides: Vec<ApOverrideDto>,
+    pending: Vec<String>,
+}
+
+fn wcfg_dto(st: &AppData) -> Result<WcfgDto, ApiError> {
+    let mut global_wlans = Vec::new();
+    for b in Band::ALL {
+        for w in st.wcfg.list_global_wlans(b.radio_id())? {
+            global_wlans.push(GlobalWlanDto::from(w));
+        }
+    }
+    Ok(WcfgDto {
+        global_radios: st
+            .wcfg
+            .list_global_radios()?
+            .into_iter()
+            .map(GlobalRadioDto::from)
+            .collect(),
+        global_wlans,
+        overrides: st
+            .wcfg
+            .list_overrides()?
+            .into_iter()
+            .map(ApOverrideDto::from)
+            .collect(),
+        pending: st
+            .wcfg
+            .list_pending()?
+            .iter()
+            .map(|m| device::mac_to_str(*m))
+            .collect(),
+    })
+}
+
+/// Materialize the global template into every approved WTP's per-AP rows and
+/// mark them pending (an AC-wide edit applies to all managed APs).
+fn propagate_global(st: &AppData) -> Result<(), ApiError> {
+    let macs: Vec<crate::device::Mac> = st
+        .devices
+        .list()?
+        .into_iter()
+        .filter(|d| d.approved)
+        .map(|d| d.mac)
+        .collect();
+    st.wcfg.materialize_all(&st.radios, &macs)?;
+    Ok(())
+}
+
+/// The full wireless configuration: global templates, per-AP overrides and the
+/// pending-sync set.
+async fn get_wcfg(State(st): State<Arc<AppData>>) -> Result<Json<WcfgDto>, ApiError> {
+    Ok(Json(wcfg_dto(&st)?))
+}
+
+#[derive(Deserialize)]
+struct GlobalRadioReq {
+    enable: Option<bool>,
+    channel_mode: Option<u8>,
+    channel: Option<u32>,
+    power: Option<u32>,
+    mode: Option<u32>,
+}
+
+async fn get_global_radio(
+    State(st): State<Arc<AppData>>,
+    Path(band): Path<u8>,
+) -> Result<Json<GlobalRadioDto>, ApiError> {
+    Ok(Json(st.wcfg.get_global_radio(band)?.into()))
+}
+
+/// Patch a band's global radio template (absent fields keep their value). The
+/// change is materialized into every approved WTP and marked pending.
+async fn set_global_radio(
+    State(st): State<Arc<AppData>>,
+    Path(band): Path<u8>,
+    Json(req): Json<GlobalRadioReq>,
+) -> Result<Json<GlobalRadioDto>, ApiError> {
+    let mut g = st.wcfg.get_global_radio(band)?;
+    if let Some(v) = req.enable {
+        g.enable = v;
+    }
+    // Fold the UI's mode+channel into the single stored IEEE channel: mode 0
+    // means auto (channel 0); mode 1 takes the requested channel (or keeps the
+    // stored one). A bare `channel` is applied directly (0 = auto).
+    if let Some(v) = req.channel_mode {
+        g.channel = if v == 0 {
+            0
+        } else {
+            req.channel.unwrap_or(g.channel)
+        };
+    } else if let Some(v) = req.channel {
+        g.channel = v;
+    }
+    if let Some(v) = req.power {
+        g.power = v;
+    }
+    if let Some(v) = req.mode {
+        g.mode = v;
+    }
+    st.wcfg.set_global_radio(&g)?;
+    propagate_global(&st)?;
+    logx::admin(format!(
+        "global radio set for band {band}: enable={}, channel_mode={}, channel={}, power={}, mode={}",
+        g.enable,
+        u8::from(g.channel != 0),
+        g.channel,
+        g.power,
+        g.mode
+    ));
+    Ok(Json(g.into()))
+}
+
+#[derive(Deserialize)]
+struct GlobalWlanReq {
+    band: u8,
+    wlan_id: Option<u8>,
+    ssid: String,
+    /// Key-management and cipher dimensions, kept separate; pmf defaults to
+    /// disabled.
+    akm: String,
+    cipher: Option<String>,
+    pmf: Option<String>,
+    psk: Option<String>,
+    #[serde(default = "serde_default_true")]
+    wlan_enable: bool,
+    #[serde(default)]
+    isolate: bool,
+    #[serde(default = "serde_default_true")]
+    broadcast: bool,
+    #[serde(default)]
+    client_count: u32,
+    #[serde(default)]
+    vlan_id: u32,
+    #[serde(default)]
+    rekey_period: u32,
+}
+
+async fn list_global_wlans(State(st): State<Arc<AppData>>) -> Result<Json<Vec<GlobalWlanDto>>, ApiError> {
+    let mut out = Vec::new();
+    for b in Band::ALL {
+        for w in st.wcfg.list_global_wlans(b.radio_id())? {
+            out.push(GlobalWlanDto::from(w));
+        }
+    }
+    Ok(Json(out))
+}
+
+/// Insert or overwrite a global SSID template for a band. Materialized into
+/// every approved WTP and marked pending. Compatibility caveats are returned in
+/// `warnings`.
+async fn set_global_wlan(
+    State(st): State<Arc<AppData>>,
+    Json(req): Json<GlobalWlanReq>,
+) -> Result<Json<GlobalWlanDto>, ApiError> {
+    let security = parse_security_policy(
+        &req.akm,
+        req.cipher.as_deref(),
+        req.pmf.as_deref(),
+        req.psk.as_deref(),
+    )?;
+    let warnings = policy_warnings(&st, &security);
+    let w = GlobalWlan {
+        band: req.band,
+        wlan_id: req.wlan_id.unwrap_or(1),
+        ssid: req.ssid,
+        security: security.clone(),
+        wlan_enable: req.wlan_enable,
+        isolate: req.isolate,
+        broadcast: req.broadcast,
+        client_count: req.client_count,
+        vlan_id: req.vlan_id,
+        rekey_period: req.rekey_period,
+    };
+    st.wcfg.set_global_wlan(&w)?;
+    propagate_global(&st)?;
+    logx::admin(format!(
+        "global WLAN set for band {} wlan {}: ssid={}, akm={}, cipher={}, pmf={}",
+        w.band,
+        w.wlan_id,
+        w.ssid,
+        security.akm.as_str(),
+        security.cipher.as_str(),
+        security.pmf.as_str()
+    ));
+    Ok(Json(GlobalWlanDto::new(&w, warnings)))
+}
+
+/// Recommended WLAN security for the fleet's APs and target client group.
+#[derive(Serialize)]
+struct SecurityRecommendDto {
+    akm: String,
+    cipher: String,
+    pmf: String,
+    group: String,
+    /// A separate legacy SSID when WPA1 clients must be kept working.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    legacy_akm: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    legacy_cipher: Option<String>,
+    level: &'static str,
+    messages: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct RecommendQuery {
+    group: Option<String>,
+}
+
+/// Recommend the strongest policy that the fleet can express while still
+/// serving the target client group, never below WPA-PSK+AES.
+async fn recommend_security(
+    State(st): State<Arc<AppData>>,
+    Query(q): Query<RecommendQuery>,
+) -> Result<Json<SecurityRecommendDto>, ApiError> {
+    let group = match q.group.as_deref() {
+        Some(g) => ClientGroup::from_str(g).ok_or_else(|| ApiError {
+            status: StatusCode::BAD_REQUEST,
+            msg: format!("invalid client group '{g}' (legacy|wpa2+|wpa3)"),
+        })?,
+        None => ClientGroup::default(),
+    };
+    let profiles = fleet_profiles(&st);
+    let rec = crate::fleet::recommend(&st.caps, &profiles, group)?;
+    Ok(Json(SecurityRecommendDto {
+        akm: rec.policy.akm.as_str().into(),
+        cipher: rec.policy.cipher.as_str().into(),
+        pmf: rec.policy.pmf.as_str().into(),
+        group: group.as_str().into(),
+        legacy_akm: rec.legacy.as_ref().map(|p| p.akm.as_str().to_string()),
+        legacy_cipher: rec.legacy.as_ref().map(|p| p.cipher.as_str().to_string()),
+        level: match rec.assessment.level {
+            crate::fleet::Level::Ok => "ok",
+            crate::fleet::Level::Warn => "warn",
+            crate::fleet::Level::Error => "error",
+        },
+        messages: rec.assessment.messages,
+    }))
+}
+
+async fn delete_global_wlan(
+    State(st): State<Arc<AppData>>,
+    Path((band, wlan_id)): Path<(u8, u8)>,
+) -> Result<Json<WcfgDto>, ApiError> {
+    st.wcfg.delete_global_wlan(band, wlan_id)?;
+    propagate_global(&st)?;
+    logx::admin(format!("global WLAN removed: band {band} wlan {wlan_id}"));
+    Ok(Json(wcfg_dto(&st)?))
+}
+
+#[derive(Deserialize)]
+struct OverrideReq {
+    channel: Option<u32>,
+    power: Option<u32>,
+    mode: Option<u32>,
+}
+
+async fn get_override(
+    State(st): State<Arc<AppData>>,
+    Path((mac, band)): Path<(String, u8)>,
+) -> Result<Json<Option<ApOverrideDto>>, ApiError> {
+    let mac = device::mac_from_str(&mac).map_err(ApiError::from)?;
+    Ok(Json(st.wcfg.get_override(mac, band)?.map(ApOverrideDto::from)))
+}
+
+/// Set a per-AP override (absent fields inherit the global value). The AP's
+/// rows are re-materialized and it is marked pending.
+async fn set_override(
+    State(st): State<Arc<AppData>>,
+    Path((mac, band)): Path<(String, u8)>,
+    Json(req): Json<OverrideReq>,
+) -> Result<Json<ApOverrideDto>, ApiError> {
+    let mac = device::mac_from_str(&mac).map_err(ApiError::from)?;
+    let o = ApOverride {
+        mac,
+        band,
+        channel: req.channel,
+        power: req.power,
+        mode: req.mode,
+    };
+    st.wcfg.set_override(&o)?;
+    st.wcfg.materialize(&st.radios, mac)?;
+    st.wcfg.mark_pending(mac)?;
+    logx::admin(format!(
+        "override set for {} band {band}: channel={:?}, power={:?}, mode={:?}",
+        device::mac_to_str(mac),
+        o.channel,
+        o.power,
+        o.mode
+    ));
+    Ok(Json(o.into()))
+}
+
+/// Clear a per-AP override (back to the global template); re-materialize and
+/// mark pending.
+async fn clear_override(
+    State(st): State<Arc<AppData>>,
+    Path((mac, band)): Path<(String, u8)>,
+) -> Result<Json<WcfgDto>, ApiError> {
+    let mac = device::mac_from_str(&mac).map_err(ApiError::from)?;
+    st.wcfg.clear_override(mac, band)?;
+    st.wcfg.materialize(&st.radios, mac)?;
+    st.wcfg.mark_pending(mac)?;
+    logx::admin(format!(
+        "override cleared for {} band {band}",
+        device::mac_to_str(mac)
+    ));
+    Ok(Json(wcfg_dto(&st)?))
+}
+
+#[derive(Deserialize, Default)]
+struct CommitReq {
+    #[serde(default)]
+    macs: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct CommitResult {
+    pushed: Vec<String>,
+    /// APs with a pending change but no live session; they keep the materialized
+    /// config and pick it up at their next Configure push.
+    offline: Vec<String>,
+}
+
+/// Commit the pending configuration: for each target WTP push a Configuration
+/// Update Request carrying the effective channel/power per band. The pending
+/// entry clears when the WTP acknowledges (CONFIG_UPDATE_RESP, main.rs).
+async fn commit_wcfg(
+    State(st): State<Arc<AppData>>,
+    Json(req): Json<CommitReq>,
+) -> Result<Json<CommitResult>, ApiError> {
+    let targets: Vec<crate::device::Mac> = if req.macs.is_empty() {
+        st.wcfg.list_pending()?
+    } else {
+        req.macs
+            .iter()
+            .map(|m| device::mac_from_str(m))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(ApiError::from)?
+    };
+    if targets.is_empty() {
+        return Err(ApiError {
+            status: StatusCode::BAD_REQUEST,
+            msg: "no pending WTPs to commit".into(),
+        });
+    }
+    let mut pushed = Vec::new();
+    let mut offline = Vec::new();
+    for mac in targets {
+        let mut elems = Vec::new();
+        for b in Band::ALL {
+            let h = st.wcfg.effective_radio(mac, b.radio_id())?;
+            elems.push(ConfigUpdateElem::Channel {
+                radio: b.radio_id(),
+                channel: h.channel as u8,
+            });
+            elems.push(ConfigUpdateElem::Power {
+                radio: b.radio_id(),
+                power: h.power,
+            });
+        }
+        let name = device::mac_to_str(mac);
+        if st.cfg_update.trigger(mac, ConfigUpdateCmd::Push { elems }) {
+            pushed.push(name);
+        } else {
+            offline.push(name);
+        }
+    }
+    logx::device(format!(
+        "wireless config commit: pushed {:?}, offline {:?}",
+        pushed, offline
+    ));
+    Ok(Json(CommitResult { pushed, offline }))
+}
+
 /// Spawn the HTTP service bound to `addr` sharing `state`; returns on bind error.
 pub async fn serve(state: Arc<AppData>, addr: String) -> Result<()> {
     let listener = TcpListener::bind(&addr).await?;
@@ -782,7 +1551,79 @@ mod tests {
             Arc::new(ProfileStore::new(db.clone())),
             Arc::new(FirmwareStore::new(db.clone())),
             Arc::new(UpgradeRegistry::new()),
+            Arc::new(ConfigUpdateRegistry::new()),
+            Arc::new(WtpCmdRegistry::new()),
+            Arc::new(WirelessConfigStore::new(db.clone())),
+            Arc::new(ProductCapsStore::new(db.clone())),
         ))
+    }
+
+    /// POST helper returning the response for a request with no body.
+    async fn post_empty(state: Arc<AppData>, uri: &str) -> StatusCode {
+        router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn wtp_lifecycle_and_disconnect_endpoints() {
+        use tokio::sync::mpsc;
+
+        let state = test_state();
+        let wmac = [1, 2, 3, 4, 5, 6];
+        let smac = [9, 8, 7, 6, 5, 4];
+        let wmac_s = device::mac_to_str(wmac);
+        let smac_s = device::mac_to_str(smac);
+
+        // Without a live session the lifecycle endpoints report 404.
+        assert_eq!(
+            post_empty(state.clone(), &format!("/api/devices/{wmac_s}/reset")).await,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            post_empty(state.clone(), &format!("/api/devices/{wmac_s}/disable")).await,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            post_empty(
+                state.clone(),
+                &format!("/api/devices/{wmac_s}/stations/{smac_s}/disconnect")
+            )
+            .await,
+            StatusCode::NOT_FOUND
+        );
+
+        // Register a live session and an associated station.
+        let (tx, mut rx) = mpsc::channel(8);
+        state.wtp_cmd.register(wmac, tx);
+        state
+            .stations
+            .upsert(wmac, smac, 1, 1, "associated", None, None, None)
+            .unwrap();
+
+        assert_eq!(
+            post_empty(state.clone(), &format!("/api/devices/{wmac_s}/reset")).await,
+            StatusCode::OK
+        );
+        assert_eq!(rx.recv().await, Some(WtpCmd::Reset));
+
+        assert_eq!(
+            post_empty(
+                state.clone(),
+                &format!("/api/devices/{wmac_s}/stations/{smac_s}/disconnect")
+            )
+            .await,
+            StatusCode::OK
+        );
+        assert_eq!(rx.recv().await, Some(WtpCmd::ReleaseClient(smac)));
     }
 
     #[tokio::test]
@@ -842,7 +1683,8 @@ mod tests {
         let body = serde_json::json!({
             "radio_id": 1,
             "ssid": "minimac",
-            "security": "wpa2-wpa3",
+            "akm": "psk-sae",
+            "cipher": "ccmp",
             "psk": "person0finterest"
         })
         .to_string();
@@ -863,22 +1705,23 @@ mod tests {
         let wlans = state.radios.list_wlans([1, 2, 3, 4, 5, 6]).unwrap();
         assert_eq!(wlans.len(), 1);
         assert_eq!(wlans[0].ssid, "minimac");
-        assert_eq!(wlans[0].security, "wpa2-wpa3");
-        assert_eq!(wlans[0].psk.as_deref(), Some("person0finterest"));
+        assert_eq!(wlans[0].security.akm, Akm::PskSae);
+        assert_eq!(wlans[0].security.cipher, Cipher::Ccmp);
+        assert_eq!(wlans[0].security.pmf, Pmf::Disabled);
+        assert_eq!(wlans[0].security.psk.as_deref(), Some("person0finterest"));
         // Omitted record fields fall back to the DB defaults: record up,
-        // SSID visible, AES cipher, no isolation/limit/vlan/rekey.
+        // SSID visible, no isolation/limit/vlan/rekey.
         assert_eq!(wlans[0].wlan_enable, true);
         assert_eq!(wlans[0].isolate, false);
         assert_eq!(wlans[0].broadcast, true);
         assert_eq!(wlans[0].client_count, 0);
         assert_eq!(wlans[0].vlan_id, 0);
-        assert_eq!(wlans[0].cipher, 2);
         assert_eq!(wlans[0].rekey_period, 0);
-        // Invalid security policy is rejected.
+        // Invalid key-management is rejected.
         let bad = serde_json::json!({
             "radio_id": 2,
             "ssid": "x",
-            "security": "wep-64",
+            "akm": "wep-64",
             "psk": "person0finterest"
         })
         .to_string();
@@ -894,5 +1737,201 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn config_update_queues_into_live_session() {
+        let state = test_state();
+        let mac = [1, 2, 3, 4, 5, 6];
+        let macs = device::mac_to_str(mac);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        state.cfg_update.register(mac, tx);
+
+        let body = serde_json::json!({
+            "elements": [
+                { "type": "led", "value": 1 },
+                { "type": "telnet", "value": 0 },
+                { "type": "ap_name", "name": "WTP-1" },
+                { "type": "channel", "radio": 1, "channel": 36 }
+            ]
+        })
+        .to_string();
+        let app = router(state.clone());
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/devices/{macs}/config-update"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        match rx.recv().await {
+            Some(ConfigUpdateCmd::Push { elems }) => assert_eq!(
+                elems,
+                vec![
+                    ConfigUpdateElem::Led(1),
+                    ConfigUpdateElem::Telnet(0),
+                    ConfigUpdateElem::ApName(b"WTP-1".to_vec()),
+                    ConfigUpdateElem::Channel { radio: 1, channel: 36 },
+                ]
+            ),
+            _ => panic!("expected a queued Push command"),
+        }
+
+        // A WTP with no live session is rejected.
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/devices/0a:0b:0c:0d:0e:0f/config-update")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "elements": [{ "type": "led", "value": 0 }] })
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    async fn put_json(
+        app: &Router,
+        uri: &str,
+        body: serde_json::Value,
+    ) -> axum::response::Response {
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn wcfg_global_override_and_commit() {
+        let state = test_state();
+        let mac = [1, 2, 3, 4, 5, 6];
+        let s = device::mac_to_str(mac);
+        state
+            .devices
+            .register(mac, Some("10.0.0.9"), None, None, None, "discovery")
+            .unwrap();
+        state.devices.approve(mac).unwrap();
+        let app = router(state.clone());
+
+        // Global 2.4G radio: manual channel 6, power 2.
+        let res = put_json(&app, "/api/wcfg/global/radio/1", serde_json::json!({
+            "channel_mode": 1, "channel": 6, "power": 2
+        }))
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // Global 2.4G SSID, materialized into the approved AP.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/wcfg/global/wlan")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "band": 1, "wlan_id": 1, "ssid": "corp",
+                            "akm": "psk", "cipher": "ccmp", "psk": "passphrase0"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let wlans = state.radios.list_wlans(mac).unwrap();
+        // 2.4G: the posted "corp"; 5G: the initialization-default SSID.
+        assert_eq!(wlans.len(), 2);
+        assert_eq!(wlans[0].ssid, "corp");
+        assert_eq!(wlans[0].radio_id, 1);
+        assert_eq!(wlans.iter().filter(|w| w.radio_id == 2).count(), 1);
+        assert!(state.wcfg.is_pending(mac).unwrap());
+
+        // Per-AP power override wins over the global value.
+        let res = put_json(
+            &app,
+            &format!("/api/wcfg/override/{s}/1"),
+            serde_json::json!({ "channel": null, "power": 9, "mode": null }),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let e = state.wcfg.effective_radio(mac, 1).unwrap();
+        assert_eq!(e.power, 9);
+        assert_eq!(e.channel, 6); // channel still inherited from the global
+
+        // The full config view reports the override and the pending entry.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/wcfg")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["global_radios"].as_array().unwrap().len(), 2);
+        // One seeded SSID per band plus the posted 2.4G one.
+        assert_eq!(v["global_wlans"].as_array().unwrap().len(), 2);
+        assert_eq!(v["overrides"].as_array().unwrap().len(), 1);
+        assert_eq!(v["overrides"][0]["power"], 9);
+        assert_eq!(v["pending"].as_array().unwrap().len(), 1);
+
+        // Commit defaults to the pending set; no live session -> offline only.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/wcfg/commit")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let r: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(r["pushed"].as_array().unwrap().is_empty());
+        assert_eq!(r["offline"].as_array().unwrap().len(), 1);
+
+        // Clearing the override returns to the global template.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/wcfg/override/{s}/1"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert!(state.wcfg.get_override(mac, 1).unwrap().is_none());
+        assert_eq!(state.wcfg.effective_radio(mac, 1).unwrap().power, 2);
     }
 }

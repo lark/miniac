@@ -10,58 +10,172 @@
 #![allow(dead_code, unused_imports)] // config models; wired into the Configure/Run session paths
 
 use std::collections::HashSet;
+use std::net::Ipv4Addr;
 
-use crate::capwap::{CtrlMsg, MsgElemType, MsgType};
-use crate::elements::BaseElem;
-use crate::radio::H3cRadioHeader;
+use tokio::sync::mpsc::Sender;
+
+use crate::capwap::{CtrlMsg, CwResult, MsgElemType, MsgType};
+use crate::device::Mac;
+use crate::elements::{BaseElem, ImageIdentifier};
 
 /// IEEE 802.11 binding: IEEE 802.11 Add WLAN message element (RFC 5416 3.x).
 pub const ADD_WLAN: u16 = 1024;
 
-/// Per-radio WLAN key-management policy. `Wpa2Wpa3` maps to the common
-/// "WPA2/WPA3-PSK (mixed)" personal mode (reference M60 `ssid_enc=4`).
+/// Key-management (AKM) dimension of a WLAN security policy. Orthogonal to
+/// [`Cipher`]: `PskSae` is a *transition* mode that stays backwards-compatible
+/// with WPA2 clients, not a strictly stronger successor to `Psk`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum SecurityMethod {
+pub enum Akm {
+    /// No key management (an open network).
     #[default]
     Open,
-    Wpa2Psk,
-    Wpa3Sae,
-    Wpa2Wpa3,
+    /// WPA-PSK / WPA2-PSK; the generation follows the cipher.
+    Psk,
+    /// WPA2-PSK / WPA3-SAE transition (both offered to clients).
+    PskSae,
+    /// WPA3-SAE (personal) only.
+    Sae,
 }
 
-impl SecurityMethod {
-    /// Wire byte carried in the private security element.
-    fn byte(self) -> u8 {
+impl Akm {
+    /// Policy token stored in the database and accepted by the web API.
+    pub fn as_str(self) -> &'static str {
         match self {
-            SecurityMethod::Open => 0u8,
-            SecurityMethod::Wpa2Psk => 1,
-            SecurityMethod::Wpa3Sae => 2,
-            SecurityMethod::Wpa2Wpa3 => 3,
+            Akm::Open => "open",
+            Akm::Psk => "psk",
+            Akm::PskSae => "psk-sae",
+            Akm::Sae => "sae",
         }
     }
 
-    /// Policy string as stored in the `radio_wlans` table and accepted by the
-    /// web API ("open" | "wpa2" | "wpa3" | "wpa2-wpa3").
-    pub fn from_policy(s: &str) -> Option<SecurityMethod> {
+    pub fn from_str(s: &str) -> Option<Akm> {
         match s {
-            "open" => Some(SecurityMethod::Open),
-            "wpa2" => Some(SecurityMethod::Wpa2Psk),
-            "wpa3" => Some(SecurityMethod::Wpa3Sae),
-            "wpa2-wpa3" => Some(SecurityMethod::Wpa2Wpa3),
+            "open" => Some(Akm::Open),
+            "psk" => Some(Akm::Psk),
+            "psk-sae" => Some(Akm::PskSae),
+            "sae" => Some(Akm::Sae),
             _ => None,
         }
     }
+
+    /// Security rank; a higher rank is strictly stronger. Transition modes sit
+    /// between their endpoints (`Open < Psk < PskSae < Sae`).
+    pub fn rank(self) -> u8 {
+        match self {
+            Akm::Open => 0,
+            Akm::Psk => 1,
+            Akm::PskSae => 2,
+            Akm::Sae => 3,
+        }
+    }
+
+    /// Single-bit capability mask (see [`crate::fleet::ProductCaps`]).
+    pub fn bit(self) -> u8 {
+        1 << self.rank()
+    }
+
+    /// Whether the AKM requires a WPA passphrase.
+    pub fn secured(self) -> bool {
+        !matches!(self, Akm::Open)
+    }
 }
 
-impl std::fmt::Display for SecurityMethod {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let s = match self {
-            SecurityMethod::Open => "open",
-            SecurityMethod::Wpa2Psk => "wpa2",
-            SecurityMethod::Wpa3Sae => "wpa3",
-            SecurityMethod::Wpa2Wpa3 => "wpa2-wpa3",
-        };
-        f.write_str(s)
+/// Cipher-suite dimension of a WLAN security policy. `TkipCcmp` is the
+/// WPA/WPA2 mixed mode, where both ciphers are offered to clients.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Cipher {
+    /// TKIP (WPA-era). Usable but discouraged by the policy layer.
+    Tkip,
+    /// AES/CCMP, the secure default.
+    #[default]
+    Ccmp,
+    /// TKIP + AES/CCMP (WPA/WPA2 mixed).
+    TkipCcmp,
+}
+
+impl Cipher {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Cipher::Tkip => "tkip",
+            Cipher::Ccmp => "ccmp",
+            Cipher::TkipCcmp => "tkip+ccmp",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Cipher> {
+        match s {
+            "tkip" => Some(Cipher::Tkip),
+            "ccmp" | "aes" => Some(Cipher::Ccmp),
+            "tkip+ccmp" | "ccmp+tkip" => Some(Cipher::TkipCcmp),
+            _ => None,
+        }
+    }
+
+    /// Vendor wire integer shared by the H3C `wpa_key_type` (0xfde8 record) and
+    /// private-9 fields: 1 TKIP / 2 AES / 3 TKIP+AES.
+    pub fn wire(self) -> u32 {
+        match self {
+            Cipher::Tkip => 1,
+            Cipher::Ccmp => 2,
+            Cipher::TkipCcmp => 3,
+        }
+    }
+
+    pub fn from_wire(v: u32) -> Option<Cipher> {
+        match v {
+            1 => Some(Cipher::Tkip),
+            2 => Some(Cipher::Ccmp),
+            3 => Some(Cipher::TkipCcmp),
+            _ => None,
+        }
+    }
+
+    /// Single-bit capability mask.
+    pub fn bit(self) -> u8 {
+        match self {
+            Cipher::Tkip => 0b01,
+            Cipher::Ccmp => 0b10,
+            Cipher::TkipCcmp => 0b100,
+        }
+    }
+}
+
+/// Management-frame-protection (802.11w / PMF) policy. Kept explicit rather
+/// than derived from the AKM: PMF is a prerequisite for 802.11k/r/v and the
+/// k/r/v design revisits this field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Pmf {
+    #[default]
+    Disabled,
+    Capable,
+    Required,
+}
+
+impl Pmf {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Pmf::Disabled => "disabled",
+            Pmf::Capable => "capable",
+            Pmf::Required => "required",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Pmf> {
+        match s {
+            "disabled" => Some(Pmf::Disabled),
+            "capable" => Some(Pmf::Capable),
+            "required" => Some(Pmf::Required),
+            _ => None,
+        }
+    }
+
+    /// Single-bit capability mask.
+    pub fn bit(self) -> u8 {
+        match self {
+            Pmf::Disabled => 0b001,
+            Pmf::Capable => 0b010,
+            Pmf::Required => 0b100,
+        }
     }
 }
 
@@ -84,12 +198,34 @@ impl AuthType {
     }
 }
 
-/// Security policy attached to a WLAN: the key-management method plus the WPA
-/// passphrase (when the method is PSK).
+/// Security policy attached to a WLAN. The key-management ([`Akm`]) and
+/// cipher ([`Cipher`]) dimensions stay separate: they are orthogonal, and a
+/// transition mode such as `PskSae` is a compatibility choice rather than a
+/// stronger cipher.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct WlanSecurity {
-    pub method: SecurityMethod,
+pub struct SecurityPolicy {
+    pub akm: Akm,
+    pub cipher: Cipher,
+    /// WPA passphrase (8..63 chars) when the AKM is secured.
     pub psk: Option<String>,
+    pub pmf: Pmf,
+}
+
+impl SecurityPolicy {
+    /// Whether the policy requires a passphrase.
+    pub fn secured(&self) -> bool {
+        self.akm.secured()
+    }
+
+    /// The Add WLAN authentication-type byte for this policy: RSN once a key
+    /// manager is present, legacy open-authentication otherwise.
+    pub fn auth_type(&self) -> AuthType {
+        if self.secured() {
+            AuthType::Rsn
+        } else {
+            AuthType::Open
+        }
+    }
 }
 
 /// A WLAN the AC pushes to a WTP through Configuration Update. The fixed
@@ -106,17 +242,16 @@ pub struct WlanConfig {
     pub tunnel_mode: u8,
     pub suppress_ssid: bool,
     pub ssid: Vec<u8>,
-    pub security: WlanSecurity,
+    pub security: SecurityPolicy,
     /// H3C 0xfde8 record fields (DB-backed, defaults mirror the stable wire):
     /// record slot up, client isolate, SSID visibility (broadcast 1 / hidden
-    /// 0), client limit, VLAN id, WPA cipher (1 TKIP / 2 AES / 3 TKIP+AES) and
-    /// WPA rekey period.
+    /// 0), client limit, VLAN id and WPA rekey period. The cipher rides in
+    /// [`SecurityPolicy::cipher`]; the vendor layer maps it to its wire field.
     pub wlan_enable: bool,
     pub isolate: bool,
     pub broadcast: bool,
     pub client_count: u32,
     pub vlan_id: u32,
-    pub cipher: u32,
     pub rekey_period: u32,
 }
 
@@ -132,13 +267,12 @@ impl Default for WlanConfig {
             tunnel_mode: 0,
             suppress_ssid: false,
             ssid: Vec::new(),
-            security: WlanSecurity::default(),
+            security: SecurityPolicy::default(),
             wlan_enable: true,
             isolate: false,
             broadcast: true,
             client_count: 0,
             vlan_id: 0,
-            cipher: 2,
             rekey_period: 0,
         }
     }
@@ -203,87 +337,193 @@ impl WlanConfig {
             tunnel_mode: body[tunnel_mode_at],
             suppress_ssid: body[suppress_at] != 0,
             ssid,
-            security: WlanSecurity {
-                method: SecurityMethod::from_policy("open").unwrap(),
-                psk: None,
-            },
+            security: SecurityPolicy::default(),
             ..WlanConfig::default()
         })
     }
 
-    /// Encode the private security element body described at `WLAN_SECURITY_ELEM`.
-    /// `psk` is carried verbatim (passphrases are 8..63 ASCII/UTF-8 chars).
+    /// Encode the private security element body. `psk` is carried verbatim
+    /// (passphrases are 8..63 ASCII/UTF-8 chars). Layout:
+    /// `[radio][wlan][akm rank][cipher wire][len:2][psk]`.
     pub fn security_element(&self) -> Vec<u8> {
         let psk = self.security.psk.as_deref().unwrap_or("");
-        let mut v = Vec::with_capacity(2 + 1 + 2 + psk.len());
+        let mut v = Vec::with_capacity(4 + 2 + psk.len());
         v.push(self.radio_id);
         v.push(self.wlan_id);
-        v.push(self.security.method.byte());
+        v.push(self.security.akm.rank());
+        v.push(self.security.cipher.wire() as u8);
         v.extend_from_slice(&(psk.len() as u16).to_be_bytes());
         v.extend_from_slice(psk.as_bytes());
         v
     }
 
-    /// Parse a private security element body back into a `WlanSecurity`.
-    pub fn decode_security(body: &[u8]) -> anyhow::Result<WlanSecurity> {
-        if body.len() < 5 {
+    /// Parse a private security element body back into a [`SecurityPolicy`].
+    pub fn decode_security(body: &[u8]) -> anyhow::Result<SecurityPolicy> {
+        if body.len() < 6 {
             anyhow::bail!("security element too short");
         }
-        let method = match body[2] {
-            0 => SecurityMethod::Open,
-            1 => SecurityMethod::Wpa2Psk,
-            2 => SecurityMethod::Wpa3Sae,
-            3 => SecurityMethod::Wpa2Wpa3,
-            other => anyhow::bail!("unsupported security method byte {other}"),
+        let akm = match body[2] {
+            0 => Akm::Open,
+            1 => Akm::Psk,
+            2 => Akm::PskSae,
+            3 => Akm::Sae,
+            other => anyhow::bail!("unsupported akm rank {other}"),
         };
-        let psk_len = u16::from_be_bytes([body[3], body[4]]) as usize;
-        if body.len() < 5 + psk_len {
+        let cipher = Cipher::from_wire(body[3] as u32)
+            .ok_or_else(|| anyhow::anyhow!("unsupported cipher wire {}", body[3]))?;
+        let psk_len = u16::from_be_bytes([body[4], body[5]]) as usize;
+        if body.len() < 6 + psk_len {
             anyhow::bail!("security element PSK truncated");
         }
         let psk = if psk_len == 0 {
             None
         } else {
-            Some(String::from_utf8(body[5..5 + psk_len].to_vec())?)
+            Some(String::from_utf8(body[6..6 + psk_len].to_vec())?)
         };
-        Ok(WlanSecurity { method, psk })
+        Ok(SecurityPolicy {
+            akm,
+            cipher,
+            psk,
+            pmf: Pmf::Disabled,
+        })
     }
 }
 
-/// Build a Configuration Update Request carrying arbitrary base elements plus
-/// the given WLAN(s) and a per-radio administrative-state element. WLAN push
-/// is the forward direction (AC -> WTP).
+/// Build a Configuration Update Request (mtype 7) carrying arbitrary base
+/// elements plus H3C config-update elements.
 ///
-/// The AX60 applies 0xfde8 records only when its WLAN-interface commit hook
-/// fires (create_wlan_intf / CFG_SetWifiSsidEnable); sending a Radio
-/// Administrative State element per radio drives that interface-state
-/// transition so the stored SSID/security actually take effect.
+/// The AX60 request parser (`CWParseConfigurationUpdateRequest`, WTP.dis
+/// 0x317e4) recognizes only the H3C-private tags in
+/// [`crate::vendor::h3c::ConfigUpdateElem`]. A runtime WLAN push uses the opaque
+/// 0xfdf1 batch blob, **not** the 0xfde8 element of the Configuration Status
+/// Response — the request parser skips 0xfde8 as an unrecognized element.
 pub fn config_update(
     seq: u32,
     base: &[BaseElem],
-    wlans: &[WlanConfig],
-    g24_hdr: &H3cRadioHeader,
-    g5_hdr: &H3cRadioHeader,
+    elems: &[crate::vendor::h3c::ConfigUpdateElem],
 ) -> CtrlMsg {
     let mut msg = CtrlMsg::new(MsgType::CONFIG_UPDATE_REQ, seq);
     for b in base {
         msg = msg.add_element(b.clone());
     }
-    let mut radios_seen = HashSet::new();
-    if !wlans.is_empty() {
-        // One element carries every radio's WLANs (2.4G + 5G sections), matching
-        // the AX60 decoder 0x52ee0's dual-band layout.
-        let body = crate::vendor::h3c::encode_h3c(wlans, g24_hdr, g5_hdr);
-        msg = msg.add_elem(crate::vendor::h3c::WLAN_CFG_H3C, &body);
+    for e in elems {
+        let (tag, body) = e.encode();
+        msg = msg.add_elem(tag, &body);
     }
-    for w in wlans {
-        // Drive the AX60 WLAN-interface state-transition commit (create_wlan_intf
-        // / CFG_SetWifiSsidEnable) by toggling the radio administrative state:
-        // first disabled (1) then enabled (0). A single [radio_id, 0] did NOT
-        // trigger apply in the real device, so supply an explicit down/up.
-        if radios_seen.insert(w.radio_id) {
-            msg = msg.add_elem(MsgElemType::RADIO_ADMIN_STATE, &[w.radio_id, 1]);
-            msg = msg.add_elem(MsgElemType::RADIO_ADMIN_STATE, &[w.radio_id, 0]);
-        }
+    msg
+}
+
+/// Generic (RFC 5415 8.5) Reset Request (mtype 17): names the image the WTP
+/// should reboot into. Vendor overlays (H3C, TP-Link) add their own image name
+/// and private reset mask on top of this.
+pub fn reset_request(seq: u32, image: &ImageIdentifier) -> CtrlMsg {
+    CtrlMsg::new(MsgType::RESET_REQ, seq).add_element(BaseElem::ImageIdentifier(image.clone()))
+}
+
+/// Generic (RFC 5415 8.7) Clear Configuration Request (mtype 23): asks the WTP
+/// to clear its configuration and return to defaults. The element set is empty.
+///
+/// TP-Link AC100 does not implement mtype 23 — it expresses restore-defaults
+/// through the reset mask — so this is the vendor-neutral (and H3C) path only.
+pub fn clear_config_request(seq: u32) -> CtrlMsg {
+    CtrlMsg::new(MsgType::CLEAR_CONFIG_REQ, seq)
+}
+
+/// RFC 5415 4.6.1 AC Descriptor value: a 12-byte base field set followed by the
+/// two mandatory AC Information sub-elements (Type 4 Hardware Version, Type 5
+/// Software Version), both carrying `vendor_id`.
+///
+/// The base bytes are the values the H3C AX60 WTP accepts (Security R bit set,
+/// DTLS clear-text-data policy); they are valid RFC 5415 values and are shared
+/// by every vendor form.
+pub fn ac_descriptor(hw: &str, sw: &str, vendor_id: u32) -> Vec<u8> {
+    let mut v = Vec::with_capacity(12 + 20);
+    v.extend_from_slice(&[
+        0x00, 0x00, 0x04, 0x00, // Stations 0 / Limit 1024
+        0x00, 0x00, 0x00, 0x20, // Active WTPs 0 / Max WTPs 32
+        0x01, 0x01, 0x00, 0x02, // Security / R-MAC Field / Reserved / DTLS Policy
+    ]);
+    for (ty, ver) in [(4u16, hw), (5u16, sw)] {
+        v.extend_from_slice(&vendor_id.to_be_bytes());
+        v.extend_from_slice(&ty.to_be_bytes());
+        v.extend_from_slice(&(ver.len() as u16).to_be_bytes());
+        v.extend_from_slice(ver.as_bytes());
+    }
+    v
+}
+
+/// RFC 5415 4.6.10 CAPWAP Control IPv4 Address entry: `[IPv4 4B][WTP Count 2B]`.
+/// The second field is the number of WTPs the interface serves.
+pub fn control_ipv4_entry(ip: Ipv4Addr, wtp_count: u16) -> Vec<u8> {
+    let mut v = Vec::with_capacity(6);
+    v.extend_from_slice(&ip.octets());
+    v.extend_from_slice(&wtp_count.to_be_bytes());
+    v
+}
+
+/// Generic (RFC 5415 8.1) Discovery Response (mtype 2) for the vendor-neutral
+/// and TP-Link paths: AC Name (4), AC Descriptor (1), CAPWAP Control IPv4
+/// Address (10). H3C keeps its own header-mirroring builder.
+pub fn discovery_response(seq: u32, ac_ip: Ipv4Addr, ac_name: &[u8], vendor_id: u32) -> CtrlMsg {
+    CtrlMsg::new(MsgType::DISC_RESP, seq)
+        .add_element(BaseElem::AcName(ac_name.to_vec()))
+        .add_elem(
+            MsgElemType::AC_DESCRIPTOR,
+            &ac_descriptor("1.0", "1.0", vendor_id),
+        )
+        .add_elem(
+            MsgElemType::CAPWAP_CTRL_IPV4_ADDR,
+            &control_ipv4_entry(ac_ip, 0),
+        )
+}
+
+/// Generic (RFC 5415 8.2) Join Response (mtype 4) for the vendor-neutral and
+/// TP-Link paths: Result Code (33), AC Name (4), AC Descriptor (1), ECN Support
+/// (53), CAPWAP Local IPv4 Address (30), CAPWAP Control IPv4 Address (10).
+///
+/// A refused join (unapproved WTP) carries the Result Code plus the AC
+/// identity only, so the WTP can retry.
+pub fn join_response(
+    seq: u32,
+    ac_ip: Ipv4Addr,
+    ac_name: &[u8],
+    vendor_id: u32,
+    ok: bool,
+) -> CtrlMsg {
+    let result = if ok { CwResult::Success } else { CwResult::Failure };
+    let mut msg = CtrlMsg::new(MsgType::JOIN_RESP, seq)
+        .with_result(result)
+        .add_element(BaseElem::AcName(ac_name.to_vec()))
+        .add_elem(
+            MsgElemType::AC_DESCRIPTOR,
+            &ac_descriptor("1.0", "1.0", vendor_id),
+        );
+    if ok {
+        msg = msg
+            .add_elem(MsgElemType::ECN_SUPPORT, &[1])
+            .add_elem(MsgElemType::CAPWAP_LOCAL_IPV4_ADDR, &ac_ip.octets())
+            .add_elem(
+                MsgElemType::CAPWAP_CTRL_IPV4_ADDR,
+                &control_ipv4_entry(ac_ip, 0),
+            );
+    } else {
+        msg = msg.add_elem(
+            MsgElemType::CAPWAP_CTRL_IPV4_ADDR,
+            &control_ipv4_entry(Ipv4Addr::LOCALHOST, 0),
+        );
+    }
+    msg
+}
+
+/// Generic (RFC 5415 8.3) Configuration Status Response (mtype 6).
+///
+/// The caller supplies the element set to relay back (RFC elements plus any
+/// vendor-specific payloads); RFC 5415 requires a Result Code, which is appended
+/// when the supplied set does not already carry one.
+pub fn config_status_response(seq: u32, elems: &[BaseElem]) -> CtrlMsg {
+    let mut msg = CtrlMsg::new(MsgType::CONFIG_STATUS_RESP, seq).add_elements(elems.to_vec());
+    if !elems.iter().any(|e| matches!(e, BaseElem::ResultCode(_))) {
+        msg = msg.with_result(CwResult::Success);
     }
     msg
 }
@@ -325,21 +565,58 @@ impl ConfigStatus {
     }
 }
 
+/// Command delivered from the management plane to a live WTP session to push a
+/// Configuration Update Request (mtype 7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigUpdateCmd {
+    Push {
+        elems: Vec<crate::vendor::h3c::ConfigUpdateElem>,
+    },
+}
+
+/// Registry mapping a WTP MAC to its live session's command channel, letting the
+/// web/API layer push a Configuration Update Request into the running CAPWAP
+/// flow (mirrors `firmware::UpgradeRegistry`).
+pub struct ConfigUpdateRegistry {
+    inner: std::sync::Mutex<std::collections::HashMap<Mac, Sender<ConfigUpdateCmd>>>,
+}
+
+impl ConfigUpdateRegistry {
+    pub fn new() -> Self {
+        ConfigUpdateRegistry {
+            inner: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// Associate a WTP MAC with the channel its session listens on.
+    pub fn register(&self, mac: Mac, tx: Sender<ConfigUpdateCmd>) {
+        self.inner.lock().unwrap().insert(mac, tx);
+    }
+
+    /// Whether a live session for this WTP is currently registered.
+    pub fn is_active(&self, mac: Mac) -> bool {
+        self.inner.lock().unwrap().contains_key(&mac)
+    }
+
+    /// Deliver a command to the WTP's session. Returns false when the session is
+    /// absent or its channel closed (e.g. the WTP just went offline).
+    pub fn trigger(&self, mac: Mac, cmd: ConfigUpdateCmd) -> bool {
+        match self.inner.lock().unwrap().get(&mac).cloned() {
+            Some(tx) => tx.try_send(cmd).is_ok(),
+            None => false,
+        }
+    }
+}
+
+impl Default for ConfigUpdateRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn hdr24() -> H3cRadioHeader {
-        H3cRadioHeader::default()
-    }
-
-    fn hdr5() -> H3cRadioHeader {
-        H3cRadioHeader {
-            radio_id: 2,
-            channel: 4,
-            ..H3cRadioHeader::default()
-        }
-    }
 
     #[test]
     fn wlan_roundtrip() {
@@ -355,9 +632,11 @@ mod tests {
             tunnel_mode: 0,
             suppress_ssid: false,
             ssid: b"miniac".to_vec(),
-            security: WlanSecurity {
-                method: SecurityMethod::Open,
+            security: SecurityPolicy {
+                akm: Akm::Open,
+                cipher: Cipher::Ccmp,
                 psk: None,
+                pmf: Pmf::Disabled,
             },
             ..WlanConfig::default()
         };
@@ -377,98 +656,73 @@ mod tests {
             tunnel_mode: 0,
             suppress_ssid: false,
             ssid: b"minimac".to_vec(),
-            security: WlanSecurity {
-                method: SecurityMethod::Wpa3Sae,
+            security: SecurityPolicy {
+                akm: Akm::Sae,
+                cipher: Cipher::Ccmp,
                 psk: Some("person0finterest".into()),
+                pmf: Pmf::Disabled,
             },
             ..WlanConfig::default()
         };
         let body = w.security_element();
-        // [radio][wlan][method][len:2][psk]
+        // [radio][wlan][akm rank][cipher wire][len:2][psk]
         assert_eq!(body[0], 2);
         assert_eq!(body[1], 1);
-        assert_eq!(body[2], 2); // Wpa3Sae
+        assert_eq!(body[2], 3); // Akm::Sae rank
+        assert_eq!(body[3], 2); // Cipher::Ccmp wire
         assert_eq!(
-            u16::from_be_bytes([body[3], body[4]]) as usize,
+            u16::from_be_bytes([body[4], body[5]]) as usize,
             "person0finterest".len()
         );
-        assert_eq!(
-            WlanConfig::decode_security(&body).unwrap(),
-            w.security
-        );
+        assert_eq!(WlanConfig::decode_security(&body).unwrap(), w.security);
     }
 
     #[test]
     fn config_update_message() {
+        use crate::vendor::h3c::{ConfigUpdateElem, CFG_LED, CFG_TELNET};
         let msg = config_update(
             5,
             &[BaseElem::CapwapTimers {
                 disc_interval_secs: 20,
                 echo_interval_secs: 60,
             }],
-            &[WlanConfig {
-                radio_id: 1,
-                wlan_id: 1,
-                capability: 0x0001,
-                qos: 0,
-                auth_type: AuthType::Rsn,
-                mac_mode: 0,
-                tunnel_mode: 0,
-                suppress_ssid: false,
-                ssid: b"corp".to_vec(),
-                security: WlanSecurity {
-                    method: SecurityMethod::Open,
-                    psk: None,
-                },
-                ..WlanConfig::default()
-            }],
-            &hdr24(),
-            &hdr5(),
+            &[ConfigUpdateElem::Led(1), ConfigUpdateElem::Telnet(0)],
         );
         assert_eq!(msg.hdr.msg_type, MsgType::CONFIG_UPDATE_REQ);
-        assert!(msg.elems.iter().any(|e| e.tag == crate::vendor::h3c::WLAN_CFG_H3C));
         assert!(msg
             .elems
             .iter()
             .any(|e| e.tag == MsgElemType::CAPWAP_TIMERS));
+        // Base elements come first, then the H3C config-update elements.
+        assert_eq!(msg.elems.first().unwrap().tag, MsgElemType::CAPWAP_TIMERS);
+        assert!(msg.elems.iter().any(|e| e.tag == CFG_LED));
+        assert_eq!(msg.elems.last().unwrap().tag, CFG_TELNET);
     }
 
     #[test]
-    fn config_update_embeds_security_into_h3c_body() {
-        let msg = config_update(
-            7,
-            &[],
-            &[WlanConfig {
-                radio_id: 1,
-                wlan_id: 1,
-                capability: 0x0001,
-                qos: 0,
-                auth_type: AuthType::Rsn,
-                mac_mode: 0,
-                tunnel_mode: 0,
-                suppress_ssid: false,
-                ssid: b"minimac".to_vec(),
-                security: WlanSecurity {
-                    method: SecurityMethod::Wpa2Wpa3,
-                    psk: Some("person0finterest".into()),
-                },
-                ..WlanConfig::default()
-            }],
-            &hdr24(),
-            &hdr5(),
-        );
-        let cfg_elems: Vec<_> = msg
-            .elems
-            .iter()
-            .filter(|e| e.tag == crate::vendor::h3c::WLAN_CFG_H3C)
-            .collect();
-        assert_eq!(cfg_elems.len(), 1);
-        // The PSK rides inside the 0xfde8 body (after the encrypt u32), not a
-        // separate element. Radio 1 -> "SSID-" anchor at offset 28.
-        let b = &cfg_elems[0].data;
-        assert_eq!(&b[28..33], b"SSID-");
-        let enc_at = 28 + 33 + 4 + 33 + 16;
-        assert_eq!(&b[enc_at + 4..enc_at + 4 + 16], b"person0finterest");
+    fn config_update_registry_trigger() {
+        use crate::vendor::h3c::ConfigUpdateElem;
+        use tokio::sync::mpsc;
+
+        let mac = [1, 2, 3, 4, 5, 6];
+        let reg = ConfigUpdateRegistry::new();
+        assert!(!reg.trigger(mac, ConfigUpdateCmd::Push { elems: vec![] })); // no live session
+
+        let (tx, mut rx) = mpsc::channel(1);
+        reg.register(mac, tx);
+        assert!(reg.is_active(mac));
+        assert!(reg.trigger(
+            mac,
+            ConfigUpdateCmd::Push {
+                elems: vec![ConfigUpdateElem::Led(1)]
+            }
+        ));
+        match rx.blocking_recv() {
+            Some(ConfigUpdateCmd::Push { elems }) => {
+                assert_eq!(elems, vec![ConfigUpdateElem::Led(1)])
+            }
+            _ => panic!("expected Push command"),
+        }
     }
 
     #[test]
@@ -481,5 +735,63 @@ mod tests {
         assert!(!s.is_synced());
         s.mark_acked([MsgElemType::RADIO_ADMIN_STATE]);
         assert!(s.is_synced());
+    }
+
+    #[test]
+    fn rfc_discovery_response_layout() {
+        let msg = discovery_response(7, Ipv4Addr::new(192, 168, 0, 2), b"miniac", 0x1234_5678);
+        assert_eq!(msg.hdr.msg_type, MsgType::DISC_RESP);
+        assert_eq!(msg.hdr.seq_num, 7);
+        let tags: Vec<u16> = msg.elems.iter().map(|e| e.tag).collect();
+        assert_eq!(
+            tags,
+            vec![
+                MsgElemType::AC_NAME,
+                MsgElemType::AC_DESCRIPTOR,
+                MsgElemType::CAPWAP_CTRL_IPV4_ADDR,
+            ]
+        );
+        // AC Descriptor: 12-byte base + 2 × (vendor 4 + type 2 + len 2 + "1.0").
+        assert_eq!(msg.elems[1].data.len(), 34);
+        // The AC Information sub-elements carry the enterprise number.
+        assert_eq!(&msg.elems[1].data[12..16], &0x1234_5678u32.to_be_bytes());
+        // Control IPv4 entry is [4B IP][2B WTP count].
+        assert_eq!(msg.elems[2].data, vec![192, 168, 0, 2, 0, 0]);
+    }
+
+    #[test]
+    fn rfc_join_response_layout() {
+        let ac_ip = Ipv4Addr::new(192, 168, 0, 2);
+        let msg = join_response(3, ac_ip, b"miniac", 0x1234_5678, true);
+        assert_eq!(msg.hdr.msg_type, MsgType::JOIN_RESP);
+        let tags: Vec<u16> = msg.elems.iter().map(|e| e.tag).collect();
+        assert_eq!(
+            tags,
+            vec![
+                MsgElemType::RESULT_CODE,
+                MsgElemType::AC_NAME,
+                MsgElemType::AC_DESCRIPTOR,
+                MsgElemType::ECN_SUPPORT,
+                MsgElemType::CAPWAP_LOCAL_IPV4_ADDR,
+                MsgElemType::CAPWAP_CTRL_IPV4_ADDR,
+            ]
+        );
+        assert_eq!(msg.elems[0].data, vec![0]); // Success
+        assert_eq!(msg.elems[4].data, vec![192, 168, 0, 2]);
+        assert_eq!(msg.elems[5].data, vec![192, 168, 0, 2, 0, 0]);
+
+        // A refused join carries the Result Code and AC identity only.
+        let refused = join_response(3, ac_ip, b"miniac", 0, false);
+        assert_eq!(refused.elems[0].data, vec![1]); // Failure
+        let tags: Vec<u16> = refused.elems.iter().map(|e| e.tag).collect();
+        assert_eq!(
+            tags,
+            vec![
+                MsgElemType::RESULT_CODE,
+                MsgElemType::AC_NAME,
+                MsgElemType::AC_DESCRIPTOR,
+                MsgElemType::CAPWAP_CTRL_IPV4_ADDR,
+            ]
+        );
     }
 }

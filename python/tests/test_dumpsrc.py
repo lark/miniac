@@ -123,7 +123,7 @@ class TestCorrelateAndToCode:
         ]
         code = dumpsrc.to_code(script, "h3c", "test", "synthetic")
         assert "TEMPLATES = {" in code
-        assert "resp_hex=" in code
+        assert "reply=Template(" in code
         with tempfile.NamedTemporaryFile("w", suffix=".py",
                                          delete=False) as fh:
             path = fh.name

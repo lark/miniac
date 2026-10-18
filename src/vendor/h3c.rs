@@ -36,7 +36,7 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use tracing::info;
 
-use crate::capwap::{CtrlMsg, MsgElemType, MsgType};
+use crate::capwap::{CtrlMsg, CwElem, CwResult, MsgElemType, MsgType};
 use crate::config;
 use crate::elements::BaseElem;
 use crate::radio::H3cRadioHeader;
@@ -104,33 +104,40 @@ pub fn ac_ipv4_entry(ip: Ipv4Addr) -> Vec<u8> {
     v
 }
 
-/// RFC 5415 4.6.1 AC Descriptor for Join/Discovery responses: 12-byte base
-/// plus the two mandatory AC Information sub-elements (Hardware and Software
-/// Version, vendor id 0). Shared so the WTP sees a consistent descriptor.
+/// RFC 5415 4.6.1 AC Descriptor for Join/Discovery responses, vendor id 0.
+///
+/// The AX60 WTP branches on the Security byte at WTP.dis 0x223c4 (==1 passes
+/// the real certificate paths to DTLS init, !=1 passes NULL and crashes); the
+/// shared base bytes satisfy that.
 pub fn ac_descriptor(hw: &str, sw: &str) -> Vec<u8> {
-    // Stations(2) + Limit(2): 0 / 1024
-    // Active WTPs(2) + Max WTPs(2): 0 / 32
-    // Security(1): R bit (0x01) of the S|X|R mask. The AX60 branches on this
-    // byte at WTP.dis 0x223c4: ==1 passes the real certificate paths to DTLS
-    // init, !=1 passes NULL and crashes.
-    // R-MAC Field(1): 1 = supported
-    // Reserved(1): 0
-    // DTLS Policy(1): clear-text data bit of the D|C|R mask (0x02)
-    let mut v = Vec::with_capacity(12 + 20);
-    v.extend_from_slice(&[
-        0x00, 0x00, 0x04, 0x00, //
-        0x00, 0x00, 0x00, 0x20, //
-        0x01, 0x01, 0x00, 0x02,
-    ]);
-    // AC Information sub-elements: Vendor id(4) + Type(2) + Len(2) + data.
-    // Type 4 = Hardware Version, Type 5 = Software Version (RFC 5415 4.6.1).
-    for (ty, ver) in [(4u16, hw), (5u16, sw)] {
-        v.extend_from_slice(&0u32.to_be_bytes());
-        v.extend_from_slice(&ty.to_be_bytes());
-        v.extend_from_slice(&(ver.len() as u16).to_be_bytes());
-        v.extend_from_slice(ver.as_bytes());
+    config::ac_descriptor(hw, sw, 0)
+}
+
+/// Build the H3C AX60 Join Response (mtype 4).
+///
+/// On success the element set is [Result Code, AC Descriptor, AC Name, ECN
+/// Support, Max Message Length, CAPWAP Control IPv4, CAPWAP Local IPv4]. The tag
+/// 10 value must be the 6-byte `[4B IP][2B]` entry: the AX60 JoinResponse parser
+/// (WTP.dis 0x23754) counts entries and re-parses each at 0x1df5c, and a 4-byte
+/// value makes it malloc(0)/desync and reject. A refused join (unapproved WTP)
+/// returns Result Code 1 with a loopback control address so the WTP keeps
+/// retrying.
+pub fn join_response(seq: u32, ac_ip: Ipv4Addr, ok: bool) -> CtrlMsg {
+    if !ok {
+        return CtrlMsg::new(MsgType::JOIN_RESP, seq)
+            .with_result(CwResult::Failure)
+            .add_elem(MsgElemType::AC_NAME, b"miniac")
+            .add_elem(MsgElemType::CAPWAP_CTRL_IPV4_ADDR, &[127, 0, 0, 1])
+            .add_elem(MsgElemType::CAPWAP_LOCAL_IPV4_ADDR, &[127, 0, 0, 1]);
     }
-    v
+    CtrlMsg::new(MsgType::JOIN_RESP, seq)
+        .with_result_success()
+        .add_elem(MsgElemType::AC_DESCRIPTOR, &ac_descriptor("1.0", "1.0"))
+        .add_elem(MsgElemType::AC_NAME, b"miniac")
+        .add_elem(MsgElemType::ECN_SUPPORT, &[1])
+        .add_element(BaseElem::MaxMessageLen(2048))
+        .add_elem(MsgElemType::CAPWAP_CTRL_IPV4_ADDR, &ac_ipv4_entry(ac_ip))
+        .add_elem(MsgElemType::CAPWAP_LOCAL_IPV4_ADDR, &ac_ip.octets())
 }
 
 /// H3C private WLAN configuration element (verified against the M60 AC
@@ -148,15 +155,86 @@ pub const WLAN_CFG_H3C: u16 = 0xfde8;
 pub const WTP_CHAN_UTIL_REQ: u32 = 145;
 pub const WTP_CHAN_UTIL_RESP: u32 = 146;
 
-/// Wire encrypt-type byte for the H3C 0xfde8 element. `Wpa2Psk` and the mixed
-/// `Wpa2Wpa3` map to the reference AC `ssid_enc=4`; `Wpa3Sae` to 6.
-fn h3c_encrypt(w: &config::WlanConfig) -> u32 {
-    match w.security.method {
-        config::SecurityMethod::Open => 0,
-        config::SecurityMethod::Wpa2Psk => 4,
-        config::SecurityMethod::Wpa2Wpa3 => 4,
-        config::SecurityMethod::Wpa3Sae => 6,
+/// H3C-private element tag carried in Release Client by AC Request (mtype 139):
+/// the MAC of the station the AC wants the WTP to evict. The AX60 parser
+/// (`CWParseReleasedClientRequest` 0x3d68c -> `sub_52B6C`) reads one element and
+/// rejects the request unless its value is exactly 6 bytes.
+pub const ELEM_RELEASE_CLIENT_MAC: u16 = 65;
+
+/// Build a Reset Request (mtype 17) that restarts the WTP on its current image.
+///
+/// RFC 5415 9.2; the AX60 parser `CWParseResetRequest` (WTP.dis 0x3ddb8) expects
+/// exactly one Image Identifier element (tag 25) whose value is
+/// `[vendor id u32 BE][image name][0x00]` — the parser forces the final byte to
+/// NUL, so the name must carry its own terminator. vendor id 0 skips the image
+/// check, and the name `all_version` selects the running firmware (any other
+/// name that differs from the current image yields Result 10 and no restart).
+pub fn reset_request(seq: u32) -> CtrlMsg {
+    CtrlMsg::new(MsgType::RESET_REQ, seq)
+        .add_elem(MsgElemType::IMAGE_ID, &image_id_all_version())
+}
+
+/// Value of the Image Identifier element for a plain restart: vendor id 0, the
+/// name `all_version` and its trailing NUL (16 bytes).
+pub fn image_id_all_version() -> Vec<u8> {
+    let mut v = Vec::with_capacity(16);
+    v.extend_from_slice(&0u32.to_be_bytes());
+    v.extend_from_slice(b"all_version");
+    v.push(0);
+    v
+}
+
+/// Build a Clear Configuration Request (mtype 23), restoring factory defaults.
+/// The AX60 handler (`sub_3EE88` -> `CWWTPInitConfiguration`) parses no
+/// structured elements, so the request is sent bare.
+pub fn clear_config_request(seq: u32) -> CtrlMsg {
+    CtrlMsg::new(MsgType::CLEAR_CONFIG_REQ, seq)
+}
+
+/// Build a Release Client by AC Request (mtype 139) evicting one station.
+/// The single element (tag 65) carries the 6-byte client MAC verbatim.
+pub fn release_client_request(seq: u32, mac: [u8; 6]) -> CtrlMsg {
+    CtrlMsg::new(MsgType::RELEASE_CLIENT_REQ, seq).add_elem(ELEM_RELEASE_CLIENT_MAC, &mac)
+}
+
+/// Read the Result Code (tag 33) from a response message, accepting both the
+/// RFC 5415 1-byte form and the H3C 4-byte widening. Returns `None` when the
+/// element is absent or has an unexpected length.
+pub fn result_code(msg: &CtrlMsg) -> Option<u32> {
+    let e = msg.find_elems(MsgElemType::RESULT_CODE).next()?;
+    match e.data.len() {
+        4 => Some(u32::from_be_bytes([e.data[0], e.data[1], e.data[2], e.data[3]])),
+        1 => Some(e.data[0] as u32),
+        _ => None,
     }
+}
+
+/// H3C private element carrying the WTP MAC as a bare top-level tag.
+///
+/// H3C does not use the RFC Board Data base MAC sub-element (type 4); it sends
+/// the MAC in this element instead, which is why the device identifier of an
+/// H3C WTP has to be read from here rather than from the RFC WTP Board Data.
+pub const ELEM_WTP_MAC: u16 = 54;
+
+/// Board MAC of an H3C WTP from its private element 54 (raw 6-byte value).
+/// `None` when the element is missing or shorter than a MAC, in which case the
+/// caller falls back to the RFC Board Data (which H3C WTPs do not use).
+pub fn wtp_mac(elems: &std::collections::HashMap<u16, Vec<CwElem>>) -> Option<[u8; 6]> {
+    match elems.get(&ELEM_WTP_MAC).and_then(|v| v.first()) {
+        Some(CwElem::Unknown(_, body)) if body.len() >= 6 => {
+            let mut mac = [0u8; 6];
+            mac.copy_from_slice(&body[..6]);
+            Some(mac)
+        }
+        _ => None,
+    }
+}
+
+/// H3C 0xfde8 security selectors for a WLAN policy: the encrypt-type byte plus
+/// the WPA cipher, both through the shared vendor mapping. An inexpressible
+/// policy (pure WPA3) is snapped to the closest H3C mode (WPA2/WPA3 mixed).
+fn h3c_security(w: &config::WlanConfig) -> crate::vendor::profile::SecurityFields {
+    crate::vendor::profile::VendorProfile::H3c.security_fields(&w.security)
 }
 
 /// AX60 wire radio id (virtual interface): band derives as `radio_id - 1`
@@ -193,15 +271,15 @@ pub fn encode_h3c(
     let g24: Vec<&config::WlanConfig> = wlans.iter().filter(|w| w.radio_id != 2).collect();
     let g5: Vec<&config::WlanConfig> = wlans.iter().filter(|w| w.radio_id == 2).collect();
 
-    // TEMP experiment switches isolating the AX60 crash trigger. To be
-    // removed once the root cause is pinned down:
-    //   MINIAC_H3C_EXP=skip5grec -> keep the 5G header (enable=1) but drop
-    //     the "5G-SSID-" records (element shrinks to 28+163+28=219B).
-    //   MINIAC_H3C_EXP=disable5g -> 5G header enable=0 but keep the records.
-    //   MINIAC_H3C_EXP=5gslot1 -> move the 5G records to slot 1 (anchor
-    //     "5G-SSID-2"): slot 0 stays empty so the "SSID-33" lookup is
-    //     skipped instead of hard-rejecting; slot-1 records resolve through
-    //     the j-loop ("SSID-34") and silently no-op on miss.
+    // Diagnostic encoding variants selected by MINIAC_H3C_EXP (absent by
+    // default):
+    //   skip5grec -> keep the 5G header (enable=1) but drop the "5G-SSID-"
+    //     records (element shrinks to 28+163+28=219B).
+    //   disable5g -> 5G header enable=0 but keep the records.
+    //   5gslot1 -> move the 5G record to slot 1 (anchor "5G-SSID-2"); slot 0
+    //     stays empty so the "SSID-33" lookup is skipped rather than
+    //     hard-rejecting, and slot-1 records resolve through the j-loop.
+    //   zero5g -> all-zero 5G header and no 5G records.
     let exp = std::env::var("MINIAC_H3C_EXP").unwrap_or_default();
 
     let mut v = Vec::new();
@@ -217,20 +295,17 @@ pub fn encode_h3c(
     let g5_enable = exp != "disable5g" && !g5.is_empty() && g5_hdr.enable;
     emit_h3c_radio_header(&mut v, g5.first().copied(), g5_hdr, g5_enable);
     if exp == "zero5g" {
-        // All-zero 5G header (mimics the pre-dual-band stable tail) and no
-        // 5G records; isolate whether non-zero 5G header words crash AX60.
+        // All-zero 5G header (matches the single-band tail) and no 5G
+        // records.
         let n = v.len();
         v.truncate(n - 28);
         v.extend_from_slice(&[0u8; 28]);
     } else if exp != "skip5grec" {
-        // 5G records keep the "5G-SSID-<n>" anchor: the AX60 decoder's
-        // Loop2 routes them to the band-1 slot region, while a plain
-        // "SSID-<n>" anchor is consumed by Loop1 (2.4G) and collides with
-        // the 2.4G records (f7 experiment dropped miniac24b).
+        // 5G records keep the "5G-SSID-<n>" anchor: the AX60 decoder's Loop2
+        // routes them to the band-1 slot region, while a plain "SSID-<n>"
+        // anchor is consumed by Loop1 (2.4G) and collides with the 2.4G
+        // records.
         for w in &g5 {
-            // 5gslot1 probe: emit the record under slot index 1 (anchor
-            // "5G-SSID-2") so slot 0 stays empty and its "SSID-33" hard-
-            // reject path never runs; index 2 routes through the j-loop.
             let idx = if exp == "5gslot1" { 2 } else { w.wlan_id as u32 };
             emit_h3c_record(&mut v, w, b"5G-SSID-", idx);
         }
@@ -238,22 +313,20 @@ pub fn encode_h3c(
     v
 }
 
-/// Emit one per-radio single-band element (experiment E-1: bisect the AX60
-/// session crash between the single dual-band element and the 2-element
-/// per-radio format that kept the session stable at 14:03). Each element
-/// carries one band's 7x u32 header plus its anchored records, ending with
-/// a 28-byte zero section the decoder reads as the other band's radio
-/// header; an all-zero tail leaves that band's radio disabled.
+/// Emit one per-radio single-band element. Each element carries one band's
+/// 7x u32 header plus its anchored records, ending with a 28-byte zero
+/// section the decoder reads as the other band's radio header; an all-zero
+/// tail leaves that band's radio disabled.
 pub fn encode_h3c_per_radio(radio: &config::WlanConfig, band5g: bool) -> Vec<u8> {
     let mut v = Vec::new();
-    // 5G keeps the AX60 band header defaults: radio id 2, channel index 4
-    // (165 MHz); 2.4G uses id 1, channel AUTO (0).
+    // 5G keeps the AX60 band header defaults: radio id 2, channel AUTO (0);
+    // 2.4G uses id 1, channel AUTO (0).
     let hdr = H3cRadioHeader {
         radio_id: h3c_wire_radio_id(band5g, radio.wlan_id as u32) as u8,
         enable: true,
         power: 6,
         mode: 0,
-        channel: if band5g { 4 } else { 0 },
+        channel: 0,
     };
     emit_h3c_radio_header(&mut v, Some(radio), &hdr, true);
     emit_h3c_record(
@@ -266,11 +339,10 @@ pub fn encode_h3c_per_radio(radio: &config::WlanConfig, band5g: bool) -> Vec<u8>
     v
 }
 
-/// Encode the M60-style 0xfde8 body, mirroring a captured M60 Configuration
-/// Status Response (456B ground truth, one record per band). Per band: a
-/// 7x u32 header ([enable, 0, 0, mode, radio id, 0, 100], mode 11 = 2.4G /
-/// 8 = 5G) then "SSID-" / "5G-SSID-" anchored records, followed by a 74B
-/// tail ([33B "SSID-1"][u32 1][33B "5G-SSID-1"][u32 1]).
+/// Encode the M60-style 0xfde8 body: one record per band. Per band a 7x u32
+/// header ([enable, 0, 0, mode, radio id, 0, 100], mode 11 = 2.4G / 8 = 5G)
+/// then "SSID-" / "5G-SSID-" anchored records, followed by a 74B tail
+/// ([33B "SSID-1"][u32 1][33B "5G-SSID-1"][u32 1]).
 pub fn encode_h3c_m60(wlans: &[config::WlanConfig]) -> Vec<u8> {
     let g24: Vec<&config::WlanConfig> = wlans.iter().filter(|w| w.radio_id != 2).collect();
     let g5: Vec<&config::WlanConfig> = wlans.iter().filter(|w| w.radio_id == 2).collect();
@@ -308,9 +380,8 @@ fn emit_h3c_m60_band(
 
 /// Append one M60 WLAN record: [33B anchor][u32 enable][33B SSID name][u32
 /// isolate=0][u32 broadcast=1][u32 client=0xffffffff][u32 vlan][u32 encrypt]
-/// and, when encrypted, [65B PSK][u32 cipher=2][u32 rekey=3600]. Field
-/// conventions copied from the captured M60 response; only SSID/PSK/enable
-/// come from the miniac DB.
+/// and, when encrypted, [65B PSK][u32 cipher=2][u32 rekey=3600]. Only
+/// SSID/PSK/enable come from the miniac DB.
 fn emit_h3c_m60_record(v: &mut Vec<u8>, w: &config::WlanConfig, prefix: &[u8], idx: u32) {
     let mut anchor = [0u8; 33];
     anchor[..prefix.len()].copy_from_slice(prefix);
@@ -326,7 +397,8 @@ fn emit_h3c_m60_record(v: &mut Vec<u8>, w: &config::WlanConfig, prefix: &[u8], i
     let mut pskbuf = [0u8; 65];
     let n = psk.len().min(64);
     pskbuf[..n].copy_from_slice(psk.as_bytes()[..n].into());
-    let enc = h3c_encrypt(w);
+    let fields = h3c_security(w);
+    let enc = fields.encrypt;
 
     v.extend_from_slice(&anchor);
     v.extend_from_slice(&u32::from(w.wlan_enable).to_be_bytes());
@@ -338,7 +410,7 @@ fn emit_h3c_m60_record(v: &mut Vec<u8>, w: &config::WlanConfig, prefix: &[u8], i
     v.extend_from_slice(&enc.to_be_bytes());
     if enc != 0 {
         v.extend_from_slice(&pskbuf);
-        v.extend_from_slice(&2u32.to_be_bytes());
+        v.extend_from_slice(&fields.cipher.to_be_bytes());
         v.extend_from_slice(&3600u32.to_be_bytes());
     }
 }
@@ -346,7 +418,7 @@ fn emit_h3c_m60_record(v: &mut Vec<u8>, w: &config::WlanConfig, prefix: &[u8], i
 /// Append one band's 7 x u32 radio header. The AX60 apply chain (0x26f14)
 /// reads word 0 as the radio-enable flag (CFG_SetWifiEnable), word 3 as the
 /// mode selector, word 4 as the radio id (band = radio_id - 1 via 0x3ff20),
-/// word 5 as channel and word 2 as power.
+/// word 5 as the IEEE channel number (0 = auto) and word 2 as power.
 fn emit_h3c_radio_header(
     v: &mut Vec<u8>,
     lead: Option<&config::WlanConfig>,
@@ -360,7 +432,7 @@ fn emit_h3c_radio_header(
         hdr.power,                // radio power
         hdr.mode,                 // mode selector
         u32::from(hdr.radio_id),  // radio id -> band (0x3ff20)
-        hdr.channel,              // 5G channel index (0..12 -> 149..64 freq map)
+        hdr.channel,              // IEEE channel number (0 = auto)
         0u32,
     ] {
         v.extend_from_slice(&word.to_be_bytes());
@@ -392,7 +464,8 @@ fn emit_h3c_record(v: &mut Vec<u8>, w: &config::WlanConfig, prefix: &[u8], idx: 
         let n = psk.len().min(64);
         pskbuf[..n].copy_from_slice(psk.as_bytes()[..n].into());
     }
-    let enc = h3c_encrypt(w);
+    let fields = h3c_security(w);
+    let enc = fields.encrypt;
 
     v.extend_from_slice(&anchor);
     // Record slot enable: CFG_SetWifiSsidEnable, 1 = interface up.
@@ -408,7 +481,7 @@ fn emit_h3c_record(v: &mut Vec<u8>, w: &config::WlanConfig, prefix: &[u8], idx: 
     if enc != 0 {
         v.extend_from_slice(&pskbuf);
         // WPA cipher: 1 TKIP / 2 AES / 3 TKIP+AES.
-        v.extend_from_slice(&w.cipher.to_be_bytes());
+        v.extend_from_slice(&fields.cipher.to_be_bytes());
         // WPA rekey period.
         v.extend_from_slice(&w.rekey_period.to_be_bytes());
     }
@@ -484,11 +557,10 @@ pub struct ConfigStatusResp<'a> {
     pub fe31: Option<u32>,
 }
 
-/// M60 0xfe0b private element value (96B, captured from a live M60 response).
-/// The M60 AC builds it as three 32B slots [type][new password][login prompt]
-/// (CWAssembleMsgElemIdleSetAPPwd): type "1" = AP password follows the AC's
-/// login password, "2" = manual. The capture shows type "1" with the default
-/// "123456" in both the password and prompt slots.
+/// M60 0xfe0b private element value (96B): three 32B slots
+/// [type][new password][login prompt] (CWAssembleMsgElemIdleSetAPPwd): type
+/// "1" = AP password follows the AC's login password, "2" = manual. Built as
+/// type "1" with the default "123456" in both the password and prompt slots.
 const M60_FE0B: [u8; 96] = [
     0x31, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -503,8 +575,7 @@ const M60_FE0B: [u8; 96] = [
 /// Build the H3C Configuration Status Response (mtype 6). Assembles the element
 /// stream in the M60 AC's order ([2][3][12][32][16][23][40][55] then one 0xfde8
 /// per radio/WLAN; H3C base elements are small-ID tags with vendor payloads,
-/// appended verbatim) and honors the MINIAC_H3C_EXP bisection switches
-/// (e1..e5, f1/f2/f5/f6) isolating the AX60 +10s session crash.
+/// appended verbatim).
 pub fn config_status_response(inp: &ConfigStatusResp<'_>) -> CtrlMsg {
     let mut resp_msg = CtrlMsg::new(MsgType::CONFIG_STATUS_RESP, inp.seq)
         .add_element(BaseElem::CapwapTimers {
@@ -513,28 +584,21 @@ pub fn config_status_response(inp: &ConfigStatusResp<'_>) -> CtrlMsg {
         })
         .add_element(BaseElem::IdleTimeout(300))
         .add_element(BaseElem::WtpFallback(2));
-    // M60 template base elements (H3C private payloads), wire bytes from the
-    // AC builders in AC.dis:
-    //   type2  1003a980 = AC/management IPv4 list, 2 x u32 BE
-    //   type3  1003ab14 = IPv6 list, 2 x 16B
-    //   type12 1003b364 = 2 control bytes (globals 0x10081e14/0x10081e18,
-    //                     boot 0x14/0x0a)
-    //   type32 1003c518 = radio list, 3B per record
-    //   type16 1003b4b8 = radio params, 3B per record
-    //   type23 1003ba58 = one u32 BE (global 0x10081e1c, boot 0xa)
-    //   type40 1003c414 = constant 0x00
-    //   type55 1003f434 = interface MAC (6B)
-    // Experiment E-2: with MINIAC_H3C_EXP=e2 restore the 14:03-stable
-    // type2/12/23 values ([192.168.0.2, peer], [0,0], [0,0,0,0]) while keeping
-    // the per-radio 2x 0xfde8 layout, to bisect the AX60 +10s crash.
+    // M60 template base elements (H3C private payloads):
+    //   type2  = AC/management IPv4 list, 2 x u32 BE
+    //   type3  = IPv6 list, 2 x 16B
+    //   type12 = 2 control bytes ([0x14, 0x0a] normally)
+    //   type32 = radio list, 3B per record
+    //   type16 = radio params, 3B per record
+    //   type23 = one u32 BE ([0, 0, 0, 0x0a] normally)
+    //   type40 = constant 0x00
+    //   type55 = interface MAC (6B)
     let exp = std::env::var("MINIAC_H3C_EXP").unwrap_or_default();
     if exp == "m60" {
-        // Experiment m60: emit the full M60 Configuration Status Response
-        // layout (captured ground truth, 718B) so AX60 can be tested against
-        // the real M60 AC format. Element order
+        // Full M60 Configuration Status Response layout (718B). Element order
         // [2][3][12][32][16][23][fe0b][fe0c][fe1a][fe1b][fe0d][40] then one
-        // M60-layout 0xfde8; no RFC base elements, no tag31, no type55;
-        // the type32 radio list uses state byte 2 (M60 parity).
+        // M60-layout 0xfde8; no RFC base elements, no tag31, no type55; the
+        // type32 radio list uses state byte 2 (M60 parity).
         let mut m = CtrlMsg::new(MsgType::CONFIG_STATUS_RESP, inp.seq);
         let mut ac_ip4 = [0u8; 8];
         ac_ip4[..4].copy_from_slice(&inp.ac_ip.octets());
@@ -583,20 +647,14 @@ pub fn config_status_response(inp: &ConfigStatusResp<'_>) -> CtrlMsg {
         m = m.add_elem(0x0028, &[0u8; 1]);
         if !inp.wlans.is_empty() {
             let body = encode_h3c_m60(inp.wlans);
-            let hx: String = body.iter().map(|b| format!("{:02x}", b)).collect();
-            info!("[DBG] m60 0xfde8 body ({}B): {}", body.len(), hx);
             m = m.add_elem(WLAN_CFG_H3C, &body);
         }
         return m;
     }
     let e2 = exp == "e2" || exp == "e5b";
-    // Experiment E-3: with MINIAC_H3C_EXP=e3 reproduce the 14:03-stable config
-    // response that kept the AX60 session alive (timers/idle/fallback +
-    // per-radio 0xfde8), omitting the 8 base elements and tag31 that were added
-    // later and never verified.
-    // Experiment E-4 (e4): e3 layout but re-add the per-radio RADIO_ADMIN_STATE
-    // (tag31) element, to bisect the crash between tag31 and the 8 base
-    // elements.
+    // e3/e4/f1/f2/f5/f6 drop the 8 base elements and tag31, keeping timers/
+    // idle/fallback + the per-radio 0xfde8 layout; e4/f1/f2/f5/f6 re-add the
+    // per-radio RADIO_ADMIN_STATE (tag31) echo.
     let e3 = exp == "e3"
         || exp == "e4"
         || exp == "f1"
@@ -612,9 +670,8 @@ pub fn config_status_response(inp: &ConfigStatusResp<'_>) -> CtrlMsg {
     if let IpAddr::V4(v4) = inp.peer.ip() {
         ac_ip4[4..].copy_from_slice(&v4.octets());
     }
-    // Experiment E-5: with MINIAC_H3C_EXP=e5a/e5b/e5c add back one group of the
-    // 8 base elements on top of the e3 (stable) layout, isolating which element
-    // presence crashes the AX60 session +10s:
+    // e5a/e5b/e5c add back one group of the 8 base elements on top of the e3
+    // layout:
     //   e5a -> type3 (IPv6 list), type32 (radio list), type16 (radio params)
     //   e5a1 -> type3 only; e5a2 -> type32 + type16
     //   e5a3 -> type32 only; e5a4 -> type16 only
@@ -651,11 +708,8 @@ pub fn config_status_response(inp: &ConfigStatusResp<'_>) -> CtrlMsg {
         }
     }
     if exp == "f6" {
-        // Experiment f6: single type32 (radio list) element declaring BOTH
-        // physical radios (id 1,2), keeping the f2 dual-band 0xfde8 layout.
-        // Isolate whether the radio declaration alone lets AX60 register the 5G
-        // interface (band-1) and apply the config, without the other 7 base
-        // elements that crash the session.
+        // f6: single type32 (radio list) element declaring both physical
+        // radios (id 1,2), keeping the f2 dual-band 0xfde8 layout.
         info!("[>] f6: type32 radio list both bands");
         resp_msg = resp_msg.add_elem(0x0020, &[1, 0, 0]);
         resp_msg = resp_msg.add_elem(0x0020, &[2, 0, 0]);
@@ -695,20 +749,14 @@ pub fn config_status_response(inp: &ConfigStatusResp<'_>) -> CtrlMsg {
     // response, and its decoder 0x52ee0 consumes one dual-band element with the
     // 5G radio header as the element's trailing field.
     if !inp.wlans.is_empty() {
-        // Experiment E-1: with MINIAC_H3C_EXP=e1 push one 0xfde8 per radio
-        // (single-band elements, the 14:03-stable format) instead of a single
-        // dual-band element, keeping the new type2/12/23 values, to bisect the
-        // AX60 +10s session crash. (e2 additionally restores the old
-        // type2/12/23 values; e3 drops the 8 base elements and tag31; all keep
-        // the per-radio element layout.)
+        // e1/e2/e3/e4/e5*: push one 0xfde8 per radio (single-band elements)
+        // instead of a single dual-band element. e2 also restores the old
+        // type2/12/23 values; e3/e4/e5* drop the 8 base elements and tag31.
         if exp == "f5" {
-            // Experiment f5: push ONLY the 5G band config (single per-radio
-            // element, wire radio id 33), omitting the 2.4G element entirely,
-            // to isolate whether the 2.4G section keeps the 5G radio off.
+            // f5: push only the 5G band config (single per-radio element),
+            // omitting the 2.4G element.
             if let Some(w) = inp.wlans.iter().find(|w| w.radio_id == 2) {
                 let body = encode_h3c_per_radio(w, true);
-                let hx: String = body.iter().map(|b| format!("{:02x}", b)).collect();
-                info!("[DBG] 0xfde8 body ({}B): {}", body.len(), hx);
                 resp_msg = resp_msg.add_elem(WLAN_CFG_H3C, &body);
             }
         } else if exp == "e1"
@@ -725,20 +773,138 @@ pub fn config_status_response(inp: &ConfigStatusResp<'_>) -> CtrlMsg {
         {
             for w in inp.wlans {
                 let body = encode_h3c_per_radio(w, w.radio_id == 2);
-                let hx: String = body.iter().map(|b| format!("{:02x}", b)).collect();
-                info!("[DBG] 0xfde8 body ({}B): {}", body.len(), hx);
                 resp_msg = resp_msg.add_elem(WLAN_CFG_H3C, &body);
             }
         } else {
             // Band headers ride in from the radios store (DB-backed H3C config;
             // defaults when absent).
             let body = encode_h3c(inp.wlans, inp.g24_hdr, inp.g5_hdr);
-            let hx: String = body.iter().map(|b| format!("{:02x}", b)).collect();
-            info!("[DBG] 0xfde8 body ({}B): {}", body.len(), hx);
             resp_msg = resp_msg.add_elem(WLAN_CFG_H3C, &body);
         }
     }
     resp_msg
+}
+
+// ---------------------------------------------------------------------------
+// Configuration Update Request / Response (mtype 7 / 8)
+// ---------------------------------------------------------------------------
+
+/// H3C-private element tags carried in a Configuration Update Request that the
+/// AX60 request parser recognizes (`CWParseConfigurationUpdateRequest`, WTP.dis
+/// 0x317e4). Encoders mirror the M60 AC `CWAssembleConfigurationUpdateRequest`
+/// (AC.dis 0x1002e218).
+///
+/// Note 0xfde8 (the Configuration Status Response WLAN element) is deliberately
+/// absent: the AX60 request parser does not handle it and skips it as an
+/// "Unrecognized Message Element". The runtime WLAN push instead uses 0xfdf1.
+pub const CFG_KEEPALIVE: u16 = 0xfdf0;
+pub const CFG_WLAN_BATCH: u16 = 0xfdf1;
+pub const CFG_AP_NAME: u16 = 0xfdf2;
+pub const CFG_LED: u16 = 0xfdf4;
+pub const CFG_TELNET: u16 = 0xfdf5;
+pub const CFG_ROAMING: u16 = 0xfdf7;
+pub const CFG_CHANNEL: u16 = 0xfdf9;
+pub const CFG_POWER: u16 = 0xfdfa;
+/// Standard AC-address-change tag; the H3C private twin is 0xfe06.
+pub const CFG_AC_ADDR_CHANGE: u16 = 0x003e;
+/// Standard Image Identifier tag (RFC 5415 4.6.25).
+pub const CFG_IMAGE_IDENTIFIER: u16 = 0x0019;
+
+/// One element of an H3C Configuration Update Request (AC -> WTP, mtype 7).
+/// Each variant carries its own wire encoding, matched to the M60 AC encoder.
+/// `ImageIdentifier` / `WlanBatch` are modelled for completeness but not yet
+/// wired to a caller (image signalling rides the Image Data exchange, and the
+/// 0xfdf1 batch blob layout is not decoded).
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigUpdateElem {
+    /// Keep-alive interval, seconds (u32 BE).
+    KeepAlive(u32),
+    /// AP name; stored as a NUL-terminated string.
+    ApName(Vec<u8>),
+    /// LED on/off (u32 BE).
+    Led(u32),
+    /// Telnet service enabled (u32 BE).
+    Telnet(u32),
+    /// Roaming enabled (u32 BE).
+    Roaming(u32),
+    /// Per-radio channel: `[radio id][channel]` (2B).
+    Channel { radio: u8, channel: u8 },
+    /// Per-radio power: `[radio id][power u32 BE]` (5B).
+    Power { radio: u8, power: u32 },
+    /// New AC address the WTP should adopt (4B IPv4).
+    AcAddressChange(Ipv4Addr),
+    /// Image identifier (vendor id u32 BE + name); drives the WTP image path.
+    ImageIdentifier { vendor_id: u32, name: Vec<u8> },
+    /// Opaque H3C WLAN batch blob (tag 0xfdf1); the AX60 copies it verbatim.
+    WlanBatch(Vec<u8>),
+}
+
+impl ConfigUpdateElem {
+    /// Element tag and wire body for this update element.
+    pub fn encode(&self) -> (u16, Vec<u8>) {
+        match self {
+            ConfigUpdateElem::KeepAlive(v) => (CFG_KEEPALIVE, v.to_be_bytes().to_vec()),
+            ConfigUpdateElem::ApName(name) => {
+                let mut b = name.clone();
+                b.push(0); // C string
+                (CFG_AP_NAME, b)
+            }
+            ConfigUpdateElem::Led(v) => (CFG_LED, v.to_be_bytes().to_vec()),
+            ConfigUpdateElem::Telnet(v) => (CFG_TELNET, v.to_be_bytes().to_vec()),
+            ConfigUpdateElem::Roaming(v) => (CFG_ROAMING, v.to_be_bytes().to_vec()),
+            ConfigUpdateElem::Channel { radio, channel } => (CFG_CHANNEL, vec![*radio, *channel]),
+            ConfigUpdateElem::Power { radio, power } => {
+                let mut b = Vec::with_capacity(5);
+                b.push(*radio);
+                b.extend_from_slice(&power.to_be_bytes());
+                (CFG_POWER, b)
+            }
+            ConfigUpdateElem::AcAddressChange(ip) => (CFG_AC_ADDR_CHANGE, ip.octets().to_vec()),
+            ConfigUpdateElem::ImageIdentifier { vendor_id, name } => {
+                let mut b = Vec::with_capacity(4 + name.len());
+                b.extend_from_slice(&vendor_id.to_be_bytes());
+                b.extend_from_slice(name);
+                (CFG_IMAGE_IDENTIFIER, b)
+            }
+            ConfigUpdateElem::WlanBatch(blob) => (CFG_WLAN_BATCH, blob.clone()),
+        }
+    }
+
+    /// Element tag without encoding the body (for logging / acknowledgement).
+    pub fn tag(&self) -> u16 {
+        self.encode().0
+    }
+}
+
+/// Parsed Configuration Update Response (WTP -> AC, mtype 8).
+///
+/// The AX60 builds it via `CWAssembleConfigurationUpdateResponse` (WTP.dis
+/// 0x3029c) with a single Result Code element (tag 33) whose value is a 4-byte
+/// big-endian code; 0 means the update was applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConfigUpdateResp {
+    pub result_code: u32,
+}
+
+impl ConfigUpdateResp {
+    pub fn decode(msg: &CtrlMsg) -> anyhow::Result<Self> {
+        let elem = msg
+            .find_elems(MsgElemType::RESULT_CODE)
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("Configuration Update Response missing Result Code"))?;
+        // H3C widens the RFC 1-byte Result Code to 4 bytes; accept both.
+        let result_code = match elem.data.len() {
+            4 => u32::from_be_bytes([elem.data[0], elem.data[1], elem.data[2], elem.data[3]]),
+            1 => elem.data[0] as u32,
+            n => return Err(anyhow::anyhow!("unexpected Result Code length {n}")),
+        };
+        Ok(ConfigUpdateResp { result_code })
+    }
+
+    pub fn is_success(&self) -> bool {
+        self.result_code == 0
+    }
 }
 
 #[cfg(test)]
@@ -797,7 +963,7 @@ mod tests {
         assert!(discovery_response(&bad, Ipv4Addr::LOCALHOST, b"x").is_none());
     }
 
-    use crate::config::{AuthType, SecurityMethod, WlanConfig, WlanSecurity};
+    use crate::config::{Akm, AuthType, Cipher, Pmf, SecurityPolicy, WlanConfig};
 
     // cargo runs tests in parallel, but several tests read/write the shared
     // MINIAC_H3C_EXP env var; serialize them with a module-level mutex.
@@ -826,9 +992,11 @@ mod tests {
             tunnel_mode: 0,
             suppress_ssid: false,
             ssid: ssid.as_bytes().to_vec(),
-            security: WlanSecurity {
-                method: SecurityMethod::Wpa2Wpa3,
+            security: SecurityPolicy {
+                akm: Akm::PskSae,
+                cipher: Cipher::Ccmp,
                 psk: Some("person0finterest".into()),
+                pmf: Pmf::Disabled,
             },
             ..WlanConfig::default()
         }
@@ -851,9 +1019,11 @@ mod tests {
                     tunnel_mode: 0,
                     suppress_ssid: false,
                     ssid: b"miniac24".to_vec(),
-                    security: WlanSecurity {
-                        method: SecurityMethod::Wpa2Wpa3,
+                    security: SecurityPolicy {
+                        akm: Akm::PskSae,
+                        cipher: Cipher::Ccmp,
                         psk: Some("person0finterest".into()),
+                        pmf: Pmf::Disabled,
                     },
                     ..WlanConfig::default()
                 },
@@ -882,16 +1052,16 @@ mod tests {
         assert_eq!(&b[g5_rec..g5_rec + 9], b"5G-SSID-1");
         let g5_name = g5_rec + 33 + 4;
         assert_eq!(&b[g5_name..g5_name + 7], b"minimac");
-        // encrypt u32 == 4 (WPA2/WPA3 mixed), PSK ASCII right after.
+        // encrypt u32 == 6 (WPA2/WPA3 mixed), PSK ASCII right after.
         let g5_enc = g5_rec + 33 + 4 + 33 + 16;
-        assert_eq!(&b[g5_enc..g5_enc + 4], &4u32.to_be_bytes());
+        assert_eq!(&b[g5_enc..g5_enc + 4], &6u32.to_be_bytes());
         assert_eq!(&b[g5_enc + 4..g5_enc + 4 + 16], b"person0finterest");
     }
 
     #[test]
-    fn h3c_body_layout_slot1_probe() {
+    fn h3c_body_layout_slot1() {
         let _guard = ENV_EXP.lock().unwrap();
-        // MINIAC_H3C_EXP=5gslot1 probe: single 5G record re-anchored "5G-SSID-2"
+        // MINIAC_H3C_EXP=5gslot1: single 5G record re-anchored "5G-SSID-2"
         // (slot 1) so slot 0 stays empty. Slot-0 emptiness must leave the 5G
         // header (enable=1, radio id=2) otherwise intact.
         unsafe { std::env::set_var("MINIAC_H3C_EXP", "5gslot1") };
@@ -947,37 +1117,6 @@ mod tests {
         assert_eq!(&b[g5..g5 + 4], &0u32.to_be_bytes()); // enable 0
         assert_eq!(&b[g5 + 16..g5 + 20], &2u32.to_be_bytes()); // radio id 2 (5G)
         assert_eq!(b.len(), g5 + 28);
-    }
-
-    #[test]
-    fn dump_wire_for_user() {
-        // TEMP: dump the exact wire bytes the current code generates for the
-        // two 2.4G SSIDs currently in the runtime DB (radio 1: miniac24 +
-        // miniac24b), in both encode paths, so they can be compared against the
-        // M60 AC template. Remove once the 5G/dual-SSID format is settled.
-        let wl = [wlan(1, 1, "miniac24"), wlan(1, 2, "miniac24b")];
-        let cases = [
-            ("encode_h3c(dual-band single elem)", encode_h3c(&wl, &hdr24(), &hdr5())),
-            (
-                "encode_h3c_per_radio elem1",
-                encode_h3c_per_radio(&wl[0], false),
-            ),
-            (
-                "encode_h3c_per_radio elem2",
-                encode_h3c_per_radio(&wl[1], false),
-            ),
-        ];
-        for (name, bytes) in &cases {
-            println!("== {name} : {}B ==", bytes.len());
-            println!(
-                "{}",
-                bytes
-                    .iter()
-                    .map(|b| format!("{:02x}", b))
-                    .collect::<String>()
-            );
-        }
-        assert!(true);
     }
 
     #[test]
@@ -1182,7 +1321,7 @@ mod tests {
             fe28: None,
             fe31: None,
         });
-        // e2 restores the 14:03-stable type2/12/23 values. Tags 12/23 collide
+        // e2 restores the legacy type2/12/23 values. Tags 12/23 collide
         // with the RFC CAPWAP_TIMERS / IDLE_TIMEOUT base elements (which ride
         // first), so the H3C type12/23 is the LAST element bearing that tag.
         let t2 = resp.elems.iter().find(|e| e.tag == 0x0002).unwrap();
@@ -1218,5 +1357,104 @@ mod tests {
                 0, 33, 0, 4, 0, 0, 0, 0, // Result Code element, value 0
             ]
         );
+    }
+
+    #[test]
+    fn config_update_elem_encodings() {
+        use ConfigUpdateElem::*;
+        assert_eq!(KeepAlive(30).encode(), (CFG_KEEPALIVE, vec![0, 0, 0, 30]));
+        assert_eq!(Led(1).encode(), (CFG_LED, vec![0, 0, 0, 1]));
+        assert_eq!(Telnet(0).encode(), (CFG_TELNET, vec![0, 0, 0, 0]));
+        assert_eq!(Roaming(1).encode(), (CFG_ROAMING, vec![0, 0, 0, 1]));
+        // AP name is a NUL-terminated C string.
+        assert_eq!(
+            ApName(b"ap-1".to_vec()).encode(),
+            (CFG_AP_NAME, b"ap-1\0".to_vec())
+        );
+        assert_eq!(
+            Channel { radio: 1, channel: 6 }.encode(),
+            (CFG_CHANNEL, vec![1, 6])
+        );
+        assert_eq!(
+            Power { radio: 2, power: 100 }.encode(),
+            (CFG_POWER, vec![2, 0, 0, 0, 100])
+        );
+        assert_eq!(
+            AcAddressChange(Ipv4Addr::new(192, 168, 0, 2)).encode(),
+            (CFG_AC_ADDR_CHANGE, vec![192, 168, 0, 2])
+        );
+        assert_eq!(
+            ImageIdentifier { vendor_id: 1916, name: b"fw".to_vec() }.encode(),
+            (CFG_IMAGE_IDENTIFIER, vec![0, 0, 7, 124, b'f', b'w'])
+        );
+        assert_eq!(
+            WlanBatch(vec![1, 2, 3]).encode(),
+            (CFG_WLAN_BATCH, vec![1, 2, 3])
+        );
+    }
+
+    #[test]
+    fn config_update_response_result_code() {
+        // H3C widens the Result Code to 4 bytes; the AX60 sends tag 33 (0x21).
+        let msg = CtrlMsg::new(MsgType::CONFIG_UPDATE_RESP, 3)
+            .add_elem(MsgElemType::RESULT_CODE, &[0, 0, 0, 0]);
+        let resp = ConfigUpdateResp::decode(&msg).unwrap();
+        assert_eq!(resp.result_code, 0);
+        assert!(resp.is_success());
+
+        let fail = CtrlMsg::new(MsgType::CONFIG_UPDATE_RESP, 4)
+            .add_elem(MsgElemType::RESULT_CODE, &[0, 0, 0, 13]);
+        assert_eq!(ConfigUpdateResp::decode(&fail).unwrap().result_code, 13);
+
+        // A response without a Result Code element is rejected.
+        assert!(ConfigUpdateResp::decode(&CtrlMsg::new(MsgType::CONFIG_UPDATE_RESP, 5)).is_err());
+    }
+
+    #[test]
+    fn reset_request_image_id_encoding() {
+        // Image Identifier value = [vendor 0, "all_version", 0x00], 16 bytes.
+        assert_eq!(
+            image_id_all_version(),
+            vec![0, 0, 0, 0, b'a', b'l', b'l', b'_', b'v', b'e', b'r', b's', b'i', b'o', b'n', 0]
+        );
+        let msg = reset_request(7);
+        assert_eq!(msg.hdr.msg_type, MsgType::RESET_REQ);
+        assert_eq!(msg.hdr.seq_num, 7);
+        assert_eq!(msg.elems.len(), 1);
+        assert_eq!(msg.elems[0].tag, MsgElemType::IMAGE_ID);
+        assert_eq!(msg.elems[0].data, image_id_all_version());
+        // Sanity: the element body carries its own trailing NUL (the AX60 parser
+        // forces the last byte to NUL, so an unterminated name is truncated).
+        assert_eq!(*msg.elems[0].data.last().unwrap(), 0);
+    }
+
+    #[test]
+    fn clear_config_request_is_bare() {
+        let msg = clear_config_request(9);
+        assert_eq!(msg.hdr.msg_type, MsgType::CLEAR_CONFIG_REQ);
+        assert_eq!(msg.hdr.seq_num, 9);
+        assert!(msg.elems.is_empty());
+    }
+
+    #[test]
+    fn release_client_request_mac_element() {
+        let mac = [0xc4, 0xc0, 0x63, 0xef, 0xca, 0x25];
+        let msg = release_client_request(11, mac);
+        assert_eq!(msg.hdr.msg_type, MsgType::RELEASE_CLIENT_REQ);
+        assert_eq!(msg.elems.len(), 1);
+        // Tag 65 with a value that is exactly the 6-byte client MAC.
+        assert_eq!(msg.elems[0].tag, ELEM_RELEASE_CLIENT_MAC);
+        assert_eq!(msg.elems[0].data, mac.to_vec());
+        assert_eq!(msg.elems[0].data.len(), 6);
+    }
+
+    #[test]
+    fn result_code_reads_both_widths() {
+        let h3c = CtrlMsg::new(MsgType::RELEASE_CLIENT_RESP, 1)
+            .add_elem(MsgElemType::RESULT_CODE, &[0, 0, 0, 0]);
+        assert_eq!(result_code(&h3c), Some(0));
+        let rfc = CtrlMsg::new(MsgType::RESET_RESP, 2).add_elem(MsgElemType::RESULT_CODE, &[10]);
+        assert_eq!(result_code(&rfc), Some(10));
+        assert_eq!(result_code(&CtrlMsg::new(MsgType::RESET_RESP, 3)), None);
     }
 }

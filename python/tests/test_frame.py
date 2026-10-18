@@ -9,7 +9,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from wtpan.ctrl import CtrlMsg
-from wtpan.frame import BASE_HEADER, CtrlFrame
+from wtpan.frame import BASE_HEADER, TPLINK_HEADER, CtrlFrame
 
 #: Confirmed AX60 JoinRequest control payload (= app_data[8..]): msg_type 3,
 #: 4-byte seq 2, MsgElemLen self-inclusive, then elements (framing.rs JOIN).
@@ -103,7 +103,8 @@ class TestRfc:
         assert not out.startswith(BASE_HEADER)
         assert out[:4] == bytes([0, 0, 0, 1])
         assert out[4] == 5
-        assert int.from_bytes(out[5:7], "big") == 6  # 4 + 2 element bytes
+        # MsgElemLen is self-inclusive: 3 + (4 + 2 element bytes).
+        assert int.from_bytes(out[5:7], "big") == 9
         assert out[7] == 0  # flags
         assert out[8:] == bytes([0, 1, 0, 2, 1, 2])
 
@@ -114,3 +115,40 @@ class TestRfc:
         rfrm = CtrlFrame("rfc")
         assert rfrm.wire_to_control(b"\x01\x02") == b"\x01\x02"
         assert rfrm.control_to_wire(b"\x01\x02") == b"\x01\x02"
+
+
+#: Real TL-AP1300GI wire captures (dump28): the WTP's WLAN Configuration
+#: Update Response (mtype 0x0033DD02) and the AC's Delete-WLAN request
+#: (mtype 0x0033DD01, element 1027 value `[radio][wlan]`).
+TPLINK_WLAN_RESP = bytes.fromhex(
+    "01104300000000000033dd0264000b000021000400000000")
+TPLINK_DEL_WLAN = bytes.fromhex(
+    "00100300000000000033dd0164000900040300020101")
+
+
+class TestTplink:
+    def test_header_offsets(self):
+        frm = CtrlFrame("tplink")
+        assert frm.seq_len() == 1
+        assert frm.elem_off() == 8
+        assert frm.base_header() == TPLINK_HEADER
+        assert frm.self_inclusive_elem_len()
+
+    def test_decode_wlan_response(self):
+        frm = CtrlFrame("tplink")
+        msg = CtrlMsg.decode(frm, frm.wire_to_control(TPLINK_WLAN_RESP))
+        assert (msg.msg_type, msg.seq) == (0x0033DD02, 100)
+        assert msg.elems == [(33, b"\x00\x00\x00\x00")]
+
+    def test_decode_delete_wlan(self):
+        frm = CtrlFrame("tplink")
+        msg = CtrlMsg.decode(frm, frm.wire_to_control(TPLINK_DEL_WLAN))
+        assert (msg.msg_type, msg.seq) == (0x0033DD01, 100)
+        assert msg.elems == [(1027, b"\x01\x01")]
+
+    def test_encode_delete_wlan_matches_wire(self):
+        frm = CtrlFrame("tplink")
+        msg = CtrlMsg(0x0033DD01, 100, [(1027, b"\x01\x01")])
+        expected = TPLINK_HEADER + bytes.fromhex(
+            "0033dd0164000900040300020101")
+        assert msg.encode(frm) == expected
