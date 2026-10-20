@@ -162,6 +162,31 @@ impl RadioStore {
         Ok(created)
     }
 
+    /// Record the RF state a vendor resource report learned for a radio (band,
+    /// channel, TX power) without touching the admin/op state, which other
+    /// reports own. Inserts a row with default admin/op state when the radio is
+    /// new.
+    pub fn set_rf(
+        &self,
+        mac: Mac,
+        radio_id: u8,
+        band: Option<&str>,
+        channel: u32,
+        tx_power: i32,
+    ) -> Result<()> {
+        let conn = self.db.lock();
+        conn.execute(
+            "INSERT INTO radios (mac,radio_id,band,admin_state,op_state,channel,tx_power,last_seen)
+             VALUES (?1,?2,?3,0,0,?4,?5,?6)
+             ON CONFLICT(mac,radio_id) DO UPDATE SET
+                band=COALESCE(excluded.band, band),
+                channel=excluded.channel, tx_power=excluded.tx_power,
+                last_seen=excluded.last_seen",
+            params![&mac[..], radio_id, band, channel, tx_power, now_unix() as i64],
+        )?;
+        Ok(())
+    }
+
     /// All radios owned by a device.
     pub fn list_by_device(&self, mac: Mac) -> Result<Vec<Radio>> {
         let conn = self.db.lock();

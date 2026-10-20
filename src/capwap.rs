@@ -104,15 +104,21 @@ pub struct WtpContext {
     pub led_enabled: bool,
     pub session_id: u64,
     pub last_seen: Instant,
+    /// The AC's single outstanding Request awaiting its Response.
     pub last_sent: Option<LastSentInfo>,
     /// When the Run-state keep-alive Echo Request was last sent to the WTP.
     pub last_echo_sent: Instant,
 
-    /// TP-Link Run-entry configuration push, delivered strictly serialized:
-    /// AC100 sends one Configuration Update Request at a time and waits for the
-    /// WTP's reply before the next, because the WTP admits a single in-flight
-    /// radio operation and silently drops a message that arrives while one is
-    /// still running. Each entry is an encoded wire frame.
+    /// RFC 5415 4.5.3: seq of the last Request accepted from the WTP, with its
+    /// Response cached to replay on a retransmission.
+    pub last_req_seq: Option<u32>,
+    pub last_resp_buf: Option<Vec<u8>>,
+    /// Last Response (seq, type) handled, whose duplicate is discarded.
+    pub last_resp_done: Option<(u32, u32)>,
+
+    /// TP-Link Run-entry configuration push, sent strictly one frame per reply:
+    /// the WTP admits a single in-flight radio operation and drops a message that
+    /// arrives while one is still running. Each entry is an encoded wire frame.
     pub push_queue: VecDeque<Vec<u8>>,
     /// Frames released together once `push_queue` drains: the WLAN slot deletes
     /// and Add WLAN pushes, which the WTP accepts back-to-back.
@@ -289,6 +295,9 @@ impl WtpContext {
             last_seen: Instant::now(),
             last_sent: None,
             last_echo_sent: Instant::now(),
+            last_req_seq: None,
+            last_resp_buf: None,
+            last_resp_done: None,
             push_queue: VecDeque::new(),
             push_burst: Vec::new(),
             push_last_sent: None,
@@ -303,14 +312,41 @@ impl WtpContext {
         self.last_seen = Instant::now();
     }
 
+    /// Store a sent frame by role (RFC 5415 4.5.3): a Request becomes the single
+    /// outstanding Request, a Response is cached against the WTP Request it
+    /// answers, so the two never displace each other.
     pub fn set_last_sent(&mut self, msg: &CtrlMsg, buf: Vec<u8>) {
-        self.last_sent = Some(LastSentInfo {
-            buf,
-            seq: msg.hdr.seq_num,
-            msg_type: msg.hdr.msg_type,
-            send_time: Instant::now(),
-            retry_count: 0,
-        });
+        if MsgType::is_request(msg.hdr.msg_type) {
+            // A new Request starts a new lock-step; drop the duplicate marker.
+            self.last_resp_done = None;
+            self.last_sent = Some(LastSentInfo {
+                buf,
+                seq: msg.hdr.seq_num,
+                msg_type: msg.hdr.msg_type,
+                send_time: Instant::now(),
+                retry_count: 0,
+            });
+        } else {
+            self.last_req_seq = Some(msg.hdr.seq_num);
+            self.last_resp_buf = Some(buf);
+        }
+    }
+
+    /// Whether a Request of ours awaits its Response; RFC 5415 4.5.3 allows only
+    /// one outstanding at a time.
+    pub fn has_outstanding_request(&self) -> bool {
+        self.last_sent
+            .as_ref()
+            .is_some_and(|l| MsgType::is_request(l.msg_type))
+    }
+
+    /// Retransmit interval for the `retry_count`-th retransmission: doubles each
+    /// time, capped at half the EchoInterval (RFC 5415 4.5.3).
+    pub fn retrans_interval_for(&self, retry_count: u32) -> Duration {
+        let doubled = self
+            .retrans_interval
+            .saturating_mul(1u32 << retry_count.min(8));
+        doubled.min(self.echo_interval / 2)
     }
 
     pub fn next_seq(&mut self) -> u32 {
@@ -484,6 +520,15 @@ impl MsgType {
     pub fn is_response(m_type: u32) -> bool {
         m_type != 0 && m_type % 2 == 0
     }
+}
+
+/// Whether seq `a` is older than `b` over the framing's counter width: the RFC
+/// 1-octet Sequence Number wraps at 256, H3C's 4-octet one at 2^32. `a` is older
+/// when its forward distance to `b` stays within half the modulus.
+pub fn seq_is_older(a: u32, b: u32, frame: crate::vendor::framing::CtrlFrame) -> bool {
+    let modulus = 1i64 << (8 * frame.seq_len());
+    let diff = (b as i64 - a as i64).rem_euclid(modulus);
+    diff > 0 && diff < modulus / 2
 }
 
 pub struct MsgElemType;
@@ -1338,6 +1383,26 @@ impl MsgSchema {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn seq_ordering_follows_framing() {
+        use crate::vendor::framing::CtrlFrame;
+        // RFC framing: 1-octet Sequence Number, wraps at 256 (RFC 5415 4.5.3).
+        assert!(seq_is_older(5, 6, CtrlFrame::Rfc));
+        assert!(seq_is_older(250, 10, CtrlFrame::Rfc)); // wrapped forward past zero
+        assert!(!seq_is_older(6, 5, CtrlFrame::Rfc));
+        assert!(!seq_is_older(10, 250, CtrlFrame::Rfc));
+        // Half a cycle apart is the boundary and counts as newer, not older.
+        assert!(!seq_is_older(0, 128, CtrlFrame::Rfc));
+        assert!(!seq_is_older(128, 0, CtrlFrame::Rfc));
+        assert!(!seq_is_older(7, 7, CtrlFrame::Rfc));
+        // H3C framing: 4-octet Sequence Number, does not wrap at 256.
+        assert!(seq_is_older(255, 511, CtrlFrame::H3c));
+        assert!(seq_is_older(511, 512, CtrlFrame::H3c));
+        assert!(!seq_is_older(511, 255, CtrlFrame::H3c));
+        assert!(!seq_is_older(512, 511, CtrlFrame::H3c));
+        assert!(!seq_is_older(9, 9, CtrlFrame::H3c));
+    }
 
     #[test]
     fn test_at_least_one_validation() {

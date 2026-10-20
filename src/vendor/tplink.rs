@@ -517,6 +517,130 @@ pub fn wlan_config_del_request(seq: u32, radio_id: u8, wlan_id: u8) -> CtrlMsg {
     CtrlMsg::new(WLAN_CONFIG_UPDATE_REQ, seq).add_elem(MsgElemType::DEL_WLAN, &[radio_id, wlan_id])
 }
 
+/// Top-level element 51 carrying the periodic per-radio station report. TP-Link
+/// reuses the RFC 5415 element id 51 (CAPWAP Transport Protocol) for its own
+/// station state report (AP1300GI `CWAssembleMsgStationStateReport` 0x42f0dc;
+/// AC100 `_uac_wsta_pkt_rssi_report` 0x51D80C keys on top-level id 0x33). It
+/// rides the WTP Event Request (message type 9) once the AP has been handed its
+/// report period by the Configuration Status Response's private 60.
+pub const STATION_REPORT_TAG: u16 = 51;
+
+/// One station in a station report: its MAC and the signal strength the radio
+/// measured for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StationRecord {
+    pub mac: [u8; 6],
+    /// RSSI in dBm (signed), as the AP reports it.
+    pub rssi: i32,
+}
+
+/// One radio's entry in a station report: the radio id and the stations
+/// currently associated on it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StationReport {
+    pub radio_id: u8,
+    pub stations: Vec<StationRecord>,
+}
+
+/// Parse a station report value: `[radio u8][count u32]` then `count` records of
+/// `[6B MAC][1B RSSI]`. A zero count is the 5-byte value the AP sends while no
+/// station is associated. Returns `None` when the value is shorter than the
+/// declared record count, so a truncated report is ignored instead of being
+/// applied half-read.
+pub fn parse_station_report(value: &[u8]) -> Option<StationReport> {
+    let radio_id = *value.first()?;
+    let count = u32::from_be_bytes(value.get(1..5)?.try_into().ok()?) as usize;
+    let recs = value.get(5..)?;
+    if recs.len() < count * 7 {
+        return None;
+    }
+    let stations = (0..count)
+        .map(|i| {
+            let rec = &recs[i * 7..i * 7 + 7];
+            let mut mac = [0u8; 6];
+            mac.copy_from_slice(&rec[..6]);
+            StationRecord {
+                mac,
+                rssi: rec[6] as i8 as i32,
+            }
+        })
+        .collect();
+    Some(StationReport { radio_id, stations })
+}
+
+/// One entry of the WLAN list the WTP reports already holding (private 30).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SavedWlan {
+    /// Radio id this entry belongs to. The byte reads 1 and 2 while the WTP holds
+    /// WLAN id 1 on both radios, so it is the radio id and not the WLAN id; the
+    /// list carries one SSID per radio.
+    pub radio_id: u8,
+    /// SSID the WTP holds on that radio, NUL-trimmed out of its fixed 32-byte
+    /// name field.
+    pub ssid: String,
+}
+
+/// Parse a private 30 (WLAN list) value: a two-word header followed by
+/// `count` records of `[u8 radio_id][32B SSID]`. The WTP carries it in its
+/// Configuration Status Request (wire message type 5), so the AC learns what
+/// the WTP already holds before deciding whether to push. The header's first
+/// word is not understood (observed `1`, then the record count); only the count
+/// is used. Returns `None` when the value does not hold the declared records, so
+/// a truncated list is ignored instead of half-read.
+pub fn parse_wlan_list(value: &[u8]) -> Option<Vec<SavedWlan>> {
+    const REC: usize = 33; // [u8 radio_id][32B SSID]
+    let count = u32::from_be_bytes(value.get(4..8)?.try_into().ok()?) as usize;
+    let recs = value.get(8..)?;
+    if recs.len() < count * REC {
+        return None;
+    }
+    Some(
+        (0..count)
+            .map(|i| {
+                let rec = &recs[i * REC..i * REC + REC];
+                let name = &rec[1..];
+                let end = name.iter().position(|&b| b == 0).unwrap_or(name.len());
+                SavedWlan {
+                    radio_id: rec[0],
+                    ssid: String::from_utf8_lossy(&name[..end]).into_owned(),
+                }
+            })
+            .collect(),
+    )
+}
+
+/// Private 37 (AP resource information) value, live wire:
+/// `[radio u8][band type u8][channel u8][power u16]`. The band type byte is the
+/// same 0x06/0x09 selector `radio_cfg_variant` writes into the private radio
+/// record (0x06 = 2.4G, 0x09 = 5G). Instances: radio 1 `01 06 06 00 0d`
+/// (2.4G, channel 6, power 13), radio 2 `02 09 95 00 0f` (5G, channel 149,
+/// power 15). The AP reports it in the WTP Event Request every ~20 s.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApResInfo {
+    pub radio_id: u8,
+    pub band: Option<&'static str>,
+    pub channel: u32,
+    pub tx_power: i32,
+}
+
+/// Parse a private 37 (AP resource information) value. Returns `None` when the
+/// value is too short to hold the fixed five fields.
+pub fn parse_ap_res_info(value: &[u8]) -> Option<ApResInfo> {
+    if value.len() < 5 {
+        return None;
+    }
+    Some(ApResInfo {
+        radio_id: value[0],
+        band: match value[1] {
+            0x06 => Some("2.4G"),
+            0x09 => Some("5G"),
+            _ => None,
+        },
+        channel: value[2] as u32,
+        tx_power: u16::from_be_bytes([value[3], value[4]]) as i32,
+    })
+}
+
 /// Private radio-record base tags AC100 carries in the Configuration Update
 /// Request that brings a radio up. 0x0404 and 0x0406 have no RFC 5416 meaning
 /// and are TP-Link's own per-radio channel/transmit records; 0x0411 (MAC
@@ -990,5 +1114,61 @@ mod tests {
                 MsgElemType::VENDOR_SPECIFIC_PAYLOAD, // private 58
             ]
         );
+    }
+
+    #[test]
+    fn station_report_parses_radio_count_and_macs() {
+        // Live wire value with one station on radio 2: `02 00000001` then the
+        // 6-byte MAC and its RSSI byte.
+        let v = hex("0200000001 ee2281ceabaf cd");
+        let rep = parse_station_report(&v).unwrap();
+        assert_eq!(rep.radio_id, 2);
+        assert_eq!(
+            rep.stations,
+            vec![StationRecord {
+                mac: [0xee, 0x22, 0x81, 0xce, 0xab, 0xaf],
+                rssi: -51,
+            }]
+        );
+        // The no-station form is the bare 5-byte value.
+        let empty = parse_station_report(&hex("0100000000")).unwrap();
+        assert_eq!(empty.radio_id, 1);
+        assert!(empty.stations.is_empty());
+        // A count larger than the value carries is rejected, not half-read.
+        assert_eq!(parse_station_report(&hex("0200000002ee2281ceabafcd")), None);
+        assert_eq!(parse_station_report(&[]), None);
+        assert_eq!(parse_station_report(&hex("01")), None);
+    }
+
+    #[test]
+    fn wlan_list_parses_radio_ids_and_ssids() {
+        // Live wire value from the WTP's Configuration Status Request: a two-word
+        // header then two records of `[u8 radio_id][32B NUL-padded SSID]` holding
+        // "miniac", one per radio.
+        let mut v = hex("0000000100000002");
+        for id in [1u8, 2] {
+            v.push(id);
+            let mut name = [0u8; 32];
+            name[..6].copy_from_slice(b"miniac");
+            v.extend_from_slice(&name);
+        }
+        assert_eq!(
+            parse_wlan_list(&v).unwrap(),
+            vec![
+                SavedWlan {
+                    radio_id: 1,
+                    ssid: "miniac".into()
+                },
+                SavedWlan {
+                    radio_id: 2,
+                    ssid: "miniac".into()
+                },
+            ]
+        );
+        // A zero count is a valid empty list: a blank WTP holds no WLAN.
+        assert_eq!(parse_wlan_list(&hex("0000000100000000")).unwrap(), vec![]);
+        // A count larger than the records carried is rejected, not half-read.
+        assert_eq!(parse_wlan_list(&hex("0000000100000002016d696e696163")), None);
+        assert_eq!(parse_wlan_list(&hex("00000001")), None);
     }
 }

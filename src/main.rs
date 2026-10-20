@@ -66,6 +66,13 @@ fn is_dtls_frame(pkt: &[u8]) -> bool {
     pkt.first() == Some(&1)
 }
 
+/// Whether a datagram opens a new DTLS handshake: after the 4-byte CAPWAP DTLS
+/// header, a handshake record (content type 22) whose first message is a
+/// ClientHello (type 1).
+fn is_dtls_client_hello(pkt: &[u8]) -> bool {
+    is_dtls_frame(pkt) && pkt.get(4) == Some(&22) && pkt.get(17) == Some(&1)
+}
+
 /// Command-line settings: `-a` (repeatable) names the CAPWAP control bind
 /// addresses (the control port 5246 is fixed by RFC 5415), `-l` gives the
 /// web/API listen address (`ip[:port]` or `:port`), and `-D <file>` enables
@@ -347,10 +354,19 @@ async fn run_control_socket(
         };
 
         if let Some(tx) = tx {
-            if is_dtls_frame(&pkt) {
-                let _ = tx.try_send(pkt);
+            // A restarted peer begins again with a plaintext Discovery Request;
+            // from a live address that means its old session is gone, so drop it
+            // and answer. Anything else belongs to the live session.
+            if pkt.get(0) == Some(&0) && pkt.get(11) == Some(&1) {
+                info!("[<] from {}: Discovery Request on a live address, replacing session", peer);
+                dispatcher_map.lock().await.remove(&peer);
+                // fall through to answer the Discovery
+            } else {
+                if is_dtls_frame(&pkt) {
+                    let _ = tx.try_send(pkt);
+                }
+                continue;
             }
-            continue;
         }
 
         // 3. New Discovery
@@ -399,6 +415,13 @@ async fn run_control_socket(
         // Discovery refines it.
         let prof = VendorProfile::forced().or(known_profile).unwrap_or_default();
         if is_dtls_frame(&pkt) {
+            if !is_dtls_client_hello(&pkt) {
+                // Application data for a session we do not have (e.g. after an AC
+                // restart). No DTLS state to feed it into, so drop it; the peer
+                // re-discovers after its own timeout.
+                debug!("[<] from {}: dtls frame for unknown session, dropped", peer);
+                continue;
+            }
             info!("[<] from {}: direct dtls hello ({:?})", peer, prof);
             peer_profiles.lock().await.insert(peer.ip(), prof);
             let config = dtls_configs
@@ -548,6 +571,40 @@ fn configs_from_store(
     Ok(out)
 }
 
+/// Apply one TP-Link station report: upsert the reported stations and delete the
+/// ones the radio no longer reports, since each report is its complete associated
+/// set. Returns the change count so only real changes are logged.
+fn apply_station_report(
+    stations: &station::StationStore,
+    wmac: device::Mac,
+    rep: &vendor::tplink::StationReport,
+) -> Result<usize> {
+    let mut changed = 0;
+    for st in &rep.stations {
+        // The report carries the MAC and RSSI only, so the WLAN id is unknown (0)
+        // and the SSID/IP are filled in later from other sources.
+        if stations.upsert(
+            wmac,
+            st.mac,
+            rep.radio_id,
+            0,
+            "associated",
+            None,
+            None,
+            Some(st.rssi),
+        )? {
+            changed += 1;
+        }
+    }
+    for st in stations.list_by_wtp(wmac)? {
+        if st.radio_id == rep.radio_id && !rep.stations.iter().any(|r| r.mac == st.mac) {
+            stations.delete(wmac, st.mac)?;
+            changed += 1;
+        }
+    }
+    Ok(changed)
+}
+
 async fn handle_session(
     peer: SocketAddr,
     profile: vendor::profile::VendorProfile,
@@ -594,6 +651,8 @@ async fn handle_session(
     // UI-issued command awaiting its WTP response; a firmware-driven reset is
     // tracked separately by `fw_upgrade`/`fw_record_id`.
     let mut pending_cmd: Option<wtpcmd::WtpCmd> = None;
+    // WLANs the WTP reports already holding (TP-Link private 30).
+    let mut wtp_saved_wlans: Option<Vec<vendor::tplink::SavedWlan>> = None;
 
     loop {
         let retrans_duration = ctx
@@ -601,7 +660,7 @@ async fn handle_session(
             .as_ref()
             .filter(|last| MsgType::is_request(last.msg_type))
             .map(|last| {
-                ctx.retrans_interval
+                ctx.retrans_interval_for(last.retry_count)
                     .saturating_sub(last.send_time.elapsed())
             })
             .unwrap_or(Duration::from_secs(60));
@@ -629,8 +688,17 @@ async fn handle_session(
             sleep_duration = Duration::from_millis(1);
         }
 
+        // RFC 5415 4.5.3: one Request at a time. The management triggers below
+        // are gated so a new Request waits for the pending one's Response.
+        let outstanding = ctx.has_outstanding_request();
+
         tokio::select! {
-            Some(pkt) = rx.recv() => {
+            maybe_pkt = rx.recv() => {
+                // Channel closed: the dispatcher replaced this session.
+                let Some(pkt) = maybe_pkt else {
+                    info!("[*] with {}: session channel closed, ending", peer);
+                    return Ok(());
+                };
                 let app_datas = capdtls.feed(&pkt).await?;
                 if capdtls.handshake_complete() && !handshake_logged {
                     handshake_logged = true;
@@ -685,19 +753,62 @@ async fn handle_session(
                         continue;
                     };
 
-                    if let Some(ref last) = ctx.last_sent {
-                        if seq == last.seq && m_type == last.msg_type {
-                            if MsgType::is_response(last.msg_type) {
-                                warn!("[!] from {}: dup req (seq {}), resending response", peer, seq);
-                                capdtls.write(&last.buf).await?;
+                    // RFC 5415 4.5.3: replay the cached Response for a repeated
+                    // Request, ignore an older one, process a newer one. Ordering
+                    // is over the framing's counter width (RFC 256, H3C 2^32).
+                    if MsgType::is_request(m_type) {
+                        if let Some(last) = ctx.last_req_seq {
+                            if seq == last {
+                                match ctx.last_resp_buf.clone() {
+                                    Some(buf) => {
+                                        info!("[<] from {}: duplicate request (seq {}), replaying cached response", peer, seq);
+                                        capdtls.write(&buf).await?;
+                                    }
+                                    None => debug!("[<] from {}: duplicate request (seq {}) with no cached response", peer, seq),
+                                }
+                                continue;
+                            }
+                            if capwap::seq_is_older(seq, last, frame(profile)) {
+                                info!("[<] from {}: stale request (seq {} older than {}), ignored", peer, seq, last);
                                 continue;
                             }
                         }
+                        ctx.last_req_seq = Some(seq);
+                        ctx.last_resp_buf = None;
+                    }
+
+                    // RFC 5415 4.5.3: record each Response as handled, so its
+                    // retransmission does not re-run the state machine.
+                    if MsgType::is_response(m_type) {
+                        if ctx.last_resp_done == Some((seq, m_type)) {
+                            debug!("[<] from {}: duplicate response (seq {}), discarded", peer, seq);
+                            continue;
+                        }
+                        ctx.last_resp_done = Some((seq, m_type));
                     }
 
                     if MsgType::is_response(m_type) {
                         if let Some(last) = ctx.last_sent.as_ref().filter(|l| l.seq == seq && MsgType::is_request(l.msg_type)) {
                             info!("[<] from {}: received response for {:?} (seq {})", peer, last.msg_type, seq);
+                            // On success clear the pushed config tags from the
+                            // outstanding set; on a non-zero Result Code keep them
+                            // pending.
+                            if last.msg_type == MsgType::CONFIG_UPDATE_REQ {
+                                match vendor::h3c::ConfigUpdateResp::decode(&msg) {
+                                    Ok(r) if r.is_success() => {
+                                        cfg_status.mark_acked(cfg_status.pending().collect::<Vec<u16>>());
+                                        info!("[<] from {}: configuration update acked", peer);
+                                    }
+                                    Ok(r) => warn!(
+                                        "[!] from {}: configuration update rejected (result {})",
+                                        peer, r.result_code
+                                    ),
+                                    Err(e) => warn!(
+                                        "[!] from {}: configuration update response undecodable: {e}",
+                                        peer
+                                    ),
+                                }
+                            }
                             ctx.last_sent = None;
                         }
                     }
@@ -794,6 +905,33 @@ async fn handle_session(
                                 declared_radios.push((1, 1));
                             }
 
+                            // TP-Link reports the WLANs it already holds (private
+                            // 30) here; only TP-Link sends it.
+                            if profile == vendor::profile::VendorProfile::TpLink {
+                                wtp_saved_wlans = elems
+                                    .get(&MsgElemType::VENDOR_SPECIFIC_PAYLOAD)
+                                    .into_iter()
+                                    .flatten()
+                                    .filter_map(|e| match e {
+                                        CwElem::Unknown(_, v) => vendor::vsp::split_value(v),
+                                        _ => None,
+                                    })
+                                    .filter(|(vendor_id, _, _)| *vendor_id == vendor::tplink::VENDOR_ID)
+                                    .find_map(|(_, _, tlvs)| {
+                                        vendor::vsp::find(&tlvs, vendor::tplink::priv_id::WLAN_LIST)
+                                            .and_then(vendor::tplink::parse_wlan_list)
+                                    });
+                                match &wtp_saved_wlans {
+                                    Some(w) => info!(
+                                        "[*] WTP {} holds {} saved WLAN(s): {}",
+                                        peer,
+                                        w.len(),
+                                        w.iter().map(|s| format!("radio {}={}", s.radio_id, s.ssid)).collect::<Vec<_>>().join(", ")
+                                    ),
+                                    None => debug!("[*] WTP {} reported no saved WLAN list", peer),
+                                }
+                            }
+
                             let mac = ctx.mac.unwrap_or([0; 6]);
                             // On first contact with a WTP that carries no per-AP
                             // rows yet, seed them from the AC-wide global template
@@ -878,12 +1016,22 @@ async fn handle_session(
                             capdtls.write(&resp_buf).await?;
                             ctx.set_last_sent(&resp_msg, resp_buf);
                             cfg_status.mark_pushed([vendor::h3c::WLAN_CFG_H3C]);
+                            // The TP-Link form carries no WLAN configuration, so
+                            // the WLANs go out only in the later Run-entry push.
+                            let resp_wlans = if profile == vendor::profile::VendorProfile::TpLink {
+                                0
+                            } else {
+                                wlans.len()
+                            };
                             logx::device(format!(
-                                "pushed {} WLAN config(s) to {}",
-                                wlans.len(),
+                                "pushed {} WLAN config(s) to {} in the config response",
+                                resp_wlans,
                                 peer
                             ));
-                            info!("[>] to {}: config response with {} WLAN config(s) sent", peer, wlans.len());
+                            info!(
+                                "[>] to {}: config response with {} WLAN config(s) sent",
+                                peer, resp_wlans
+                            );
 
                             ctx.state = WtpState::DataCheck;
                             info!("[>] to {}: config resp sent, state -> DataCheck", peer);
@@ -907,9 +1055,10 @@ async fn handle_session(
                             ctx.state = WtpState::Run;
                             info!("[>] to {}: change state event resp sent, state -> Run", peer);
                             logx::device(format!("WTP {} entered Run state", peer));
-                            // Persist reachability for a MAC we know as of this peer.
+                            // Persist the runtime FSM state and reachability for a
+                            // MAC we know as of this peer.
                             if let Some(mac) = ctx.mac {
-                                devices.mark_joined(mac)?;
+                                devices.set_state(mac, "Run")?;
                             }
                             // Proceeding to Run means the pushed configuration was
                             // accepted; drop the outstanding push so it is not
@@ -940,21 +1089,21 @@ async fn handle_session(
                                         device::mac_to_str(mac)
                                     );
                                 }
-                                // Each radio starts administratively down and the
-                                // WTP's apply chain silently drops per-radio
-                                // WLAN/SSID configuration while it is down, so the
-                                // AC must bring the radio up before pushing WLANs.
-                                // AC100 does this with two Configuration Update
-                                // Requests per radio (a bare RADIO_ADMIN_STATE
-                                // then the private radio record), reproduced here
-                                // with the band channel taken from the AC's
-                                // channel config (ACS by default, fixed only when
-                                // the band is set manual), sent strictly one per
-                                // reply:
-                                // the WTP admits a single in-flight radio
-                                // operation and drops a record that arrives while
-                                // one is still running, which AC100's pacing
-                                // avoids. See `WtpContext::push_queue`.
+                                // WLANs are re-applied on Run entry. Add WLAN
+                                // (1024) overwrites its slot in place, so a
+                                // modification needs no Del (1027) - which is never
+                                // sent: on this WTP a delete clears the whole saved
+                                // table. The push is not skipped when the WTP
+                                // reports the same WLANs (private 30), because
+                                // radio bring-up re-initializes the VAPs and the
+                                // Adds must follow it.
+                                //
+                                // A radio starts admin-down and the WTP drops its
+                                // WLAN config while down, so each radio is brought
+                                // up first with a bare RADIO_ADMIN_STATE then the
+                                // private radio record, one Configuration Update
+                                // Request per reply (the WTP admits a single
+                                // in-flight radio op). See `WtpContext::push_queue`.
                                 for radio_id in 1..=2u8 {
                                     let channel = wcfg.effective_channel(mac, radio_id)?;
                                     let channel = vendor::tplink::channel_field(channel);
@@ -973,29 +1122,11 @@ async fn handle_session(
                                         ctx.push_msg(msg.encode_for(frame(profile)));
                                     }
                                 }
-                                // The WTP keeps its own WLAN table and Add WLAN
-                                // only appends to it, so the SSIDs its own table
-                                // still holds (the factory Guest_*) survive a
-                                // plain push. Del WLAN addresses those entries by
-                                // `{radio, wlan}` and Delete is the only message
-                                // that reaches them, so clear every slot on both
-                                // radios before adding the AC's set. Note this
-                                // cannot touch the WLANs held outside that table
-                                // (the built-in office1_*), which Add/Del never
-                                // see.
-                                for radio_id in 1..=2u8 {
-                                    for wlan_id in 1..=vendor::tplink::WLAN_IDS_PER_RADIO {
-                                        let del = vendor::tplink::wlan_config_del_request(
-                                            ctx.next_seq(),
-                                            radio_id,
-                                            wlan_id,
-                                        );
-                                        ctx.burst_msg(del.encode_for(frame(profile)));
-                                    }
-                                }
                                 for w in &wlans {
-                                    let req =
-                                        vendor::tplink::wlan_config_update_request(ctx.next_seq(), w);
+                                    let req = vendor::tplink::wlan_config_update_request(
+                                        ctx.next_seq(),
+                                        w,
+                                    );
                                     ctx.burst_msg(req.encode_for(frame(profile)));
                                 }
                                 let radios_queued = ctx.push_queue.len();
@@ -1004,7 +1135,7 @@ async fn handle_session(
                                     capdtls.write(&buf).await?;
                                 }
                                 info!(
-                                    "[>] to {}: {} radio bring-up message(s) serialized, {} WLAN/delete message(s) queued",
+                                    "[>] to {}: {} radio bring-up message(s) serialized, {} WLAN message(s) queued",
                                     peer, radios_queued, burst_queued
                                 );
                                 logx::device(format!(
@@ -1070,6 +1201,72 @@ async fn handle_session(
                                 };
                                 for item in items {
                                     debug!("[*] wtp event element {}: {:?}", label, item);
+                                }
+                            }
+                            // TP-Link reports two things here: the per-radio station
+                            // report (top-level element 51) and, every ~20 s, the
+                            // per-radio resource info (private 37). Both are
+                            // TP-Link-only (RFC id 51 is Transport Protocol).
+                            if profile == vendor::profile::VendorProfile::TpLink {
+                                let wmac = ctx.mac.unwrap_or([0; 6]);
+                                // Each report is the radio's complete associated
+                                // set: it refreshes the listed stations and drops
+                                // the rest.
+                                if let Some(items) = elems.get(&vendor::tplink::STATION_REPORT_TAG) {
+                                    for item in items {
+                                        if let CwElem::Unknown(_, v) = item {
+                                            match vendor::tplink::parse_station_report(v) {
+                                                Some(rep) => {
+                                                    match apply_station_report(&stations, wmac, &rep) {
+                                                        Ok(n) if n > 0 => logx::station(format!(
+                                                            "station report on {}: radio {} has {} station(s) ({} changed)",
+                                                            device::mac_to_str(wmac),
+                                                            rep.radio_id,
+                                                            rep.stations.len(),
+                                                            n
+                                                        )),
+                                                        Ok(_) => debug!(
+                                                            "[*] station report: radio {} has {} station(s), unchanged",
+                                                            rep.radio_id,
+                                                            rep.stations.len()
+                                                        ),
+                                                        Err(e) => warn!("[!] station report persist failed: {}", e),
+                                                    }
+                                                }
+                                                None => debug!(
+                                                    "[*] station report: malformed value ({}B)",
+                                                    v.len()
+                                                ),
+                                            }
+                                        }
+                                    }
+                                }
+                                // Private 37 records the radio's live band, channel
+                                // and TX power, so the web view shows the RF state
+                                // actually in use.
+                                if let Some(items) = elems.get(&MsgElemType::VENDOR_SPECIFIC_PAYLOAD) {
+                                    for item in items {
+                                        if let CwElem::Unknown(_, v) = item {
+                                            let Some((vendor_id, _, tlvs)) = vendor::vsp::split_value(v) else {
+                                                continue;
+                                            };
+                                            if vendor_id != vendor::tplink::VENDOR_ID {
+                                                continue;
+                                            }
+                                            let Some(ri) = vendor::vsp::find(&tlvs, vendor::tplink::priv_id::AP_RES_INFO)
+                                                .and_then(vendor::tplink::parse_ap_res_info)
+                                            else {
+                                                continue;
+                                            };
+                                            if let Err(e) = radios.set_rf(wmac, ri.radio_id, ri.band, ri.channel, ri.tx_power) {
+                                                warn!("[!] radio RF persist failed: {}", e);
+                                            }
+                                        }
+                                    }
+                                }
+                                // This traffic also proves the WTP is alive.
+                                if let Some(mac) = ctx.mac {
+                                    devices.mark_joined(mac)?;
                                 }
                             }
                             logx::device(format!("WTP {} reported events", peer));
@@ -1346,13 +1543,20 @@ async fn handle_session(
                     capdtls.on_timeout(now).await?;
                 }
 
+                let retrans_interval = ctx
+                    .last_sent
+                    .as_ref()
+                    .map(|last| ctx.retrans_interval_for(last.retry_count))
+                    .unwrap_or_default();
                 if let Some(ref mut last) = ctx.last_sent {
-                    if MsgType::is_request(last.msg_type) && now >= last.send_time + ctx.retrans_interval {
+                    if MsgType::is_request(last.msg_type) && now >= last.send_time + retrans_interval {
                         if last.retry_count < ctx.max_retries {
                             last.retry_count += 1;
                             last.send_time = now;
                             warn!("[>] to {}: retransmitting {:?} (seq {}, attempt {})",
                                 peer, last.msg_type, last.seq, last.retry_count);
+                            // Re-encrypted through DTLS so the peer does not drop
+                            // it as a replay (RFC 5415 4.5.3).
                             capdtls.write(&last.buf).await?;
                         } else {
                             error!("[!] with {}: max retries reached", peer);
@@ -1378,12 +1582,16 @@ async fn handle_session(
                         }
                     }
                 }
-                if ctx.state == WtpState::Run && now >= ctx.last_echo_sent + ctx.echo_interval {
+                if ctx.state == WtpState::Run
+                    && !outstanding
+                    && now >= ctx.last_echo_sent + ctx.echo_interval
+                {
                     // Active keep-alive: send an Echo Request each interval. It is
                     // not queued in `last_sent` (so unacknowledged echoes do not
                     // force a retransmit loop) — liveness is still gated by the
                     // inbound-traffic deadline below, which tolerates vendor
-                    // keep-alives that are not standard Echo Responses.
+                    // keep-alives that are not standard Echo Responses. Not sent
+                    // while a Request is outstanding (RFC 5415 4.5.3).
                     let echo = CtrlMsg::new(MsgType::ECHO_REQ, ctx.next_seq());
                     let echo_buf = echo.encode_for(frame(profile));
                     capdtls.write(&echo_buf).await?;
@@ -1396,7 +1604,7 @@ async fn handle_session(
                 }
             }
 
-            cmd = upgrade_rx.recv() => {
+            cmd = upgrade_rx.recv(), if !outstanding => {
                 match cmd {
                     Some(firmware::UpgradeCmd::Start { image }) => {
                         info!("[>] to {}: firmware download triggered via management plane", peer);
@@ -1414,7 +1622,7 @@ async fn handle_session(
                 }
             }
 
-            cmd = cfg_update_rx.recv() => {
+            cmd = cfg_update_rx.recv(), if !outstanding => {
                 match cmd {
                     Some(config::ConfigUpdateCmd::Push { elems }) => {
                         info!("[>] to {}: configuration update triggered via management plane", peer);
@@ -1430,7 +1638,7 @@ async fn handle_session(
                 }
             }
 
-            cmd = wtp_cmd_rx.recv() => {
+            cmd = wtp_cmd_rx.recv(), if !outstanding => {
                 match cmd {
                     Some(wtpcmd::WtpCmd::Reset) => {
                         info!("[>] to {}: reset requested via management plane", peer);

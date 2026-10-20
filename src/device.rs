@@ -29,9 +29,9 @@ pub struct Device {
     pub hw_version: Option<String>,
     pub sw_version: Option<String>,
     pub ip_addr: Option<String>,
-    /// Static DB lifecycle state (e.g. "registered"). The runtime CAPWAP FSM
-    /// (Join/Run/...) is deliberately NOT persisted; it lives only in memory
-    /// in `WtpContext::state`.
+    /// Last CAPWAP lifecycle state (e.g. "registered" on first join, "Run" once
+    /// the session reaches the Run state). The live FSM also lives in memory in
+    /// `WtpContext::state`; this column is the last state observed there.
     pub state: String,
     pub first_seen: u64,
     pub last_seen: u64,
@@ -129,9 +129,9 @@ impl DeviceStore {
     }
 
     /// Upsert device learned from the CAPWAP flow (`None` sw/ip leave existing
-    /// values intact). `state` records a static, DB-lifecycle value (e.g.
-    /// "registered"); the runtime CAPWAP FSM (join/run) is not persisted.
-    /// Returns `Ok(true)` when the device was newly created.
+    /// values intact). `state` records the lifecycle value observed so far (e.g.
+    /// "registered" on first join); later FSM transitions overwrite it via
+    /// [`Self::set_state`]. Returns `Ok(true)` when the device was newly created.
     pub fn register(
         &self,
         mac: Mac,
@@ -178,6 +178,19 @@ impl DeviceStore {
         conn.execute(
             "UPDATE devices SET joined_at = COALESCE(joined_at, ?2), last_seen = ?2 WHERE mac = ?1",
             params![&mac[..], ts],
+        )?;
+        Ok(())
+    }
+
+    /// Record the current CAPWAP lifecycle state and refresh `last_seen`;
+    /// `joined_at` keeps its first-join semantics.
+    pub fn set_state(&self, mac: Mac, state: &str) -> Result<()> {
+        let ts = now_unix() as i64;
+        let conn = self.db.lock();
+        conn.execute(
+            "UPDATE devices SET state = ?2, last_seen = ?3,
+                joined_at = COALESCE(joined_at, ?3) WHERE mac = ?1",
+            params![&mac[..], state, ts],
         )?;
         Ok(())
     }
