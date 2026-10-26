@@ -13,9 +13,11 @@ mod elements;
 mod firmware;
 mod fleet;
 mod logx;
+mod net;
 mod radio;
 mod roaming;
 mod security;
+mod settings;
 mod stage1;
 mod station;
 mod vendor;
@@ -38,9 +40,6 @@ use tracing::{debug, error, info, warn};
 
 use capwap::{CtrlMsg, CwElem, MsgElemType, MsgType, WtpContext, WtpState};
 use elements::BaseElem;
-
-const CTRL_PORT: u16 = 5246;
-const HTTP_DEFAULT_PORT: &str = "8080";
 
 /// Image name carried by a Reset Request's Image Identifier on the RFC and
 /// TP-Link paths (AC100 names its own software version there). H3C ignores it:
@@ -73,98 +72,6 @@ fn is_dtls_client_hello(pkt: &[u8]) -> bool {
     is_dtls_frame(pkt) && pkt.get(4) == Some(&22) && pkt.get(17) == Some(&1)
 }
 
-/// Command-line settings: `-a` (repeatable) names the CAPWAP control bind
-/// addresses (the control port 5246 is fixed by RFC 5415), `-l` gives the
-/// web/API listen address (`ip[:port]` or `:port`), and `-D <file>` enables
-/// plaintext control-message dumping for offline replay analysis.
-struct Cli {
-    control_ips: Vec<String>,
-    http_listen: Option<String>,
-    dump_file: Option<String>,
-}
-
-/// Value picked up from `-a` / `-l` / `-D` flags. Unknown flags are ignored.
-/// With no `-a`, the control plane defaults to all interfaces (0.0.0.0).
-fn parse_cli() -> Cli {
-    let mut cli = Cli {
-        control_ips: Vec::new(),
-        http_listen: None,
-        dump_file: None,
-    };
-    let mut args = std::env::args().skip(1);
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "-a" => {
-                if let Some(addr) = args.next() {
-                    cli.control_ips.push(addr);
-                }
-            }
-            "-l" => {
-                if let Some(addr) = args.next() {
-                    cli.http_listen = Some(addr);
-                }
-            }
-            "-D" => {
-                if let Some(path) = args.next() {
-                    cli.dump_file = Some(path);
-                }
-            }
-            _ => {}
-        }
-    }
-    if cli.control_ips.is_empty() {
-        cli.control_ips.push("0.0.0.0".to_string());
-    }
-    cli
-}
-
-/// Resolve the final `host:port` listen address for the web/API service from
-/// the `-l` argument, falling back to `MINIAC_HTTP_PORT` and then the default
-/// port bound to all interfaces.
-fn resolve_http_addr(listen: Option<String>) -> String {
-    let default_port =
-        std::env::var("MINIAC_HTTP_PORT").unwrap_or_else(|_| HTTP_DEFAULT_PORT.to_string());
-    let Some(listen) = listen else {
-        return format!("0.0.0.0:{default_port}");
-    };
-    if let Some(rest) = listen.strip_prefix(':') {
-        let port = if rest.is_empty() { &default_port } else { rest };
-        return format!("0.0.0.0:{port}");
-    }
-    match listen.rfind(':') {
-        Some(idx) => {
-            let (host, rest) = listen.split_at(idx);
-            let port = if rest.len() <= 1 {
-                &default_port
-            } else {
-                &rest[1..]
-            };
-            format!("{host}:{port}")
-        }
-        None => format!("{listen}:{default_port}"),
-    }
-}
-
-/// Parse the optional `MINIAC_WTP_NET` override (`a.b.c.d/prefix`) into a
-/// network base and prefix length, defaulting to 192.168.0.0/24.
-fn wtp_net_from_env() -> (std::net::Ipv4Addr, u8) {
-    let default = (std::net::Ipv4Addr::new(192, 168, 0, 0), 24u8);
-    let Some(v) = std::env::var("MINIAC_WTP_NET").ok() else {
-        return default;
-    };
-    let (ip, prefix) = match v.rsplit_once('/') {
-        Some((ip, p)) => (ip, p.parse().unwrap_or(24)),
-        None => (v.as_str(), 24),
-    };
-    let base: std::net::Ipv4Addr = ip.parse().unwrap_or(default.0);
-    (base, prefix)
-}
-
-/// Add a host offset to an IPv4 address (u32 host order).
-fn add_ip(ip: std::net::Ipv4Addr, delta: u32) -> std::net::Ipv4Addr {
-    std::net::Ipv4Addr::from(u32::from(ip).wrapping_add(delta))
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     // Honor RUST_LOG (e.g. RUST_LOG=debug) for runtime message-level tracing.
@@ -173,12 +80,26 @@ async fn main() -> Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
-    let cli = parse_cli();
+    let settings = settings::load()?;
 
-    if let Some(dump_path) = &cli.dump_file {
-        dump::open(dump_path)?;
-        info!("[*] plaintext control dump -> {dump_path}");
+    if let Some(dump_path) = &settings.dump_file {
+        let path = dump_path
+            .to_str()
+            .ok_or_else(|| anyhow!("dump path {} is not UTF-8", dump_path.display()))?;
+        dump::open(path)?;
+        info!("[*] plaintext control dump -> {}", dump_path.display());
     }
+    info!(
+        "[*] CAPWAP peer allow list: {:?}; binds {:?}{}",
+        settings.source.allow,
+        settings.capwap.binds,
+        settings
+            .capwap
+            .iface
+            .as_ref()
+            .map(|i| format!(" on {i}"))
+            .unwrap_or_default()
+    );
 
     // One DTLS identity per vendor profile: the detected device profile picks
     // the certificate directory (and whether the client certificate is pinned).
@@ -217,8 +138,12 @@ async fn main() -> Result<()> {
     logx::system("persistence initialized (miniac.db)".to_string());
 
     // M7: web management plane (REST + embedded frontend), shared store handles.
-    // Listen address from `-l ip[:port]` / `-l :port`, else $MINIAC_HTTP_PORT, else 0.0.0.0:8080.
-    let http_addr = resolve_http_addr(cli.http_listen);
+    // Defaults to loopback HTTP; HTTPS starts only when configured. A non-loopback
+    // bind has no authentication, so it is announced loudly at startup.
+    for warning in settings.web.warnings() {
+        warn!("[!] {warning}");
+        logx::system(warning);
+    }
     let web_state = std::sync::Arc::new(web::AppData::new(
         devices.clone(),
         radios.clone(),
@@ -231,70 +156,73 @@ async fn main() -> Result<()> {
         wcfg.clone(),
         caps.clone(),
     ));
-    tokio::spawn(web::serve(web_state, http_addr));
-
-    // M8: H3C FIT-AP stage-1 discovery responder. The WTP leases its own IP,
-    // gateway and the AC IP (DHCP-like) over the private port 10087 before it
-    // starts CAPWAP unicast on 5246. The allocatable pool defaults to
-    // 192.168.0.50..192.168.0.80 (persisted in miniac.db); the base/prefix is
-    // overridable via MINIAC_WTP_NET (e.g. 10.0.0.0/24).
-    let stage_bind = format!("0.0.0.0:{}", stage1::STAGE1_PORT);
     {
-        let (base, prefix) = wtp_net_from_env();
-        let gateway = add_ip(base, 1);
-        let ac_ip = add_ip(base, 2);
-        // The AC IP and gateway are the WTP's stage-1 DHCP-like lease fields; on
-        // real hardware they must equal miniac's own address / the network
-        // gateway on the WTP subnet, so override them via the environment when
-        // they differ from the base+2 / base+1 defaults.
-        let gateway = std::env::var("MINIAC_WTP_GW")
-            .ok()
-            .and_then(|v| v.parse::<std::net::Ipv4Addr>().ok())
-            .unwrap_or(gateway);
-        let ac_ip = std::env::var("MINIAC_WTP_AC")
-            .ok()
-            .and_then(|v| v.parse::<std::net::Ipv4Addr>().ok())
-            .unwrap_or(ac_ip);
-        // The pool defaults to base+50..base+80; override the bounds individually
-        // (MINIAC_WTP_POOL_START / MINIAC_WTP_POOL_END) so a site with a fixed,
-        // small range can be pinned without shifting the network base.
-        let pool_ip = |key: &str, default: std::net::Ipv4Addr| {
-            std::env::var(key)
-                .ok()
-                .and_then(|v| v.parse::<std::net::Ipv4Addr>().ok())
-                .unwrap_or(default)
-        };
-        let pool_start = pool_ip("MINIAC_WTP_POOL_START", add_ip(base, 50));
-        let pool_end = pool_ip("MINIAC_WTP_POOL_END", add_ip(base, 80));
-        let netmask = std::net::Ipv4Addr::from(0xffff_ffffu32 << (32 - prefix));
-        let pool = std::sync::Arc::new(stage1::AcPool::prefill(
-            db.clone(),
-            pool_start,
-            pool_end,
-            gateway,
-            netmask,
-            ac_ip,
-        )?);
-        info!(
-            "[*] stage-1 pool {}-{} gw {} ac {}",
-            pool_start, pool_end, gateway, ac_ip
-        );
-        let sb = stage_bind.clone();
+        let web_settings = settings.web.clone();
         tokio::spawn(async move {
-            if let Err(e) = stage1::serve(&sb, pool).await {
-                error!("stage-1 discovery server: {e}");
+            if let Err(e) = web::serve(web_state, web_settings).await {
+                error!("web server: {e}");
             }
         });
     }
 
-    // CAPWAP control plane: one UDP socket per `-a` address (RFC 5415 control
-    // port is fixed at 5246; only the bind address is configurable).
+    // M8: H3C FIT-AP stage-1 discovery responder. The WTP leases its own IP,
+    // gateway and the AC address (DHCP-like) over the private port 10087 before
+    // it starts CAPWAP unicast on 5246. The pool defaults to
+    // 192.168.0.50..192.168.0.80 (persisted in miniac.db); the AC address is
+    // the address the request arrived on, so a multihomed AC needs no override.
+    if settings.stage1.enabled {
+        let stage_bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), stage1::STAGE1_PORT);
+        let pool = std::sync::Arc::new(stage1::AcPool::prefill(
+            db.clone(),
+            settings.stage1.pool_start,
+            settings.stage1.pool_end,
+            settings.stage1.gateway,
+            settings.stage1.netmask(),
+        )?);
+        info!(
+            "[*] stage-1 pool {}-{} (net {}/{}) gw {}",
+            settings.stage1.pool_start,
+            settings.stage1.pool_end,
+            settings.stage1.net.0,
+            settings.stage1.net.1,
+            settings
+                .stage1
+                .gateway
+                .map(|g| g.to_string())
+                .unwrap_or_else(|| "ingress AC".to_string()),
+        );
+        let source = std::sync::Arc::new(settings.source.clone());
+        let iface = settings.capwap.iface.clone();
+        let net = settings.stage1.net;
+        tokio::spawn(async move {
+            if let Err(e) = stage1::serve(stage_bind, pool, source, iface, net).await {
+                error!("stage-1 discovery server: {e}");
+            }
+        });
+    } else {
+        info!("[*] stage-1 discovery responder disabled");
+    }
+
+    // CAPWAP control plane: one UDP socket per configured bind (RFC 5415 control
+    // port is fixed at 5246; only the bind address is configurable). With no
+    // bind, listen on the IPv4 and IPv6 wildcards to receive broadcast
+    // discovery; a specific unicast bind receives no broadcast, so discovery
+    // must then be unicast or DTLS to that address.
+    let source = std::sync::Arc::new(settings.source.clone());
     let mut control_tasks = Vec::new();
-    for ip in cli.control_ips {
-        let ctrl = format!("{ip}:{CTRL_PORT}");
-        let socket = Arc::new(UdpSocket::bind(&ctrl).await?);
-        info!("[!] miniac control listening on {ctrl}");
-        logx::system(format!("AC control listening on {ctrl}"));
+    for bind in &settings.capwap.binds {
+        let socket = match net::bind_udp(*bind, settings.capwap.iface.as_deref()) {
+            Ok(s) => Arc::new(s),
+            Err(e) if bind.ip().is_unspecified() && bind.is_ipv6() => {
+                // IPv6 may be disabled on the host; the IPv4 wildcard still
+                // serves the APs.
+                warn!("[!] CAPWAP bind {bind} unavailable, continuing without IPv6: {e}");
+                continue;
+            }
+            Err(e) => return Err(e.into()),
+        };
+        info!("[!] miniac control listening on {bind}");
+        logx::system(format!("AC control listening on {bind}"));
         control_tasks.push(tokio::spawn(run_control_socket(
             socket,
             dispatcher_map.clone(),
@@ -308,6 +236,8 @@ async fn main() -> Result<()> {
             cfg_update_reg.clone(),
             wtp_cmd_reg.clone(),
             wcfg.clone(),
+            source.clone(),
+            settings.h3c,
         )));
     }
 
@@ -334,11 +264,40 @@ async fn run_control_socket(
     cfg_update_reg: Arc<config::ConfigUpdateRegistry>,
     wtp_cmd_reg: Arc<wtpcmd::WtpCmdRegistry>,
     wcfg: Arc<wcfg::WirelessConfigStore>,
+    source: Arc<settings::SourceFilter>,
+    h3c: settings::H3cSettings,
 ) -> Result<()> {
     let mut buf = [0u8; 2048];
+    // Rate-limited log for dropped peers: an exposed AC must not let a remote
+    // scanner turn drops into unbounded log/CPU work.
+    let mut last_drop_log = Instant::now() - Duration::from_secs(60);
+    let mut dropped = 0u64;
     loop {
-        let (n, peer) = socket.recv_from(&mut buf).await?;
+        let (n, peer, info) = net::recv_from(&socket, &mut buf).await?;
+        if !source.permits(peer.ip(), &info) {
+            dropped += 1;
+            if last_drop_log.elapsed() >= Duration::from_secs(5) {
+                warn!(
+                    "[?] {} CAPWAP packet(s) from disallowed source(s) dropped (last {})",
+                    dropped, peer
+                );
+                dropped = 0;
+                last_drop_log = Instant::now();
+            }
+            continue;
+        }
         let pkt = buf[..n].to_vec();
+        // AC address(es) for this datagram: the destination for unicast, the
+        // ingress interface's addresses for broadcast/multicast. This lets a
+        // multihomed AC advertise only addresses the WTP can reach.
+        let mut ac_ips = net::ac_ipv4_list(&info, socket.local_addr().ok());
+        if ac_ips.is_empty() {
+            warn!(
+                "[!] from {}: no AC address on ifindex {}, falling back to 192.168.0.2",
+                peer, info.ifindex
+            );
+            ac_ips.push(Ipv4Addr::new(192, 168, 0, 2));
+        }
         use vendor::profile::VendorProfile;
 
         // Profile already detected for this peer's device, if any (in-session
@@ -376,26 +335,13 @@ async fn run_control_socket(
                 info!("[<] from {}: disc req", peer);
 
                 // The profile is detected from the device's own Discovery
-                // Request; an operator override (`MINIAC_VENDOR`) wins.
-                let prof =
-                    VendorProfile::forced().unwrap_or_else(|| VendorProfile::detect(&pkt));
+                // Request.
+                let prof = VendorProfile::detect(&pkt);
                 peer_profiles.lock().await.insert(peer.ip(), prof);
 
                 // The AC advertises its own control address (AC IPv4 List) so
                 // the WTP knows which destination to start DTLS/Join against.
-                // Prefer the operator override, else the bound interface IP,
-                // else the stage-1 default.
-                let ac_ip = std::env::var("MINIAC_WTP_AC")
-                    .ok()
-                    .and_then(|v| v.parse::<Ipv4Addr>().ok())
-                    .or_else(|| {
-                        socket.local_addr().ok().and_then(|a| match a.ip() {
-                            IpAddr::V4(v) if !v.is_unspecified() => Some(v),
-                            _ => None,
-                        })
-                    })
-                    .unwrap_or(Ipv4Addr::new(192, 168, 0, 2));
-                match prof.discovery_response(&pkt, ac_ip, b"My AC") {
+                match prof.discovery_response(&pkt, &ac_ips, b"My AC") {
                     Some(resp) => {
                         logx::device(format!("Discovery response to {} ({}B)", peer, resp.len()));
                         socket.send_to(&resp, peer).await?;
@@ -409,11 +355,10 @@ async fn run_control_socket(
         }
 
         // A fresh DTLS hello: reuse the profile detected at Discovery for this
-        // peer's address (WTPs often start DTLS from a new source port), else the
-        // operator override. A ClientHello carries no vendor information, so an
-        // unknown peer falls back to the vendor-neutral RFC profile until a
-        // Discovery refines it.
-        let prof = VendorProfile::forced().or(known_profile).unwrap_or_default();
+        // peer's address (WTPs often start DTLS from a new source port). A
+        // ClientHello carries no vendor information, so an unknown peer falls
+        // back to the vendor-neutral RFC profile until a Discovery refines it.
+        let prof = known_profile.unwrap_or_default();
         if is_dtls_frame(&pkt) {
             if !is_dtls_client_hello(&pkt) {
                 // Application data for a session we do not have (e.g. after an AC
@@ -442,6 +387,8 @@ async fn run_control_socket(
                 cfg_update_reg.clone(),
                 wtp_cmd_reg.clone(),
                 wcfg.clone(),
+                ac_ips[0],
+                h3c,
             )
             .await;
             let _ = tx.send(pkt).await;
@@ -516,6 +463,8 @@ async fn start_new_session(
     cfg_update: Arc<config::ConfigUpdateRegistry>,
     wtp_cmd: Arc<wtpcmd::WtpCmdRegistry>,
     wcfg: Arc<wcfg::WirelessConfigStore>,
+    ac_ip: Ipv4Addr,
+    h3c: settings::H3cSettings,
 ) -> mpsc::Sender<Vec<u8>> {
     let (tx, rx) = mpsc::channel(100);
     map.lock().await.insert(peer, tx.clone());
@@ -527,7 +476,7 @@ async fn start_new_session(
         info!("[*] with {}: session thread spawned ({:?})", peer, profile);
         if let Err(e) = handle_session(
             peer, profile, rx, sock_clone, conf_clone, devices, radios, stations, fw, upgrade,
-            cfg_update, wtp_cmd, wcfg,
+            cfg_update, wtp_cmd, wcfg, ac_ip, h3c,
         )
         .await
         {
@@ -619,6 +568,8 @@ async fn handle_session(
     cfg_update: Arc<config::ConfigUpdateRegistry>,
     wtp_cmd: Arc<wtpcmd::WtpCmdRegistry>,
     wcfg: Arc<wcfg::WirelessConfigStore>,
+    ac_ip: Ipv4Addr,
+    h3c: settings::H3cSettings,
 ) -> Result<()> {
     let local_addr = socket.local_addr()?;
     let mut capdtls = connection::CapwapDtls::new(local_addr, peer, socket, config);
@@ -728,14 +679,6 @@ async fn handle_session(
                     // Elements begin after the 8-byte base header plus the framed
                     // control header (RFC: 16; H3C: 19).
                     let elem_off = 8 + frame(profile).elem_off();
-                    let ac_ip = std::env::var("MINIAC_WTP_AC")
-                        .ok()
-                        .and_then(|v| v.parse::<Ipv4Addr>().ok())
-                        .or_else(|| match local_addr.ip() {
-                            IpAddr::V4(v) if !v.is_unspecified() => Some(v),
-                            _ => None,
-                        })
-                        .unwrap_or(Ipv4Addr::new(192, 168, 0, 2));
                     let elems = if let Some(schema) = capwap::MSG_SCHEMAS.get(&m_type) {
                         // Lenient: H3C AX60 packs many vendor/extra elements
                         // (30, and private IDs 45-131) that the RFC schema does
@@ -952,33 +895,15 @@ async fn handle_session(
                                     device::mac_to_str(mac)
                                 );
                             }
-                            // Build the Config Status Response in the M60 AC's
-                            // assembly order: [2][3][12][32][16][23][40][55] then
-                            // one 0xfde8 per radio/WLAN. The full assembly lives
-                            // in vendor::h3c::config_status_response.
-                            let g24_hdr = radios.h3c_header(mac, 1)?;
-                            let g5_hdr = radios.h3c_header(mac, 2)?;
                             // Advanced radio features (fe28 OFDMA/MU-MIMO, fe31
-                            // band navigation): driven by env overrides until a
-                            // DB source exists; all-zero or unset omits the
-                            // element.
-                            let ofdma = std::env::var("MINIAC_H3C_OFDMA")
-                                .ok()
-                                .and_then(|v| v.parse::<u32>().ok())
-                                .unwrap_or(0);
-                            let mumimo = std::env::var("MINIAC_H3C_MUMIMO")
-                                .ok()
-                                .and_then(|v| v.parse::<u32>().ok())
-                                .unwrap_or(0);
-                            let fe28 = if ofdma != 0 || mumimo != 0 {
-                                Some((ofdma, mumimo))
+                            // band navigation): configured in [h3c]; all-zero
+                            // omits the element.
+                            let fe28 = if h3c.ofdma != 0 || h3c.mumimo != 0 {
+                                Some((h3c.ofdma, h3c.mumimo))
                             } else {
                                 None
                             };
-                            let fe31 = std::env::var("MINIAC_H3C_LBD")
-                                .ok()
-                                .and_then(|v| v.parse::<u32>().ok())
-                                .filter(|&v| v != 0);
+                            let fe31 = (h3c.band_navigation != 0).then_some(h3c.band_navigation);
                             let resp_msg = match profile {
                                 // TP-Link WTPs accept only a narrow set of base
                                 // element types here (2/3/12/16/23/32/37/40) and
@@ -1004,9 +929,6 @@ async fn handle_session(
                                         peer,
                                         declared_radios: &declared_radios,
                                         wlans: &wlans,
-                                        g24_hdr: &g24_hdr,
-                                        g5_hdr: &g5_hdr,
-                                        wtp_mac: ctx.mac,
                                         fe28,
                                         fe31,
                                     },

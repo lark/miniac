@@ -9,13 +9,14 @@
 //! fixed 548-byte frame and holds LE network-order IP fields at the given
 //! offsets.
 
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::UdpSocket;
 use tracing::{info, warn};
 
 use crate::db::Db;
+use crate::settings::SourceFilter;
 use rusqlite::OptionalExtension;
 
 /// Private discovery port (dst on the wire, bound here by the AC).
@@ -48,12 +49,16 @@ pub const OFF_OPTIONS: usize = OFF_MAGIC + 4;
 pub const DHCP_COOKIE: [u8; 4] = [0x63, 0x82, 0x53, 0x63];
 
 /// The DHCP-like lease an AC grants a WTP during stage-1 discovery.
+///
+/// The AC address is not part of the persisted lease: it is the address the
+/// request arrived on (or the ingress interface address for a broadcast), and
+/// is supplied when the reply is built. The gateway defaults to that address
+/// unless the configuration pins one.
 #[derive(Debug, Clone, Copy)]
 pub struct Lease {
     pub wtp_ip: Ipv4Addr,
-    pub gateway: Ipv4Addr,
+    pub gateway: Option<Ipv4Addr>,
     pub netmask: Ipv4Addr,
-    pub ac_ip: Ipv4Addr,
 }
 
 /// Persistent stage-1 address pool. Allocatable IPs live in the `address_pool`
@@ -63,9 +68,8 @@ pub struct AcPool {
     db: Arc<Db>,
     start_ip: u32,
     end_ip: u32,
-    gateway: Ipv4Addr,
+    gateway: Option<Ipv4Addr>,
     netmask: Ipv4Addr,
-    ac_ip: Ipv4Addr,
 }
 
 fn now() -> i64 {
@@ -76,30 +80,30 @@ fn now() -> i64 {
 }
 
 impl AcPool {
-    /// Persist (upsert) the allocatable range plus gateway/netmask/AC IP as the
-    /// single pool row, and return a handle to it.
+    /// Persist (upsert) the allocatable range plus gateway/netmask as the single
+    /// pool row, and return a handle to it.
     pub fn prefill(
         db: Arc<Db>,
         start: Ipv4Addr,
         end: Ipv4Addr,
-        gateway: Ipv4Addr,
+        gateway: Option<Ipv4Addr>,
         netmask: Ipv4Addr,
-        ac_ip: Ipv4Addr,
     ) -> anyhow::Result<Self> {
         {
             let conn = db.lock();
+            // `ac_ip` is no longer configured (it follows the ingress address),
+            // so the retained column stores 0 to keep the single-row schema.
             conn.execute(
                 "INSERT INTO address_pool (id, start_ip, end_ip, gateway, netmask, ac_ip)
-                 VALUES (1, ?1, ?2, ?3, ?4, ?5)
+                 VALUES (1, ?1, ?2, ?3, ?4, 0)
                  ON CONFLICT(id) DO UPDATE SET
                    start_ip=excluded.start_ip, end_ip=excluded.end_ip,
-                   gateway=excluded.gateway, netmask=excluded.netmask, ac_ip=excluded.ac_ip",
+                   gateway=excluded.gateway, netmask=excluded.netmask, ac_ip=0",
                 rusqlite::params![
                     u32::from(start),
                     u32::from(end),
-                    u32::from(gateway),
+                    u32::from(gateway.unwrap_or(Ipv4Addr::UNSPECIFIED)),
                     u32::from(netmask),
-                    u32::from(ac_ip),
                 ],
             )?;
         }
@@ -109,7 +113,6 @@ impl AcPool {
             end_ip: u32::from(end),
             gateway,
             netmask,
-            ac_ip,
         })
     }
 
@@ -132,7 +135,6 @@ impl AcPool {
                 wtp_ip: Ipv4Addr::from(ip),
                 gateway: self.gateway,
                 netmask: self.netmask,
-                ac_ip: self.ac_ip,
             }));
         }
         let mut stmt = conn.prepare("SELECT ip FROM ap_leases")?;
@@ -151,19 +153,8 @@ impl AcPool {
             wtp_ip: Ipv4Addr::from(ip),
             gateway: self.gateway,
             netmask: self.netmask,
-            ac_ip: self.ac_ip,
         }))
     }
-}
-
-/// Derive a /N network mask from a prefix length.
-fn mask_for_prefix(prefix: u8) -> Ipv4Addr {
-    let v = if prefix >= 32 {
-        0xffff_ffffu32
-    } else {
-        0xffff_ffffu32 << (32 - prefix)
-    };
-    Ipv4Addr::from(v)
 }
 
 /// Format bytes as a lowercase hex string (diagnostics only).
@@ -199,9 +190,13 @@ fn dhcp_msg_type(frame: &[u8]) -> Option<u8> {
 
 /// Build a DHCPOFFER reply to a validated WTP discovery request, echoing the
 /// request header (xid, chaddr) and filling yiaddr (=leased WTP IP), siaddr
-/// (AC IP) and the required DHCP options. `request` must be `FRAME_LEN` bytes
+/// (=AC IP) and the required DHCP options. `request` must be `FRAME_LEN` bytes
 /// and carry the `REQ_MAGIC` header.
-pub fn build_reply(request: &[u8], lease: &Lease) -> Option<[u8; FRAME_LEN]> {
+///
+/// `ac_ip` is the address the request arrived on (or the ingress interface
+/// address for a broadcast), so a multihomed AC answers with the address the
+/// WTP can actually reach.
+pub fn build_reply(request: &[u8], lease: &Lease, ac_ip: Ipv4Addr) -> Option<[u8; FRAME_LEN]> {
     if request.len() != FRAME_LEN || request[..4] != REQ_MAGIC[..4] {
         return None;
     }
@@ -210,7 +205,8 @@ pub fn build_reply(request: &[u8], lease: &Lease) -> Option<[u8; FRAME_LEN]> {
     frame[0] = OP_REPLY; // BOOTREPLY
     let yi = lease.wtp_ip.octets();
     frame[OFF_YIADDR..OFF_YIADDR + 4].copy_from_slice(&yi);
-    let ac = lease.ac_ip.octets();
+    let ac = ac_ip.octets();
+    let gateway = lease.gateway.unwrap_or(ac_ip);
     frame[OFF_SIADDR..OFF_SIADDR + 4].copy_from_slice(&ac);
     frame[OFF_MAGIC..OFF_MAGIC + 4].copy_from_slice(&DHCP_COOKIE);
 
@@ -237,13 +233,13 @@ pub fn build_reply(request: &[u8], lease: &Lease) -> Option<[u8; FRAME_LEN]> {
         43,
         &[0x01, 0x07, 0x00, 0x00, 0x01, ac[0], ac[1], ac[2], ac[3]],
     );
-    put(3, &lease.gateway.octets());
+    put(3, &gateway.octets());
     put(1, &lease.netmask.octets());
     put(51, &3600u32.to_be_bytes()); // lease time (s)
                                      // Option 6: DNS server. The AP's DHCP option-55 list requests it; serving
                                      // it (in addition to the often-stated minimum) keeps the lease "complete"
                                      // enough for the AP to proceed from stage-1 to CAPWAP.
-    put(6, &lease.gateway.octets());
+    put(6, &gateway.octets());
     frame[o] = 0xff; // END
     Some(frame)
 }
@@ -299,18 +295,43 @@ fn send_broadcast_reply(sock: &UdpSocket, src: Ipv4Addr, port: u16, payload: &[u
 
 /// Run the stage-1 discovery loop: bind the private port, lease each WTP that
 /// presents a valid discovery frame, and reply with the lease.
-pub async fn serve(bind_addr: &str, pool: Arc<AcPool>) -> anyhow::Result<()> {
-    // Bind the wildcard so the WTP's broadcast request (dst 255.255.255.255) is
-    // delivered: a socket bound to a specific address does not receive it.
-    let sock = UdpSocket::bind(bind_addr).await?;
+///
+/// The wildcard address must stay bound so a broadcast request (dst
+/// 255.255.255.255) is delivered; `iface` scopes it to one link, which also
+/// lets several miniac instances share the port. `net` is the WTP subnet used
+/// to pick the ingress address that becomes the lease's AC address.
+pub async fn serve(
+    bind_addr: SocketAddr,
+    pool: Arc<AcPool>,
+    source: Arc<SourceFilter>,
+    iface: Option<String>,
+    net: (Ipv4Addr, u8),
+) -> anyhow::Result<()> {
+    let sock = crate::net::bind_udp(bind_addr, iface.as_deref())?;
     sock.set_broadcast(true)?;
     info!(
-        "[!] stage-1 discovery listening on {} (port {})",
-        bind_addr, STAGE1_PORT
+        "[!] stage-1 discovery listening on {} (port {}), allow {:?}",
+        bind_addr, STAGE1_PORT, source.allow
     );
     let mut buf = vec![0u8; FRAME_LEN];
+    let mut last_drop_log = Instant::now() - Duration::from_secs(60);
+    let mut dropped = 0u64;
     loop {
-        let (n, peer) = sock.recv_from(&mut buf).await?;
+        let (n, peer, info) = crate::net::recv_from(&sock, &mut buf).await?;
+        // The WTP has no address yet and broadcasts from 0.0.0.0, so the source
+        // filter falls back to the ingress interface address.
+        if !source.permits(peer.ip(), &info) {
+            dropped += 1;
+            if last_drop_log.elapsed() >= Duration::from_secs(5) {
+                warn!(
+                    "[?] stage-1: {} request(s) from disallowed source(s) dropped (last {})",
+                    dropped, peer
+                );
+                dropped = 0;
+                last_drop_log = Instant::now();
+            }
+            continue;
+        }
         // Our own broadcast BOOTREPLYs (op=0x02) loop back to the bound socket;
         // skip them. The AP always sends BOOTREQUEST (op=0x01).
         if buf[0] == 0x02 {
@@ -338,15 +359,25 @@ pub async fn serve(bind_addr: &str, pool: Arc<AcPool>) -> anyhow::Result<()> {
         );
         // The WTP broadcasts from 0.0.0.0 (no assigned address yet), so it may
         // only accept the limited broadcast; reply to 255.255.255.255 on both the
-        // port it asked from and the well-known stage-1 port.
+        // port it asked from and the well-known stage-1 port. The AC address is
+        // the ingress interface address inside the WTP subnet: the WTP must be
+        // able to reach it, and with several links on one AC only that one is.
+        let candidates = crate::net::ac_ipv4_list(&info, sock.local_addr().ok());
+        let Some(ac_ip) = crate::net::select_ipv4(&candidates, Some(net)) else {
+            warn!(
+                "[!] stage-1 from {}: no ingress address on ifindex {}, cannot name the AC",
+                peer, info.ifindex
+            );
+            continue;
+        };
         match pool.lease_for_mac(mac) {
             Ok(Some(lease)) => {
-                if let Some(reply) = build_reply(&buf, &lease) {
+                if let Some(reply) = build_reply(&buf, &lease, ac_ip) {
                     for port in [peer.port(), STAGE1_PORT] {
-                        match send_broadcast_reply(&sock, lease.ac_ip, port, &reply) {
+                        match send_broadcast_reply(&sock, ac_ip, port, &reply) {
                             Ok(()) => info!(
                                 "[>] stage-1 lease {} -> 255.255.255.255:{} (ac {})",
-                                lease.wtp_ip, port, lease.ac_ip
+                                lease.wtp_ip, port, ac_ip
                             ),
                             Err(e) => warn!(
                                 "[!] stage-1 reply to 255.255.255.255:{} failed: {}",
@@ -368,14 +399,17 @@ mod tests {
     use crate::db::Db;
 
     fn pool() -> (Arc<Db>, AcPool) {
+        pool_with_gateway(Some(Ipv4Addr::new(192, 168, 0, 1)))
+    }
+
+    fn pool_with_gateway(gateway: Option<Ipv4Addr>) -> (Arc<Db>, AcPool) {
         let db = Arc::new(Db::open_in_memory().unwrap());
         let p = AcPool::prefill(
             db.clone(),
             Ipv4Addr::new(192, 168, 0, 50),
             Ipv4Addr::new(192, 168, 0, 80),
-            Ipv4Addr::new(192, 168, 0, 1),
-            mask_for_prefix(24),
-            Ipv4Addr::new(192, 168, 0, 2),
+            gateway,
+            Ipv4Addr::new(255, 255, 255, 0),
         )
         .unwrap();
         (db, p)
@@ -388,8 +422,7 @@ mod tests {
         let l1 = p.lease_for_mac(a).unwrap().unwrap();
         let l2 = p.lease_for_mac(a).unwrap().unwrap();
         assert_eq!(l1.wtp_ip, l2.wtp_ip);
-        assert_eq!(l1.gateway, Ipv4Addr::new(192, 168, 0, 1));
-        assert_eq!(l1.ac_ip, Ipv4Addr::new(192, 168, 0, 2));
+        assert_eq!(l1.gateway, Some(Ipv4Addr::new(192, 168, 0, 1)));
     }
 
     #[test]
@@ -429,20 +462,18 @@ mod tests {
             .lease_for_mac([0xc4, 0xc0, 0x63, 0xef, 0xca, 0x25])
             .unwrap()
             .unwrap();
-        let reply = build_reply(&req, &lease).unwrap();
+        let ac_ip = Ipv4Addr::new(192, 168, 0, 254);
+        let reply = build_reply(&req, &lease, ac_ip).unwrap();
         assert_eq!(reply[0], OP_REPLY, "BOOTREPLY op");
         assert_eq!(&reply[OFF_YIADDR..OFF_YIADDR + 4], &lease.wtp_ip.octets());
-        assert_eq!(&reply[OFF_SIADDR..OFF_SIADDR + 4], &lease.ac_ip.octets());
+        assert_eq!(&reply[OFF_SIADDR..OFF_SIADDR + 4], &ac_ip.octets());
         // chaddr must be preserved (the WTP board MAC), not clobbered.
         assert_eq!(&reply[0x1c..0x22], &[0xc4, 0xc0, 0x63, 0xef, 0xca, 0x25]);
         assert_eq!(&reply[OFF_MAGIC..OFF_MAGIC + 4], &DHCP_COOKIE);
         // Option 53 = DHCPOFFER, option 54 = server identifier (AC IP).
         assert_eq!(&reply[OFF_OPTIONS..OFF_OPTIONS + 3], &[53, 1, OP_REPLY]);
         assert_eq!(&reply[OFF_OPTIONS + 3..OFF_OPTIONS + 5], &[54, 4]);
-        assert_eq!(
-            &reply[OFF_OPTIONS + 5..OFF_OPTIONS + 9],
-            &lease.ac_ip.octets()
-        );
+        assert_eq!(&reply[OFF_OPTIONS + 5..OFF_OPTIONS + 9], &ac_ip.octets());
         // Option 60 "H3C" and option 43 (AC IP count + AC IP) must be present.
         let mut i = OFF_OPTIONS;
         while i < OFF_OPTIONS + 48 {
@@ -460,7 +491,7 @@ mod tests {
                 assert_eq!(len, 9);
                 assert_eq!(&reply[i + 2..i + 6], &[0x01, 0x07, 0x00, 0x00]);
                 assert_eq!(reply[i + 6], 1); // single AC
-                assert_eq!(&reply[i + 7..i + 11], &lease.ac_ip.octets());
+                assert_eq!(&reply[i + 7..i + 11], &ac_ip.octets());
             }
             i += 2 + len;
         }
@@ -472,6 +503,36 @@ mod tests {
         req[0] = 0xff; // wrong header
         let (_db, p) = pool();
         let lease = p.lease_for_mac([0u8; 6]).unwrap().unwrap();
-        assert!(build_reply(&req, &lease).is_none());
+        assert!(build_reply(&req, &lease, Ipv4Addr::LOCALHOST).is_none());
+    }
+
+    #[test]
+    fn reply_uses_ingress_ac_and_gateway_default() {
+        // No configured gateway: the AC address is the gateway (and DNS) too.
+        let (_db, p) = pool_with_gateway(None);
+        let mut req = [0u8; FRAME_LEN];
+        req[..8].copy_from_slice(&REQ_MAGIC);
+        let lease = p.lease_for_mac([0x02, 0, 0, 0, 0, 1]).unwrap().unwrap();
+        let ac_ip = Ipv4Addr::new(10, 0, 0, 7);
+        let reply = build_reply(&req, &lease, ac_ip).unwrap();
+        assert_eq!(&reply[OFF_SIADDR..OFF_SIADDR + 4], &ac_ip.octets());
+        // Option 3 (gateway) follows the server identifier and vendor class in
+        // the options area; locate it by code.
+        let mut i = OFF_OPTIONS;
+        let mut gateway = None;
+        while i < reply.len() && reply[i] != 0xff {
+            let code = reply[i];
+            let len = reply[i + 1] as usize;
+            if code == 3 && len == 4 {
+                gateway = Some(Ipv4Addr::new(
+                    reply[i + 2],
+                    reply[i + 3],
+                    reply[i + 4],
+                    reply[i + 5],
+                ));
+            }
+            i += 2 + len;
+        }
+        assert_eq!(gateway, Some(ac_ip));
     }
 }

@@ -11,8 +11,6 @@
 //! When several vendors' WTPs meet one miniac, the profile is detected per
 //! device from its Discovery/Join Request (see [`VendorProfile::detect`]); a
 //! device whose vendor has no custom form falls back to the RFC profile.
-//! `MINIAC_VENDOR` remains as an operator/test override that forces one profile
-//! for every device.
 
 use std::net::Ipv4Addr;
 use std::path::Path;
@@ -38,20 +36,6 @@ pub enum VendorProfile {
 }
 
 impl VendorProfile {
-    /// Operator/test override from `MINIAC_VENDOR` (`h3c` | `tplink` | `rfc`).
-    ///
-    /// `None` when unset or unrecognized, which is the normal case: the profile
-    /// is then detected per device from its Discovery/Join Request.
-    pub fn forced() -> Option<Self> {
-        let value = std::env::var("MINIAC_VENDOR").ok()?;
-        match value.to_ascii_lowercase().as_str() {
-            "h3c" => Some(VendorProfile::H3c),
-            "tplink" | "tp-link" => Some(VendorProfile::TpLink),
-            "rfc" | "generic" => Some(VendorProfile::Rfc),
-            _ => None,
-        }
-    }
-
     /// Detect the profile a WTP speaks from its Discovery/Join Request.
     ///
     /// The control framing is the primary signal: H3C AX60-style WTPs widen the
@@ -117,11 +101,11 @@ impl VendorProfile {
     pub fn discovery_response(
         self,
         req: &[u8],
-        ac_ip: Ipv4Addr,
+        ac_ips: &[Ipv4Addr],
         ac_name: &[u8],
     ) -> Option<Vec<u8>> {
         match self {
-            VendorProfile::H3c => h3c::discovery_response(req, ac_ip, ac_name),
+            VendorProfile::H3c => h3c::discovery_response(req, ac_ips, ac_name),
             VendorProfile::TpLink | VendorProfile::Rfc => {
                 // RFC 5415 Discovery Request: 8-byte base header, Message Type at
                 // [8..12] (Discovery Request = 1), 1-byte sequence at [12].
@@ -133,7 +117,7 @@ impl VendorProfile {
                     _ => 0,
                 };
                 Some(
-                    config::discovery_response(req[12] as u32, ac_ip, ac_name, vendor_id)
+                    config::discovery_response(req[12] as u32, ac_ips, ac_name, vendor_id)
                         .encode_for(self.frame()),
                 )
             }
@@ -453,7 +437,7 @@ mod tests {
         let ac_ip = Ipv4Addr::new(192, 168, 0, 2);
 
         let rfc = VendorProfile::Rfc
-            .discovery_response(&req, ac_ip, b"miniac")
+            .discovery_response(&req, &[ac_ip], b"miniac")
             .expect("rfc response");
         // RFC base header, Message Type 2 and the echoed sequence.
         assert_eq!(&rfc[0..8], &[0x00, 0x10, 0x03, 0x00, 0, 0, 0, 0]);
@@ -465,7 +449,7 @@ mod tests {
         // The TP-Link form is the same shape but carries its enterprise number
         // in the AC Descriptor's AC Information sub-elements.
         let tp = VendorProfile::TpLink
-            .discovery_response(&req, ac_ip, b"miniac")
+            .discovery_response(&req, &[ac_ip], b"miniac")
             .expect("tplink response");
         let tp_msg = CtrlMsg::decode(CtrlFrame::Rfc, &tp[8..]).expect("decode");
         let desc = tp_msg
@@ -477,7 +461,9 @@ mod tests {
         // A malformed request (not a Discovery Request) is rejected.
         let mut bad = req;
         bad[11] = 3;
-        assert!(VendorProfile::Rfc.discovery_response(&bad, ac_ip, b"miniac").is_none());
+        assert!(VendorProfile::Rfc
+            .discovery_response(&bad, &[ac_ip], b"miniac")
+            .is_none());
     }
 
     #[test]

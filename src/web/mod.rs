@@ -7,18 +7,28 @@
 //! their own (MAC-as-`[u8;6]`) types; handlers map results to lightweight
 //! `serde` DTOs here so no `Serialize` derive leaks into the data layer.
 
-use std::sync::Arc;
+use std::{
+    ffi::CStr,
+    fs,
+    net::SocketAddr,
+    path::{Path as FsPath, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
-use anyhow::Result;
+use anyhow::{anyhow, bail, Context, Result};
 use axum::{
     extract::{Multipart, Path, Query, State},
     http::StatusCode,
     response::{Html, IntoResponse},
     routing::{get, post},
+    serve::Listener,
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use tokio::net::TcpListener;
+use sha2::{Digest, Sha256};
+use tokio::net::{TcpListener, TcpStream};
+use tokio_rustls::{server::TlsStream, TlsAcceptor};
 
 use crate::config::{Akm, Cipher, Pmf, SecurityPolicy, ConfigUpdateCmd, ConfigUpdateRegistry};
 use crate::fleet::{ClientGroup, ProductCapsStore};
@@ -29,6 +39,7 @@ use crate::firmware::{FirmwareStore, UpgradeCmd, UpgradeRegistry};
 use crate::logx;
 use crate::radio::{H3cRadioHeader, RadioStore, RadioWlan};
 use crate::security::ProfileStore;
+use crate::settings::{ListenAddr, WebSettings};
 use crate::station::StationStore;
 use crate::wcfg::{ApOverride, Band, GlobalRadio, GlobalWlan, WirelessConfigStore};
 use crate::wtpcmd::{WtpCmd, WtpCmdRegistry};
@@ -1525,13 +1536,207 @@ async fn commit_wcfg(
     Ok(Json(CommitResult { pushed, offline }))
 }
 
-/// Spawn the HTTP service bound to `addr` sharing `state`; returns on bind error.
-pub async fn serve(state: Arc<AppData>, addr: String) -> Result<()> {
-    let listener = TcpListener::bind(&addr).await?;
+/// Serve the management plane. HTTP is always on; HTTPS starts when configured.
+/// A missing certificate/key pair is generated (self-signed) and persisted, so
+/// the same identity is reused on the next start.
+pub async fn serve(state: Arc<AppData>, settings: WebSettings) -> Result<()> {
     let app = router(state);
-    logx::admin(format!("web management plane listening on http://{addr}"));
-    axum::serve(listener, app).await?;
+    let http = TcpListener::bind(settings.http.socket_addr())
+        .await
+        .with_context(|| format!("bind web http on {}", settings.http))?;
+    logx::admin(format!(
+        "web management plane listening on http://{}",
+        settings.http
+    ));
+    let Some(https) = settings.https else {
+        axum::serve(http, app).await?;
+        return Ok(());
+    };
+
+    let (certs, key, fingerprint) = load_or_create_identity(&settings, https)?;
+    let tls = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(|e| anyhow!("invalid TLS certificate/key: {e}"))?;
+    let listener = TcpListener::bind(https.socket_addr())
+        .await
+        .with_context(|| format!("bind web https on {https}"))?;
+    logx::admin(format!(
+        "web management plane listening on https://{https} (cert sha256 {fingerprint})"
+    ));
+    let tls_listener = TlsListener {
+        inner: listener,
+        acceptor: TlsAcceptor::from(Arc::new(tls)),
+    };
+    // HTTP and HTTPS run side by side; either one ending is fatal.
+    let http_app = app.clone();
+    let https_app = app;
+    tokio::try_join!(
+        async { axum::serve(http, http_app).await.map_err(anyhow::Error::from) },
+        async { axum::serve(tls_listener, https_app).await.map_err(anyhow::Error::from) },
+    )?;
     Ok(())
+}
+
+/// A TCP listener that completes the TLS handshake before yielding a connection.
+struct TlsListener {
+    inner: TcpListener,
+    acceptor: TlsAcceptor,
+}
+
+impl Listener for TlsListener {
+    type Io = TlsStream<TcpStream>;
+    type Addr = SocketAddr;
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        loop {
+            let (tcp, addr) = match self.inner.accept().await {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!("web TLS accept: {e}");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+            };
+            match self.acceptor.accept(tcp).await {
+                Ok(tls) => return (tls, addr),
+                Err(e) => {
+                    // Typically a client that speaks plain HTTP to the TLS port
+                    // or drops mid-handshake; keep serving others.
+                    tracing::debug!("web TLS handshake from {addr} failed: {e}");
+                }
+            }
+        }
+    }
+
+    fn local_addr(&self) -> std::io::Result<Self::Addr> {
+        self.inner.local_addr()
+    }
+}
+
+/// Load the configured certificate/key, or create a persistent self-signed pair
+/// when neither file exists. Returns the chain, key, and leaf SHA-256 fingerprint.
+fn load_or_create_identity(
+    settings: &WebSettings,
+    bind: ListenAddr,
+) -> Result<(Vec<rustls::pki_types::CertificateDer<'static>>, rustls::pki_types::PrivateKeyDer<'static>, String)> {
+    let cert_path = settings
+        .https_cert
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("certs/web/cert.pem"));
+    let key_path = settings
+        .https_key
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("certs/web/key.pem"));
+
+    match (cert_path.is_file(), key_path.is_file()) {
+        (true, true) => {
+            tracing::info!("[*] web TLS: using {}", cert_path.display());
+        }
+        (false, false) => {
+            generate_self_signed(&cert_path, &key_path, bind)?;
+            tracing::info!(
+                "[*] web TLS: generated self-signed certificate {}",
+                cert_path.display()
+            );
+        }
+        _ => bail!(
+            "TLS certificate/key must both exist: {} and {}",
+            cert_path.display(),
+            key_path.display()
+        ),
+    }
+
+    let certs = load_pem_certs(&cert_path)?;
+    let fingerprint = fingerprint(certs[0].as_ref());
+    let key = load_pem_key(&key_path)?;
+    Ok((certs, key, fingerprint))
+}
+
+fn load_pem_certs(path: &FsPath) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>> {
+    let data = fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    let blocks = pem::parse_many(&data).with_context(|| format!("parse PEM {}", path.display()))?;
+    let mut out = Vec::new();
+    for block in blocks {
+        if block.tag() == "CERTIFICATE" {
+            out.push(rustls::pki_types::CertificateDer::from(block.into_contents()));
+        }
+    }
+    if out.is_empty() {
+        bail!("no CERTIFICATE block in {}", path.display());
+    }
+    Ok(out)
+}
+
+fn load_pem_key(path: &FsPath) -> Result<rustls::pki_types::PrivateKeyDer<'static>> {
+    use rustls::pki_types::{PrivateKeyDer, PrivatePkcs1KeyDer, PrivatePkcs8KeyDer, PrivateSec1KeyDer};
+    let data = fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    let blocks = pem::parse_many(&data).with_context(|| format!("parse PEM {}", path.display()))?;
+    for block in blocks {
+        let tag = block.tag().to_string();
+        let der = block.into_contents();
+        match tag.as_str() {
+            "PRIVATE KEY" => return Ok(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(der))),
+            "RSA PRIVATE KEY" => return Ok(PrivateKeyDer::Pkcs1(PrivatePkcs1KeyDer::from(der))),
+            "EC PRIVATE KEY" => return Ok(PrivateKeyDer::Sec1(PrivateSec1KeyDer::from(der))),
+            _ => {}
+        }
+    }
+    bail!("no private key block in {}", path.display())
+}
+
+/// Create a self-signed certificate covering loopback, the bind address and the
+/// host name, and write certificate and key as PEM.
+fn generate_self_signed(cert_path: &FsPath, key_path: &FsPath, bind: ListenAddr) -> Result<()> {
+    let mut sans = vec!["localhost".to_string(), "127.0.0.1".to_string(), "::1".to_string()];
+    if !bind.addr.is_unspecified() {
+        let addr = bind.addr.to_string();
+        if !sans.contains(&addr) {
+            sans.push(addr);
+        }
+    }
+    if let Some(name) = hostname() {
+        if !sans.contains(&name) {
+            sans.push(name);
+        }
+    }
+    let key = rcgen::KeyPair::generate()?;
+    let mut params = rcgen::CertificateParams::new(sans)?;
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "miniac");
+    let cert = params.self_signed(&key)?;
+
+    for path in [cert_path, key_path] {
+        if let Some(dir) = path.parent() {
+            fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+        }
+    }
+    fs::write(cert_path, cert.pem()).with_context(|| format!("write {}", cert_path.display()))?;
+    fs::write(key_path, key.serialize_pem())
+        .with_context(|| format!("write {}", key_path.display()))?;
+    Ok(())
+}
+
+fn hostname() -> Option<String> {
+    let mut buf = [0 as libc::c_char; 256];
+    let rc = unsafe { libc::gethostname(buf.as_mut_ptr(), buf.len()) };
+    if rc != 0 {
+        return None;
+    }
+    let name = unsafe { CStr::from_ptr(buf.as_ptr()) }
+        .to_string_lossy()
+        .into_owned();
+    (!name.is_empty()).then_some(name)
+}
+
+/// Colon-separated uppercase hex SHA-256 of a DER certificate.
+fn fingerprint(der: &[u8]) -> String {
+    Sha256::digest(der)
+        .iter()
+        .map(|b| format!("{b:02X}"))
+        .collect::<Vec<_>>()
+        .join(":")
 }
 
 #[cfg(test)]
@@ -1556,6 +1761,37 @@ mod tests {
             Arc::new(WirelessConfigStore::new(db.clone())),
             Arc::new(ProductCapsStore::new(db.clone())),
         ))
+    }
+
+    #[test]
+    fn self_signed_identity_is_reused() {
+        let dir = std::env::temp_dir().join(format!(
+            "miniac-tls-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let cert = dir.join("cert.pem");
+        let key = dir.join("key.pem");
+        let loopback = ListenAddr {
+            addr: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            port: 8443,
+        };
+        let settings = WebSettings {
+            http: ListenAddr {
+                addr: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                port: 8246,
+            },
+            https: Some(loopback),
+            https_cert: Some(cert.clone()),
+            https_key: Some(key.clone()),
+        };
+        let (_, _, first_fp) = load_or_create_identity(&settings, loopback).unwrap();
+        let first = fs::read(&cert).unwrap();
+        let (_, _, second_fp) = load_or_create_identity(&settings, loopback).unwrap();
+        assert_eq!(first_fp, second_fp);
+        assert_eq!(first, fs::read(&cert).unwrap());
+        assert!(key.is_file());
+        fs::remove_dir_all(dir).ok();
     }
 
     /// POST helper returning the response for a request with no body.

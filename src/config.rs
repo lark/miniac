@@ -464,17 +464,27 @@ pub fn control_ipv4_entry(ip: Ipv4Addr, wtp_count: u16) -> Vec<u8> {
 /// Generic (RFC 5415 8.1) Discovery Response (mtype 2) for the vendor-neutral
 /// and TP-Link paths: AC Name (4), AC Descriptor (1), CAPWAP Control IPv4
 /// Address (10). H3C keeps its own header-mirroring builder.
-pub fn discovery_response(seq: u32, ac_ip: Ipv4Addr, ac_name: &[u8], vendor_id: u32) -> CtrlMsg {
+///
+/// Element 10 may carry several entries, one per AC address, when the AC is
+/// multihomed (e.g. a discovery broadcast arrived on an interface with more
+/// than one address).
+pub fn discovery_response(
+    seq: u32,
+    ac_ips: &[Ipv4Addr],
+    ac_name: &[u8],
+    vendor_id: u32,
+) -> CtrlMsg {
+    let mut list = Vec::with_capacity(ac_ips.len() * 6);
+    for ip in ac_ips {
+        list.extend_from_slice(&control_ipv4_entry(*ip, 0));
+    }
     CtrlMsg::new(MsgType::DISC_RESP, seq)
         .add_element(BaseElem::AcName(ac_name.to_vec()))
         .add_elem(
             MsgElemType::AC_DESCRIPTOR,
             &ac_descriptor("1.0", "1.0", vendor_id),
         )
-        .add_elem(
-            MsgElemType::CAPWAP_CTRL_IPV4_ADDR,
-            &control_ipv4_entry(ac_ip, 0),
-        )
+        .add_elem(MsgElemType::CAPWAP_CTRL_IPV4_ADDR, &list)
 }
 
 /// Generic (RFC 5415 8.2) Join Response (mtype 4) for the vendor-neutral and
@@ -739,7 +749,12 @@ mod tests {
 
     #[test]
     fn rfc_discovery_response_layout() {
-        let msg = discovery_response(7, Ipv4Addr::new(192, 168, 0, 2), b"miniac", 0x1234_5678);
+        let msg = discovery_response(
+            7,
+            &[Ipv4Addr::new(192, 168, 0, 2)],
+            b"miniac",
+            0x1234_5678,
+        );
         assert_eq!(msg.hdr.msg_type, MsgType::DISC_RESP);
         assert_eq!(msg.hdr.seq_num, 7);
         let tags: Vec<u16> = msg.elems.iter().map(|e| e.tag).collect();
