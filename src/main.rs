@@ -659,6 +659,12 @@ async fn handle_session(
                     let n = app_data.len();
                     if n < 16 { continue }
                     ctx.keep_alive();
+                    // Liveness for the management plane: any control traffic from
+                    // this WTP counts as online. The in-memory timestamp avoids a
+                    // database write per (TP-Link: 2 s) keep-alive.
+                    if let Some(mac) = ctx.mac {
+                        devices.mark_live(mac);
+                    }
 
                     let msg = match CtrlMsg::decode(frame(profile), &app_data[8..n]) {
                         Ok(m) => m,
@@ -768,15 +774,45 @@ async fn handle_session(
                                 hw_ver = Some(format!("{:08x}", hardware));
                                 sw_ver = Some(format!("{:08x}", software));
                             }
+                            // TP-Link reports the binary codes in the RFC-shaped
+                            // descriptor; the vendor records inside the same
+                            // element carry the human versions AC100 displays
+                            // (hardware "2.0", software "1.0.4"), and the model
+                            // record (private 81) carries the model name.
+                            let mut model: Option<String> = None;
+                            if profile == vendor::profile::VendorProfile::TpLink {
+                                if let Some(body) = msg
+                                    .find_elems(MsgElemType::WTP_DESCRIPTOR)
+                                    .next()
+                                    .map(|e| e.data.as_slice())
+                                {
+                                    if let Some(v) = vendor::tplink::parse_descriptor_versions(body) {
+                                        if v.hardware.is_some() {
+                                            hw_ver = v.hardware;
+                                        }
+                                        if v.software.is_some() {
+                                            sw_ver = v.software;
+                                        }
+                                    }
+                                }
+                                model = msg
+                                    .find_elems(MsgElemType::VENDOR_SPECIFIC_PAYLOAD)
+                                    .filter_map(|e| vendor::tplink::parse_model_info(&e.data))
+                                    .next();
+                            }
+                            if model.is_none() {
+                                model = wtp_model_from_elems(&elems);
+                            }
                             // Persist device learned from the join exchange (keyed by MAC).
                             if let Some(mac) = wtp_mac_from_elems(&elems, profile) {
                                 ctx.mac = Some(mac);
+                                devices.mark_live(mac);
                                 let ip = peer.ip().to_string();
                                 let created = devices.register(mac, Some(&ip), sw_ver.as_deref(), None, None, "registered")?;
                                 devices.set_identity(
                                     mac,
                                     Some(profile.vendor_name()),
-                                    wtp_model_from_elems(&elems).as_deref(),
+                                    model.as_deref(),
                                     hw_ver.as_deref(),
                                     None,
                                 )?;
@@ -904,6 +940,11 @@ async fn handle_session(
                                 None
                             };
                             let fe31 = (h3c.band_navigation != 0).then_some(h3c.band_navigation);
+                            // LED state is remembered per device: the web toggle
+                            // stores it even when the AP is offline, so a WTP that
+                            // reboots gets its saved state (typically "off") in
+                            // this Configure-stage snapshot, before it enters Run.
+                            let led = devices.get(mac)?.and_then(|d| d.led_on);
                             let resp_msg = match profile {
                                 // TP-Link WTPs accept only a narrow set of base
                                 // element types here (2/3/12/16/23/32/37/40) and
@@ -931,6 +972,7 @@ async fn handle_session(
                                         wlans: &wlans,
                                         fe28,
                                         fe31,
+                                        led,
                                     },
                                 ),
                             };
@@ -1051,6 +1093,18 @@ async fn handle_session(
                                     );
                                     ctx.burst_msg(req.encode_for(frame(profile)));
                                 }
+                                // Re-apply the remembered LED setting: an AP
+                                // restart resets its LED, so the last state the
+                                // operator chose (or the WTP reported) is pushed
+                                // again. Unknown (never reported) pushes nothing.
+                                if let Some(on) = devices.get(mac)?.and_then(|d| d.led_on) {
+                                    let seq = ctx.next_seq();
+                                    ctx.burst_msg(
+                                        profile
+                                            .led_update_request(seq, on)
+                                            .encode_for(frame(profile)),
+                                    );
+                                }
                                 let radios_queued = ctx.push_queue.len();
                                 let burst_queued = ctx.push_burst.len();
                                 for buf in ctx.release_push() {
@@ -1070,6 +1124,40 @@ async fn handle_session(
 
                         (WtpState::Run, MsgType::ECHO_REQ) => {
                             debug!("[<] from {}: echo req (seq {})", peer, seq);
+                            // TP-Link repeats its private records in every Echo
+                            // Request, including private 56 (LED status): the
+                            // WTP's current LED state is authoritative, so a
+                            // change (operator push or autonomous) is recorded
+                            // and persisted for the management plane.
+                            if profile == vendor::profile::VendorProfile::TpLink {
+                                let reported = elems
+                                    .get(&MsgElemType::VENDOR_SPECIFIC_PAYLOAD)
+                                    .and_then(|items| {
+                                        items.iter().find_map(|item| match item {
+                                            CwElem::Unknown(_, v) => {
+                                                vendor::tplink::parse_led_status(v)
+                                            }
+                                            _ => None,
+                                        })
+                                    });
+                                if let Some(on) = reported {
+                                    if ctx.led_on != Some(on) {
+                                        ctx.led_on = Some(on);
+                                        if let Some(mac) = ctx.mac {
+                                            match devices.set_led_on(mac, on) {
+                                                Ok(()) => logx::device(format!(
+                                                    "WTP {} LED is {}",
+                                                    device::mac_to_str(mac),
+                                                    if on { "on" } else { "off" }
+                                                )),
+                                                Err(e) => {
+                                                    warn!("[!] LED state persist failed: {}", e)
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                             let resp_msg = CtrlMsg::new(MsgType::ECHO_RESP, seq);
                             let resp_buf = resp_msg.encode_for(frame(profile));
                             capdtls.write(&resp_buf).await?;
@@ -1191,7 +1279,10 @@ async fn handle_session(
                                     devices.mark_joined(mac)?;
                                 }
                             }
-                            logx::device(format!("WTP {} reported events", peer));
+                            // Periodic event reports carry no auditable state
+                            // change (station changes are logged above only when
+                            // they alter the set), so they are not written to
+                            // the management log ring.
                             let resp_msg = CtrlMsg::new(MsgType::WTP_EVENT_RESP, seq);
                             let resp_buf = resp_msg.encode_for(frame(profile));
                             capdtls.write(&resp_buf).await?;
@@ -1548,7 +1639,15 @@ async fn handle_session(
                 match cmd {
                     Some(config::ConfigUpdateCmd::Push { elems }) => {
                         info!("[>] to {}: configuration update triggered via management plane", peer);
-                        let req = config::config_update(ctx.next_seq(), &[], &elems);
+                        // The LED element has a vendor-specific wire form (H3C tag
+                        // 0xfdf4, TP-Link private 57 inside element 37); every
+                        // other push keeps the vendor-neutral builder.
+                        let req = match elems.as_slice() {
+                            [crate::vendor::h3c::ConfigUpdateElem::Led(v)] => {
+                                profile.led_update_request(ctx.next_seq(), *v != 0)
+                            }
+                            _ => config::config_update(ctx.next_seq(), &[], &elems),
+                        };
                         // Remember which tags are now outstanding so the response
                         // handler can confirm (or reject) the push.
                         cfg_status.mark_pushed(elems.iter().map(|e| e.tag()));

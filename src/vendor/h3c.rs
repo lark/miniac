@@ -400,6 +400,9 @@ pub struct ConfigStatusResp<'a> {
     /// Band navigation (LBD) enable word for the fe31 element; only emitted
     /// when non-zero.
     pub fe31: Option<u32>,
+    /// Remembered AP LED state, emitted as the 0xfdf4 element (u32 BE) when
+    /// known. `None` leaves the WTP's own default (LED on) untouched.
+    pub led: Option<bool>,
 }
 
 /// M60 0xfe0b private element value (96B): three 32B slots
@@ -482,6 +485,14 @@ pub fn config_status_response(inp: &ConfigStatusResp<'_>) -> CtrlMsg {
     if !inp.wlans.is_empty() {
         let body = encode_h3c(inp.wlans);
         m = m.add_elem(WLAN_CFG_H3C, &body);
+    }
+    // The M60 AC closes this snapshot with its AP name / telnet / LED /
+    // keep-alive / roaming chain (`CWAssembleConfigureResponseForPL`), so the
+    // saved LED state rides here too: the AX60 applies 0xfdf4 while saving the
+    // Configure-stage message (`CWSaveConfigureResponseMessage` restarts or
+    // stops `led_control`), which is what makes a chosen "off" survive a reboot.
+    if let Some(on) = inp.led {
+        m = m.add_elem(CFG_LED, &u32::from(on).to_be_bytes());
     }
     m
 }
@@ -809,14 +820,18 @@ mod tests {
             wlans: &wlans,
             fe28: None,
             fe31: None,
+            led: Some(false),
         });
         // M60 element order, no RFC base elements / tag31 / type55.
         let tags: Vec<u16> = resp.elems.iter().map(|e| e.tag).collect();
         assert_eq!(
             &tags,
             &[0x0002, 0x0003, 0x000c, 0x0020, 0x0020, 0x0010, 0x0010, 0x0017,
-              0xfe0b, 0xfe0c, 0xfe1a, 0xfe1b, 0xfe0d, 0x0028, WLAN_CFG_H3C]
+              0xfe0b, 0xfe0c, 0xfe1a, 0xfe1b, 0xfe0d, 0x0028, WLAN_CFG_H3C, CFG_LED]
         );
+        // The remembered "off" state is a u32 BE in the trailing 0xfdf4 element.
+        let led = resp.elems.iter().find(|e| e.tag == CFG_LED).unwrap();
+        assert_eq!(led.data, vec![0, 0, 0, 0]);
         // type32 radio list uses state byte 2 (M60 parity).
         let t32: Vec<&[u8]> = resp
             .elems
@@ -856,6 +871,7 @@ mod tests {
                 wlans: &wlans,
                 fe28,
                 fe31,
+                led: None,
             });
             let tags: Vec<u16> = resp.elems.iter().map(|e| e.tag).collect();
             assert_eq!(

@@ -5,29 +5,29 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title data-i18n="doc.title">miniac AC — 管理面</title>
 <style>
-  :root{--bg:#0f172a;--panel:#1e293b;--panel2:#172033;--line:#334155;--text:#e2e8f0;--muted:#94a3b8;
-    --accent:#38bdf8;--ok:#4ade80;--warn:#facc15;--bad:#f87171;--sidebar:#0b1220;--sidebar-hover:#1b2740;}
+  :root{--bg:#f6f8fb;--panel:#ffffff;--panel2:#ffffff;--line:#e2e8f0;--text:#1f2937;--muted:#64748b;
+    --accent:#0284c7;--ok:#16a34a;--warn:#d97706;--bad:#dc2626;--sidebar:#ffffff;--sidebar-hover:#f1f5f9;}
   *{box-sizing:border-box;}
   body{margin:0;font-family:ui-sans-serif,system-ui,-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
        background:var(--bg);color:var(--text);font-size:14px;}
   .layout{display:grid;grid-template-columns:238px 1fr;min-height:100vh;}
   aside{background:var(--sidebar);border-right:1px solid var(--line);padding:16px 12px;position:sticky;top:0;height:100vh;overflow:auto;}
   .brand{display:flex;align-items:center;gap:10px;padding:6px 10px 16px;font-size:17px;font-weight:700;letter-spacing:.02em;}
-  .brand .dot{width:10px;height:10px;border-radius:3px;background:var(--accent);box-shadow:0 0 10px var(--accent);}
+  .brand .dot{width:10px;height:10px;border-radius:3px;background:var(--accent);box-shadow:0 0 6px rgba(2,132,199,.5);}
   .brand .ac{color:var(--accent);}
   .group{margin:14px 8px 6px;font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:#64748b;}
   nav a{display:flex;align-items:center;gap:10px;padding:9px 12px;border-radius:8px;color:var(--muted);margin:2px 0;cursor:pointer;}
   nav a svg{width:17px;height:17px;flex:0 0 17px;stroke:currentColor;fill:none;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round;}
   nav a:hover{background:var(--sidebar-hover);color:var(--text);}
-  nav a.active{background:linear-gradient(90deg,rgba(56,189,248,.18),rgba(56,189,248,.04));color:#fff;box-shadow:inset 2px 0 0 var(--accent);}
-  .foot{position:sticky;bottom:0;color:#475569;font-size:11px;padding:14px 10px 4px;}
+  nav a.active{background:linear-gradient(90deg,rgba(2,132,199,.12),rgba(2,132,199,.02));color:var(--text);box-shadow:inset 2px 0 0 var(--accent);}
+  .foot{position:sticky;bottom:0;color:#94a3b8;font-size:11px;padding:14px 10px 4px;}
   .top{display:flex;align-items:center;justify-content:space-between;padding:16px 26px;border-bottom:1px solid var(--line);background:var(--panel2);position:sticky;top:0;z-index:5;}
   .top h1{font-size:18px;margin:0;font-weight:650;}
   .top .right{display:flex;align-items:center;gap:16px;color:var(--muted);font-size:13px;}
-  .live{display:inline-flex;align-items:center;gap:6px;} .live i{width:8px;height:8px;border-radius:50%;background:var(--ok);box-shadow:0 0 8px var(--ok);display:inline-block;}
-  .btn{background:var(--accent);color:#08131f;border:none;border-radius:7px;padding:7px 13px;font-weight:650;font-size:13px;cursor:pointer;}
+  .live{display:inline-flex;align-items:center;gap:6px;} .live i{width:8px;height:8px;border-radius:50%;background:var(--ok);box-shadow:0 0 6px rgba(22,163,74,.4);display:inline-block;}
+  .btn{background:var(--accent);color:#fff;border:none;border-radius:7px;padding:7px 13px;font-weight:650;font-size:13px;cursor:pointer;}
   .btn.ghost{background:transparent;border:1px solid var(--line);color:var(--text);font-weight:500;}
-  .btn.ok{background:var(--ok);color:#06240f;} .btn.bad{background:var(--bad);color:#2a0d0d;}
+  .btn.ok{background:var(--ok);color:#fff;} .btn.bad{background:var(--bad);color:#fff;}
   .btn.sm{padding:4px 9px;font-size:12px;} .btn:hover{filter:brightness(1.1);} .btn:disabled{opacity:.45;cursor:not-allowed;filter:none;}
   .burger{display:none;}
   main{padding:24px 26px;min-width:0;}
@@ -47,11 +47,16 @@
   tbody tr:last-child td{border-bottom:none;}
   th{color:var(--muted);font-weight:600;white-space:nowrap;}
   td.mono,th.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;}
-  tbody tr:hover{background:rgba(56,189,248,.05);}
+  tbody tr:hover{background:rgba(2,132,199,.05);}
   .muted{color:var(--muted);}
+  .ledtog{display:inline-flex;align-items:center;gap:6px;}
+  .ledtog i{width:8px;height:8px;border-radius:50%;background:#cbd5e1;display:inline-block;}
+  .ledtog.on i{background:var(--ok);box-shadow:0 0 6px rgba(22,163,74,.5);}
+  .ledtog.off i{background:#e2e8f0;border:1px solid #94a3b8;}
+  .ledtog.unk i{background:transparent;border:1px dashed #94a3b8;}
   .pill{display:inline-block;padding:2px 9px;border-radius:999px;font-size:12px;font-weight:600;}
-  .p-ok{background:rgba(74,222,128,.15);color:var(--ok);}.p-warn{background:rgba(250,204,21,.15);color:var(--warn);}
-  .p-bad{background:rgba(248,113,113,.15);color:var(--bad);}.p-muted{background:rgba(148,163,184,.15);color:var(--muted);}
+  .p-ok{background:rgba(22,163,74,.12);color:var(--ok);}.p-warn{background:rgba(217,119,6,.12);color:var(--warn);}
+  .p-bad{background:rgba(220,38,38,.12);color:var(--bad);}.p-muted{background:rgba(100,116,139,.12);color:var(--muted);}
   .stat{background:var(--panel);border:1px solid var(--line);border-radius:11px;padding:16px;}
   .stat .k{font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;}
   .stat .v{font-size:26px;font-weight:700;margin-top:6px;}
@@ -61,28 +66,29 @@
   .legend b{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:5px;}
   .chips{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:4px;}
   .chip{border:1px solid var(--line);background:transparent;color:var(--muted);border-radius:999px;padding:5px 12px;font-size:12.5px;cursor:pointer;}
-  .chip.on{background:var(--accent);color:#08131f;border-color:var(--accent);font-weight:650;}
+  .chip.on{background:var(--accent);color:#fff;border-color:var(--accent);font-weight:650;}
   .chip.all{border-style:dashed;}
   .feed{list-style:none;margin:0;padding:0;max-height:440px;overflow:auto;}
   .feed li{padding:7px 2px;border-bottom:1px solid var(--line);font-size:13px;display:flex;gap:10px;align-items:baseline;}
+  .feed li:last-child{border-bottom:none;}
   .feed .ts{color:var(--muted);font-family:ui-monospace,monospace;font-size:12px;min-width:64px;}
   .feed .cat{font-size:11px;padding:1px 7px;border-radius:6px;min-width:64px;text-align:center;}
-  .cat-system{background:#334155;color:#cbd5e1;}.cat-device{background:rgba(56,189,248,.2);color:var(--accent);}
-  .cat-station{background:rgba(74,222,128,.18);color:var(--ok);}.cat-radio{background:rgba(168,85,247,.2);color:#c084fc;}
-  .cat-security{background:rgba(250,204,21,.18);color:var(--warn);}.cat-firmware{background:rgba(251,146,60,.2);color:#fb923c;}
-  .cat-roaming{background:rgba(244,114,182,.2);color:#f472b6;}.cat-admin{background:rgba(148,163,184,.2);color:var(--muted);}
+  .cat-system{background:#e2e8f0;color:#475569;}.cat-device{background:rgba(2,132,199,.12);color:var(--accent);}
+  .cat-station{background:rgba(22,163,74,.12);color:var(--ok);}.cat-radio{background:rgba(147,51,234,.12);color:#7c3aed;}
+  .cat-security{background:rgba(217,119,6,.12);color:var(--warn);}.cat-firmware{background:rgba(234,88,12,.12);color:#ea580c;}
+  .cat-roaming{background:rgba(219,39,119,.12);color:#db2777;}.cat-admin{background:rgba(100,116,139,.12);color:var(--muted);}
   .lv-error{color:var(--bad);}
   .tabs{display:flex;gap:6px;border-bottom:1px solid var(--line);margin-bottom:16px;}
   .tabs button{background:transparent;border:none;color:var(--muted);padding:10px 16px;cursor:pointer;font-size:14px;border-bottom:2px solid transparent;}
-  .tabs button.on{color:#fff;border-bottom-color:var(--accent);font-weight:650;}
+  .tabs button.on{color:var(--text);border-bottom-color:var(--accent);font-weight:650;}
   .toolbar{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-bottom:14px;}
-  input,select{background:var(--bg);color:var(--text);border:1px solid var(--line);border-radius:7px;padding:6px 9px;font-size:13px;}
+  input,select{background:#fff;color:var(--text);border:1px solid var(--line);border-radius:7px;padding:6px 9px;font-size:13px;}
   input::placeholder{color:#64748b;}
   .note{font-size:12px;color:var(--muted);margin-top:10px;line-height:1.7;}
   .kv{display:grid;grid-template-columns:110px 1fr;gap:8px 10px;font-size:13px;}
   .kv div:nth-child(odd){color:var(--muted);}
   /* modal */
-  .mask{position:fixed;inset:0;background:rgba(3,7,18,.55);display:none;z-index:30;}
+  .mask{position:fixed;inset:0;background:rgba(15,23,42,.3);display:none;z-index:30;}
   .mask.on{display:block;}
   .modal{position:fixed;top:0;right:0;height:100vh;width:400px;max-width:92vw;background:var(--panel);border-left:1px solid var(--accent);
          z-index:31;padding:18px;overflow:auto;transform:translateX(100%);transition:.2s;}
@@ -95,7 +101,7 @@
   .seg{display:inline-flex;gap:14px;} .seg label{color:var(--muted);display:inline-flex;align-items:center;gap:5px;}
   .mfoot{display:flex;gap:10px;margin-top:16px;padding-top:14px;border-top:1px solid var(--line);}
   .toast{position:fixed;right:24px;bottom:24px;background:var(--panel);border:1px solid var(--accent);color:var(--text);
-         padding:12px 16px;border-radius:10px;box-shadow:0 8px 24px rgba(0,0,0,.4);font-size:13px;z-index:50;}
+         padding:12px 16px;border-radius:10px;box-shadow:0 8px 24px rgba(15,23,42,.15);font-size:13px;z-index:50;}
 </style>
 </head>
 <body>
@@ -151,7 +157,6 @@
           <div class="chips" id="ev-chips"></div>
           <div class="note" id="ev-hint"></div>
           <ul class="feed" id="ev-feed" style="margin-top:12px"></ul>
-          <div class="note" data-i18n-html="logs.noteHtml">刷新语义：本页用 <b>GET /api/events?since=</b> 增量拉取，最新日志显示在最前。</div>
         </div>
       </section>
 
@@ -166,7 +171,6 @@
           </div>
           <table><thead><tr><th data-i18n="th.mac">MAC地址</th><th data-i18n="th.apname">AP备注</th><th data-i18n="th.radioUnit">射频单元</th><th data-i18n="th.ssid">SSID</th><th data-i18n="th.ip">IP</th><th data-i18n="th.joined">接入时间</th><th data-i18n="th.signal">信号强度</th><th data-i18n="th.state">状态</th><th data-i18n="th.disconnect">断开</th></tr></thead>
             <tbody id="sta-rows"></tbody></table>
-          <div class="note" data-i18n="clients.note">状态列保留已断开的客户端（disc），便于排查；断开操作向 AP 下发 Release Client 请求。</div>
         </div>
       </section>
 
@@ -188,7 +192,6 @@
             <button class="btn ghost sm" data-i18n="btn.addSsid" onclick="addSsid()">添加 SSID</button>
             <button class="btn ghost sm" data-i18n="btn.recommend" onclick="recommendSsid()">按设备能力推荐</button>
           </div>
-          <div class="note" data-i18n="wireless.ssidNote">全局 SSID 与频段绑定，应用到所有已确认 AP。已有 SSID 以文本显示，点击行尾「编辑」进入弹窗修改（取消即放弃，不产生待提交变更）；在末尾空行输入名称即可新增，并自动追加下一空行。</div>
         </div>
         <div class="card">
           <h2 data-i18n="card.radioset">射频设置（全局）</h2>
@@ -201,13 +204,11 @@
             <input type="number" id="r-pw" style="width:80px">
             <button class="btn sm" data-i18n="btn.apply" onclick="saveGlobalRadio()">应用</button>
           </div>
-          <div class="note" data-i18n="wireless.radioNote">全局射频设置应用到所有已确认 AP；信号强度以百分比设置，下发时按机型映射。信道选“自动”由 AP 自行选择（ACS），手动时指定信道号。</div>
         </div>
         <div class="card">
           <h2 data-i18n="card.overrides">AP 覆盖设置</h2>
           <table><thead><tr><th data-i18n="th.apname2">AP 备注</th><th data-i18n="th.channel">信道</th><th data-i18n="th.power">功率</th><th data-i18n="th.state">状态</th><th data-i18n="th.ops">操作</th></tr></thead>
             <tbody id="w-ov-rows"></tbody></table>
-          <div class="note" data-i18n="wireless.overNote">某台 AP 可单独覆盖全局的信道/功率；“恢复全局”清除该 AP 的覆盖。</div>
         </div>
       </section>
 
@@ -231,7 +232,6 @@
           </div>
           <table><thead><tr><th data-i18n="th.apname">AP 备注</th><th data-i18n="th.vendor">厂商</th><th data-i18n="th.model">型号</th><th data-i18n="th.mac">MAC</th><th data-i18n="th.hw">硬件</th><th data-i18n="th.sw">软件</th><th data-i18n="th.state">状态</th><th data-i18n="th.ops">操作</th></tr></thead>
             <tbody id="mgmt-rows"></tbody></table>
-          <div class="note" data-i18n="devmgmt.note">重启 / 停用 需 H3C 私有 Reset / Clear-Configuration 消息号（待反汇编，暂未启用）。</div>
         </div>
       </section>
 
@@ -244,7 +244,6 @@
             <input id="fw-hw" data-i18n-ph="ph.hw" placeholder="hw_version (1.0)"><input type="file" id="fw-file">
             <button class="btn sm" data-i18n="btn.upload" onclick="uploadFirmware()">上传</button>
           </div>
-          <div class="note" data-i18n="fw.note">存盘 firmware/{vendor}/{model}/{hw_version}/{file}，上传计算 MD5 入库。</div>
         </div>
         <div class="card">
           <h2 data-i18n="card.fwlist">镜像列表</h2>
@@ -259,7 +258,7 @@
           <div class="card"><h2 data-i18n="card.acinfo">AC 信息</h2>
             <div class="kv"><div data-i18n="kv.acname">AC 名称</div><div>miniac</div>
               <div data-i18n="kv.ctlport">控制端口</div><div class="mono">5246</div>
-              <div data-i18n="kv.weblisten">Web 监听</div><div class="muted" data-i18n-html="kv.weblistenVal">由启动参数 <b>-l ip[:port]</b> 指定</div></div>
+              <div data-i18n="kv.weblisten">Web 监听</div><div class="muted" data-i18n-html="kv.weblistenVal">由启动参数 <b>-w [addr:]port</b> 指定（默认 127.0.0.1:8246）</div></div>
             <div class="note" data-i18n-html="sys.runNote">运行提示：启动 miniac 测试时绑定内网地址而非 <span class="mono">0.0.0.0</span>。</div>
           </div>
           <div class="card"><h2 data-i18n="card.notes">说明</h2>
@@ -302,33 +301,30 @@ const I18N={
   'status.legendOk':'已确认 {n}','status.legendPend':'待确认 {n}','status.fsm':'（运行态 FSM 在内存中，DB 仅存生命周期状态）',
   'empty.logs':'暂无日志','radio.auto':'自动','radio.manual':'手动','empty.radios':'暂无射频状态','empty.ssidEnabled':'无已启用 SSID',
   'card.logs':'日志 · 分类过滤（可多选）',
-  'logs.noteHtml':'刷新语义：本页用 <b>GET /api/events?since=</b> 增量拉取，最新日志显示在最前。',
   'logs.all':'全部','logs.hintNone':'未选择任何分类（点“全部”可一键全开）','logs.hintAll':'已全选 {n} 个分类','logs.hintSel':'已选：{list}',
   'empty.logsFiltered':'该分类组合下暂无日志',
   'card.clients':'客户端列表','ph.searchSta':'搜索 MAC / SSID / AP','opt.allAps':'全部 AP','btn.search':'搜索',
   'th.mac':'MAC地址','th.apname':'AP备注','th.radioUnit':'射频单元','th.ip':'IP','th.joined':'接入时间','th.signal':'信号强度','th.disconnect':'断开',
-  'clients.note':'状态列保留已断开的客户端（disc），便于排查；断开操作向 AP 下发 Release Client 请求。',
   'empty.clients':'暂无客户端','btn.disconnect':'断开','toast.disconnectSent':'已下发断开：{mac}',
   'btn.commit':'提交','card.ssidset':'SSID 设置（全局）',
   'th.seq':'序号','th.wlanname':'无线网络名称','th.security':'加密方式','th.psk':'密码','th.clientsnum':'客户端数目','th.ops':'操作',
   'btn.addSsid':'添加 SSID','btn.recommend':'按设备能力推荐',
-  'wireless.ssidNote':'全局 SSID 与频段绑定，应用到所有已确认 AP。已有 SSID 以文本显示，点击行尾「编辑」进入弹窗修改（取消即放弃，不产生待提交变更）；在末尾空行输入名称即可新增，并自动追加下一空行。',
   'card.radioset':'射频设置（全局）','radio.enable':'启用该射频','radio.power':'功率(%)','btn.apply':'应用',
-  'wireless.radioNote':'全局射频设置应用到所有已确认 AP；信号强度以百分比设置，下发时按机型映射。信道选“自动”由 AP 自行选择（ACS），手动时指定信道号。',
-  'card.overrides':'AP 覆盖设置','th.apname2':'AP 备注','wireless.overNote':'某台 AP 可单独覆盖全局的信道/功率；“恢复全局”清除该 AP 的覆盖。',
+  'card.overrides':'AP 覆盖设置','th.apname2':'AP 备注',
   'ssid.enabled':'已启用','ssid.disabled':'已禁用','btn.editSsid':'编辑','ssid.newRow':'新增','ssid.newPlaceholder':'输入名称新增 SSID…','ssid.unconfigured':'未配置',
   'ov.inherit':'继承','ov.overridden':'已覆盖','ov.global':'全局','btn.modify':'修改','btn.revert':'恢复全局',
   'empty.approvedAps':'暂无已确认 AP','wireless.pending':'待同步 {n} 台 AP','wireless.synced':'配置已同步',
   'card.devstatus':'设备状态','th.vendor':'厂商','th.model':'型号','th.hw':'硬件','th.sw':'软件','th.radiosClients':'Radios (客户端)',
   'empty.devices':'暂无设备','btn.approve':'确认接入','btn.edit':'修改','toast.approved':'已确认 {mac}','dev.pending':'待确认',
+  'dev.online':'在线','dev.offline':'离线',
   'card.devmgmt':'设备管理','ph.searchAp':'搜索 AP 备注 / MAC','opt.allStates':'全部状态','opt.approved':'已确认','opt.pending':'待确认',
-  'btn.reset':'重启','btn.disable':'停用','btn.upgrade':'更新固件',
-  'devmgmt.note':'重启 / 停用 需 H3C 私有 Reset / Clear-Configuration 消息号（待反汇编，暂未启用）。',
+  'btn.reset':'重启','btn.disable':'停用','btn.upgrade':'更新固件','btn.led':'LED',
+  'led.onTip':'当前 LED 已开，点击关闭','led.offTip':'当前 LED 已关，点击打开','led.unknownTip':'LED 状态未知，点击打开',
   'card.fwupload':'上传固件','ph.vendor':'vendor (h3c)','ph.model':'model (mini-ax60)','ph.hw':'hw_version (1.0)','btn.upload':'上传',
-  'fw.note':'存盘 firmware/{vendor}/{model}/{hw_version}/{file}，上传计算 MD5 入库。','card.fwlist':'镜像列表','empty.fw':'暂无镜像',
+  'card.fwlist':'镜像列表','empty.fw':'暂无镜像',
   'toast.fwUploaded':'固件已上传','toast.fwUploadFail':'上传失败：{msg}','toast.noFw':'暂无固件镜像，请先上传',
   'modal.upgrade':'更新固件','modal.upgradeSub':'目标 AP：{mac}','field.fwImage':'固件镜像','btn.pushUpgrade':'下发升级','toast.upgradeSent':'升级已下发（Image Data）',
-  'card.acinfo':'AC 信息','kv.acname':'AC 名称','kv.ctlport':'控制端口','kv.weblisten':'Web 监听','kv.weblistenVal':'由启动参数 <b>-l ip[:port]</b> 指定',
+  'card.acinfo':'AC 信息','kv.acname':'AC 名称','kv.ctlport':'控制端口','kv.weblisten':'Web 监听','kv.weblistenVal':'由启动参数 <b>-w [addr:]port</b> 指定（默认 127.0.0.1:8246）',
   'sys.runNote':'运行提示：启动 miniac 测试时绑定内网地址而非 <span class="mono">0.0.0.0</span>。',
   'card.notes':'说明','sys.notes':'登录鉴权、地址池/租约、日志级别等系统项的后端接口尚未提供（列入后续阶段）。',
   'btn.save':'保存','btn.cancel':'取消','toast.loadFail':'加载失败：{msg}','toast.opFail':'操作失败：{msg}','toast.fail':'失败：{msg}',
@@ -339,6 +335,7 @@ const I18N={
   'toast.noPending':'没有待同步的 AP','toast.committed':'已下发 {n} 台','toast.committedOffline':'，{n} 台离线（下次上线生效）','toast.commitFail':'提交失败：{msg}',
   'confirm.reset':'确定重启 AP {name} ？','toast.resetSent':'重启已下发：{name}',
   'confirm.disable':'确定停用 AP {name} ？将清除其配置并重启。','toast.disableSent':'停用已下发：{name}',
+  'toast.ledOn':'LED 已打开：{name}','toast.ledOff':'LED 已关闭：{name}','toast.ledSaved':'LED 设置已保存：{name}（AP 上线后生效）',
   'modal.editDevice':'修改设备','modal.editDeviceSub':'MAC {mac}','field.name':'备注名称','field.desc':'说明','toast.saved':'已保存',
   'modal.editSsid':'修改 SSID','modal.addSsid':'新增 SSID','modal.ssidSub':'全局 · {band}',
   'field.ssidName':'无线网络名称','field.akm':'密钥管理','field.cipher':'加密算法','field.pmf':'管理帧保护','field.psk':'PSK 密码',
@@ -367,33 +364,30 @@ const I18N={
   'status.legendOk':'Approved {n}','status.legendPend':'Pending {n}','status.fsm':'(Runtime FSM lives in memory; DB stores lifecycle state only)',
   'empty.logs':'No logs','radio.auto':'Auto','radio.manual':'Manual','empty.radios':'No radio status','empty.ssidEnabled':'No enabled SSID',
   'card.logs':'Logs · Category filter (multi-select)',
-  'logs.noteHtml':'Refresh: this page pulls incrementally via <b>GET /api/events?since=</b>; newest logs appear first.',
   'logs.all':'All','logs.hintNone':'No category selected (click “All” to select all)','logs.hintAll':'All {n} categories selected','logs.hintSel':'Selected: {list}',
   'empty.logsFiltered':'No logs for this category selection',
   'card.clients':'Clients','ph.searchSta':'Search MAC / SSID / AP','opt.allAps':'All APs','btn.search':'Search',
   'th.mac':'MAC','th.apname':'AP Name','th.radioUnit':'Radio','th.ip':'IP','th.joined':'Joined','th.signal':'RSSI','th.disconnect':'Disconnect',
-  'clients.note':'The state column keeps disconnected (disc) clients for troubleshooting; disconnect sends a Release Client request to the AP.',
   'empty.clients':'No clients','btn.disconnect':'Disconnect','toast.disconnectSent':'Disconnect sent: {mac}',
   'btn.commit':'Commit','card.ssidset':'SSID Settings (Global)',
   'th.seq':'#','th.wlanname':'Network Name','th.security':'Security','th.psk':'Password','th.clientsnum':'Clients','th.ops':'Actions',
   'btn.addSsid':'Add SSID','btn.recommend':'Recommend by device capability',
-  'wireless.ssidNote':'Global SSIDs are bound to a band and applied to all approved APs. Existing SSIDs are shown as text; click “Edit” at the row end to modify in a dialog (cancel discards changes, no pending diff). Type a name in the blank row to add one; another blank row follows automatically.',
   'card.radioset':'Radio Settings (Global)','radio.enable':'Enable this radio','radio.power':'Power (%)','btn.apply':'Apply',
-  'wireless.radioNote':'Global radio settings apply to all approved APs; power is set as a percentage and mapped per model on push. Channel “Auto” lets the AP select itself (ACS); specify a channel number for manual.',
-  'card.overrides':'AP Overrides','th.apname2':'AP Name','wireless.overNote':'A single AP can override the global channel/power; “Revert Global” clears that AP’s override.',
+  'card.overrides':'AP Overrides','th.apname2':'AP Name',
   'ssid.enabled':'Enabled','ssid.disabled':'Disabled','btn.editSsid':'Edit','ssid.newRow':'New','ssid.newPlaceholder':'Type a name to add SSID…','ssid.unconfigured':'Unconfigured',
   'ov.inherit':'inherit','ov.overridden':'Override','ov.global':'Global','btn.modify':'Edit','btn.revert':'Revert Global',
   'empty.approvedAps':'No approved APs','wireless.pending':'{n} AP(s) pending sync','wireless.synced':'Config synced',
   'card.devstatus':'Device Status','th.vendor':'Vendor','th.model':'Model','th.hw':'HW','th.sw':'SW','th.radiosClients':'Radios (clients)',
   'empty.devices':'No devices','btn.approve':'Approve','btn.edit':'Edit','toast.approved':'Approved {mac}','dev.pending':'Pending',
+  'dev.online':'Online','dev.offline':'Offline',
   'card.devmgmt':'Device Management','ph.searchAp':'Search AP name / MAC','opt.allStates':'All states','opt.approved':'Approved','opt.pending':'Pending',
-  'btn.reset':'Reboot','btn.disable':'Disable','btn.upgrade':'Upgrade Firmware',
-  'devmgmt.note':'Reboot / Disable need H3C private Reset / Clear-Configuration message numbers (pending disassembly, not enabled yet).',
+  'btn.reset':'Reboot','btn.disable':'Disable','btn.upgrade':'Upgrade Firmware','btn.led':'LED',
+  'led.onTip':'LED is on; click to turn it off','led.offTip':'LED is off; click to turn it on','led.unknownTip':'LED state unknown; click to turn it on',
   'card.fwupload':'Upload Firmware','ph.vendor':'vendor (h3c)','ph.model':'model (mini-ax60)','ph.hw':'hw_version (1.0)','btn.upload':'Upload',
-  'fw.note':'Stored at firmware/{vendor}/{model}/{hw_version}/{file}; MD5 is computed on upload.','card.fwlist':'Image List','empty.fw':'No images',
+  'card.fwlist':'Image List','empty.fw':'No images',
   'toast.fwUploaded':'Firmware uploaded','toast.fwUploadFail':'Upload failed: {msg}','toast.noFw':'No firmware images; upload one first',
   'modal.upgrade':'Upgrade Firmware','modal.upgradeSub':'Target AP: {mac}','field.fwImage':'Firmware Image','btn.pushUpgrade':'Push Upgrade','toast.upgradeSent':'Upgrade pushed (Image Data)',
-  'card.acinfo':'AC Info','kv.acname':'AC Name','kv.ctlport':'Control Port','kv.weblisten':'Web Listen','kv.weblistenVal':'Set by startup option <b>-l ip[:port]</b>',
+  'card.acinfo':'AC Info','kv.acname':'AC Name','kv.ctlport':'Control Port','kv.weblisten':'Web Listen','kv.weblistenVal':'Set by startup option <b>-w [addr:]port</b> (default 127.0.0.1:8246)',
   'sys.runNote':'Tip: bind an internal address instead of <span class="mono">0.0.0.0</span> when testing miniac.',
   'card.notes':'Notes','sys.notes':'Backend APIs for login/auth, address pools/leases, and log level are not provided yet (planned for a later phase).',
   'btn.save':'Save','btn.cancel':'Cancel','toast.loadFail':'Load failed: {msg}','toast.opFail':'Operation failed: {msg}','toast.fail':'Failed: {msg}',
@@ -404,6 +398,7 @@ const I18N={
   'toast.noPending':'No APs pending sync','toast.committed':'Pushed to {n}','toast.committedOffline':'; {n} offline (effective on next join)','toast.commitFail':'Commit failed: {msg}',
   'confirm.reset':'Reboot AP {name}?','toast.resetSent':'Reboot sent: {name}',
   'confirm.disable':'Disable AP {name}? Its config will be cleared and it will reboot.','toast.disableSent':'Disable sent: {name}',
+  'toast.ledOn':'LED on sent: {name}','toast.ledOff':'LED off sent: {name}','toast.ledSaved':'LED setting saved: {name} (takes effect when the AP reconnects)',
   'modal.editDevice':'Edit Device','modal.editDeviceSub':'MAC {mac}','field.name':'Name','field.desc':'Description','toast.saved':'Saved',
   'modal.editSsid':'Edit SSID','modal.addSsid':'Add SSID','modal.ssidSub':'Global · {band}',
   'field.ssidName':'Network Name','field.akm':'Key Management','field.cipher':'Cipher','field.pmf':'PMF','field.psk':'PSK',
@@ -479,7 +474,7 @@ const ridOfBand=(b)=>b===1?1:2;
 const bandOfRid=(id)=>id===2?'5':'24';
 const wlanBand=(w)=>(w.radio_id===2?'5':'24');
 const staBand=(s)=>{const r=DB.radios.find(x=>x.mac===s.wmac&&x.radio_id===s.radio_id);return r?radioBand(r):bandOfRid(s.radio_id);};
-const devPill=(d)=>d.approved?[d.state||'registered','p-ok']:[t('dev.pending'),'p-warn'];
+const devPill=(d)=>d.online?[t('dev.online'),'p-ok']:[t('dev.offline'),'p-muted'];
 
 async function loadDevices(){DB.devices=await api('/api/devices');}
 async function loadRadios(){DB.radios=await api('/api/radios');}
@@ -794,6 +789,7 @@ async function renderDevmgmt(){
       : `<button class="btn ghost sm" onclick="editDevice('${esc(d.mac)}')">${t('btn.edit')}</button>
          <button class="btn ghost sm" onclick="resetAp('${esc(d.mac)}')">${t('btn.reset')}</button>
          <button class="btn ghost sm" onclick="disableAp('${esc(d.mac)}')">${t('btn.disable')}</button>
+         <button class="btn ghost sm ledtog ${d.led_on===true?'on':d.led_on===false?'off':'unk'}" onclick="ledToggle('${esc(d.mac)}')" title="${esc(t(d.led_on===true?'led.onTip':d.led_on===false?'led.offTip':'led.unknownTip'))}"><i></i>${t('btn.led')}</button>
          <button class="btn ghost sm" onclick="upgradeDialog('${esc(d.mac)}')">${t('btn.upgrade')}</button>`;
     return `<tr><td>${esc(d.name||'—')}</td><td>${esc(d.vendor||'—')}</td><td>${esc(d.model||'—')}</td><td class="mono">${esc(d.mac)}</td>
       <td>${esc(d.hw_version||'—')}</td><td>${esc(d.sw_version||'—')}</td>
@@ -835,6 +831,17 @@ async function resetAp(mac){
 async function disableAp(mac){
   if(!confirm(t('confirm.disable',{name:APNAME(mac)}))) return;
   try{ await api(`/api/devices/${mac}/disable`,{method:'POST'}); toast(t('toast.disableSent',{name:APNAME(mac)})); }
+  catch(e){ toast(t('toast.fail',{msg:e.message})); }
+}
+async function ledToggle(mac){
+  const d=DEV(mac);
+  const next=!(d&&d.led_on===true); // unknown counts as off -> turning on
+  try{
+    const ack=await apiJson(`/api/devices/${mac}/config-update`,'POST',{elements:[{type:'led',value:next?1:0}]});
+    if(d) d.led_on=next;
+    if($('p-devmgmt').classList.contains('on')) renderDevmgmt();
+    toast(t(!ack||ack.queued?(next?'toast.ledOn':'toast.ledOff'):'toast.ledSaved',{name:APNAME(mac)}));
+  }
   catch(e){ toast(t('toast.fail',{msg:e.message})); }
 }
 function editDevice(mac){

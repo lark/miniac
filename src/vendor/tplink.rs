@@ -23,6 +23,7 @@ use std::net::Ipv4Addr;
 use crate::capwap::{CwResult, CtrlMsg, MsgElemType, MsgType};
 use crate::config;
 use crate::elements::{BaseElem, ImageIdentifier};
+use crate::vendor::vsp;
 
 /// AC100 enterprise identifier. Used both as the Vendor Specific Payload vendor
 /// field and as the Image Identifier vendor field; AC100 assembles it at
@@ -53,6 +54,10 @@ pub mod priv_id {
     pub const RESET_MASK: u16 = 35;
     /// AP resource information.
     pub const AP_RES_INFO: u16 = 37;
+    /// AP model/identity record: a 16-byte header (model code at offset 4)
+    /// followed by `[type u8][len u8][value]` records; type 1 is the textual
+    /// model name.
+    pub const AP_MODEL_INFO: u16 = 81;
     /// Supported special messages bitmap (AC100 sends 0x2f2e).
     pub const SPEC_MSG_SW: u16 = 38;
     /// Configuration type.
@@ -159,6 +164,17 @@ pub fn reset_request(seq: u32, image_name: &[u8], mask: u32) -> CtrlMsg {
 /// image identifier alone.
 pub fn image_update_request(seq: u32, image_name: &[u8]) -> CtrlMsg {
     CtrlMsg::new(MsgType::CONFIG_UPDATE_REQ, seq).add_element(image_identifier(image_name))
+}
+
+/// Configuration Update Request (7) toggling the AP LED: the message carries
+/// the private 57 (LED operation) record alone, a u32 where 0 turns the LED off
+/// and 1 turns it on. Captured from AC100 (`TL-AC100`) to a TL-AP1300GI: the
+/// WTP applies it and acknowledges with mtype 8 and Result Code 0.
+pub fn led_update_request(seq: u32, on: bool) -> CtrlMsg {
+    CtrlMsg::new(MsgType::CONFIG_UPDATE_REQ, seq).add_element(vendor_specific(vec![(
+        priv_id::AP_LED_OP,
+        u32::from(on).to_be_bytes().to_vec(),
+    )]))
 }
 
 /// Configuration synchronisation inputs for producer B.
@@ -641,6 +657,120 @@ pub fn parse_ap_res_info(value: &[u8]) -> Option<ApResInfo> {
     })
 }
 
+/// Parse the AP LED status record (private 56) out of a Vendor Specific Payload
+/// value: a u32 where 0 means the LED is off and 1 means on. The TL-AP1300GI
+/// repeats it in every Echo Request, so the AC learns the state the WTP actually
+/// applied, including after an autonomous change. Returns `None` when the
+/// payload is not AC100's or carries no 4-byte record, so a malformed report is
+/// ignored rather than guessed.
+pub fn parse_led_status(value: &[u8]) -> Option<bool> {
+    let (vendor, _, tlvs) = vsp::split_value(value)?;
+    if vendor != VENDOR_ID {
+        return None;
+    }
+    let state: [u8; 4] = vsp::find(&tlvs, priv_id::AP_LED_STATUS)?.try_into().ok()?;
+    Some(u32::from_be_bytes(state) != 0)
+}
+
+/// Parse the AP model record (private 81) of a Give-and-Take (Join) Request and
+/// return the WTP's textual model name, e.g. `TL-AP1300GI-PoE`.
+///
+/// The record has a 16-byte header (the binary model code, `13008e02`, sits at
+/// offset 4) followed by `[type u8][len u8][value]` entries; type 1 is the model
+/// name. AC100 maps the same code to a name through its encrypted `apdb.bin`, so
+/// taking the WTP's own string avoids shipping that database.
+pub fn parse_model_info(value: &[u8]) -> Option<String> {
+    let (vendor, _, tlvs) = vsp::split_value(value)?;
+    if vendor != VENDOR_ID {
+        return None;
+    }
+    let mut rest = vsp::find(&tlvs, priv_id::AP_MODEL_INFO)?.get(16..)?;
+    while rest.len() >= 2 {
+        let ty = rest[0];
+        let len = rest[1] as usize;
+        if rest.len() < 2 + len {
+            break;
+        }
+        let val = &rest[2..2 + len];
+        if ty == MODEL_NAME_TYPE {
+            let text: Vec<u8> = val.iter().copied().take_while(|b| *b != 0).collect();
+            if !text.is_empty() && text.iter().all(|b| (0x20..0x7f).contains(b)) {
+                return Some(String::from_utf8_lossy(&text).into_owned());
+            }
+        }
+        rest = &rest[2 + len..];
+    }
+    None
+}
+
+/// Model-name entry type inside a private 81 record.
+const MODEL_NAME_TYPE: u8 = 1;
+
+/// Hardware/software versions carried by the TP-Link WTP Descriptor (element
+/// 39) of a Join Request.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WtpVersions {
+    pub hardware: Option<String>,
+    pub software: Option<String>,
+}
+
+/// Parse the TP-Link WTP Descriptor value. After a fixed 6-byte prefix the WTP
+/// repeats its enterprise number before each record:
+/// `[vendor u32][record id u16][len u16][value]`. Record 0 holds the hardware
+/// version as two u16 (major, minor); record 1 the software version as three
+/// u16 (major, minor, patch) followed by build date and release number.
+///
+/// The captured TL-AP1300GI descriptor (`02 00 01 01 00 00` prefix) yields
+/// hardware `2.0` and software `1.0.4`, matching AC100's display. The prefix
+/// length is not documented, so the record chain is located by its enterprise
+/// number rather than by a hardcoded offset.
+pub fn parse_descriptor_versions(value: &[u8]) -> Option<WtpVersions> {
+    let needle = VENDOR_ID.to_be_bytes();
+    let start = value.windows(needle.len()).position(|w| w == needle)?;
+    let mut rest = &value[start..];
+    let mut versions = WtpVersions::default();
+    while rest.len() >= 8 {
+        let vendor = u32::from_be_bytes([rest[0], rest[1], rest[2], rest[3]]);
+        if vendor != VENDOR_ID {
+            break;
+        }
+        let id = u16::from_be_bytes([rest[4], rest[5]]);
+        let len = u16::from_be_bytes([rest[6], rest[7]]) as usize;
+        if rest.len() < 8 + len {
+            break;
+        }
+        let record = &rest[8..8 + len];
+        match id {
+            0 => versions.hardware = version_pair(record),
+            1 => versions.software = version_triple(record),
+            _ => {}
+        }
+        rest = &rest[8 + len..];
+    }
+    (versions.hardware.is_some() || versions.software.is_some()).then_some(versions)
+}
+
+/// Two u16 as `major.minor`.
+fn version_pair(v: &[u8]) -> Option<String> {
+    let pair: [u8; 4] = v.get(..4)?.try_into().ok()?;
+    Some(format!(
+        "{}.{}",
+        u16::from_be_bytes([pair[0], pair[1]]),
+        u16::from_be_bytes([pair[2], pair[3]])
+    ))
+}
+
+/// Three u16 as `major.minor.patch`.
+fn version_triple(v: &[u8]) -> Option<String> {
+    let n: [u8; 6] = v.get(..6)?.try_into().ok()?;
+    Some(format!(
+        "{}.{}.{}",
+        u16::from_be_bytes([n[0], n[1]]),
+        u16::from_be_bytes([n[2], n[3]]),
+        u16::from_be_bytes([n[4], n[5]])
+    ))
+}
+
 /// Private radio-record base tags AC100 carries in the Configuration Update
 /// Request that brings a radio up. 0x0404 and 0x0406 have no RFC 5416 meaning
 /// and are TP-Link's own per-radio channel/transmit records; 0x0411 (MAC
@@ -789,6 +919,79 @@ mod tests {
         let (vendor, _, tlvs) = vsp::split_value(&e[1].1).unwrap();
         assert_eq!(vendor, VENDOR_ID);
         assert_eq!(tlvs, vec![(35u16, vec![0u8, 0, 0, 1])]);
+    }
+
+    #[test]
+    fn led_update_request_wraps_private_57() {
+        let msg = led_update_request(11, true);
+        assert_eq!(msg.hdr.msg_type, MsgType::CONFIG_UPDATE_REQ);
+        let e = elems(&msg);
+        assert_eq!(e.len(), 1);
+        assert_eq!(e[0].0, MsgElemType::VENDOR_SPECIFIC_PAYLOAD);
+        let (vendor, reserved, tlvs) = vsp::split_value(&e[0].1).unwrap();
+        assert_eq!(vendor, VENDOR_ID);
+        assert_eq!(reserved, 0);
+        assert_eq!(tlvs, vec![(57u16, vec![0u8, 0, 0, 1])]);
+        assert_eq!(
+            elems(&led_update_request(12, false))[0].1,
+            vsp::join_value(VENDOR_ID, 0, &[(57, vec![0, 0, 0, 0])])
+        );
+    }
+
+    #[test]
+    fn led_status_is_parsed_from_private_56() {
+        let on = vsp::join_value(VENDOR_ID, 0, &[(56, vec![0, 0, 0, 1])]);
+        assert_eq!(parse_led_status(&on), Some(true));
+        let off = vsp::join_value(VENDOR_ID, 0, &[(56, vec![0, 0, 0, 0])]);
+        assert_eq!(parse_led_status(&off), Some(false));
+        // Other private records alongside the LED one are ignored.
+        let mixed = vsp::join_value(
+            VENDOR_ID,
+            0,
+            &[(32, vec![0, 0, 0, 0]), (56, vec![0, 0, 0, 1])],
+        );
+        assert_eq!(parse_led_status(&mixed), Some(true));
+        // Missing / short / foreign payloads yield no state.
+        assert_eq!(parse_led_status(&vsp::join_value(VENDOR_ID, 0, &[])), None);
+        assert_eq!(
+            parse_led_status(&vsp::join_value(VENDOR_ID, 0, &[(56, vec![0, 1])])),
+            None
+        );
+        assert_eq!(
+            parse_led_status(&vsp::join_value(0x0000_0001, 0, &[(56, vec![0, 0, 0, 1])])),
+            None
+        );
+    }
+
+    #[test]
+    fn model_name_is_parsed_from_private_81() {
+        // Captured private 81 payload of a TL-AP1300GI join request: 16-byte
+        // header (model code 0x13008e02 at offset 4) then `[type][len][value]`.
+        let body = hex(
+            "0100020013008e020000000000000006010f544c2d41503133303047492d506f45040102080101092035454442324530363931303242453946343541334238373531313932424146360718000500000102000802020064030200110402000505020011071b0106000001020008020200640302000f040200050502000f060101",
+        );
+        let value = vsp::join_value(VENDOR_ID, 0, &[(priv_id::AP_MODEL_INFO, body)]);
+        assert_eq!(parse_model_info(&value).as_deref(), Some("TL-AP1300GI-PoE"));
+        // A vendor payload without private 81 (or a foreign vendor) is ignored.
+        assert_eq!(parse_model_info(&vsp::join_value(VENDOR_ID, 0, &[])), None);
+        assert_eq!(
+            parse_model_info(&vsp::join_value(0xdead_beef, 0, &[(81, vec![0; 32])])),
+            None
+        );
+    }
+
+    #[test]
+    fn descriptor_versions_match_ac100_display() {
+        // Captured WTP Descriptor (element 39) value: 6-byte prefix then vendor
+        // records id 0 (hardware) and id 1 (software).
+        let body = hex(
+            "020001010000123456780000000400020000123456780001000e00010000000407e30a0e0000f75c12345678000200040012d688",
+        );
+        let versions = parse_descriptor_versions(&body).unwrap();
+        assert_eq!(versions.hardware.as_deref(), Some("2.0"));
+        assert_eq!(versions.software.as_deref(), Some("1.0.4"));
+        // A value without the enterprise-number chain yields nothing.
+        assert_eq!(parse_descriptor_versions(&[0; 16]), None);
     }
 
     #[test]

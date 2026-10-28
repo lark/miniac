@@ -7,14 +7,20 @@
 
 use std::fmt::Write as _;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Result};
+use dashmap::DashMap;
 use rusqlite::{params, OptionalExtension};
 
 use crate::db::Db;
 
 pub type Mac = [u8; 6];
+
+/// How long a WTP counts as online after its last control packet. The WTP sends
+/// an Echo Request every few seconds (TP-Link ~2 s, RFC default 30 s), so this
+/// window tolerates a missed exchange without leaving a departed AP online.
+const ONLINE_WINDOW: Duration = Duration::from_secs(90);
 
 /// A known WTP device.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,6 +44,10 @@ pub struct Device {
     pub joined_at: Option<u64>,
     /// Admin approval: false = pending (visible but not yet managed).
     pub approved: bool,
+    /// Last known AP LED state: `None` until the WTP reports one (only the
+    /// TP-Link form reports it, in every Echo Request). It doubles as the
+    /// remembered setting: miniac re-applies it when the WTP next enters Run.
+    pub led_on: Option<bool>,
 }
 
 /// Format a MAC as `aa:bb:cc:dd:ee:ff`.
@@ -91,6 +101,7 @@ struct Row {
     last_seen: i64,
     joined_at: Option<i64>,
     approved: bool,
+    led_on: Option<i64>,
 }
 
 fn row_to_device(r: Row) -> Result<Device> {
@@ -113,19 +124,38 @@ fn row_to_device(r: Row) -> Result<Device> {
         last_seen: r.last_seen as u64,
         joined_at: r.joined_at.map(|v| v as u64),
         approved: r.approved,
+        led_on: r.led_on.map(|v| v != 0),
     })
 }
 
-const COLS: &str = "mac,name,description,vendor,model,hw_version,sw_version,ip_addr,state,first_seen,last_seen,joined_at,approved";
+const COLS: &str = "mac,name,description,vendor,model,hw_version,sw_version,ip_addr,state,first_seen,last_seen,joined_at,approved,led_on";
 
 /// Operations over the device table.
 pub struct DeviceStore {
     db: Arc<Db>,
+    /// MAC -> time the WTP's live CAPWAP session was last heard from. Kept in
+    /// memory (not the DB) because the WTP reports every couple of seconds.
+    live: DashMap<Mac, Instant>,
 }
 
 impl DeviceStore {
     pub fn new(db: Arc<Db>) -> Self {
-        DeviceStore { db }
+        DeviceStore {
+            db,
+            live: DashMap::new(),
+        }
+    }
+
+    /// Record that the WTP's CAPWAP session is alive (any control packet).
+    pub fn mark_live(&self, mac: Mac) {
+        self.live.insert(mac, Instant::now());
+    }
+
+    /// Whether the WTP has been heard from within [`ONLINE_WINDOW`].
+    pub fn is_online(&self, mac: Mac) -> bool {
+        self.live
+            .get(&mac)
+            .is_some_and(|t| t.elapsed() < ONLINE_WINDOW)
     }
 
     /// Upsert device learned from the CAPWAP flow (`None` sw/ip leave existing
@@ -243,6 +273,18 @@ impl DeviceStore {
         Ok(())
     }
 
+    /// Remember the AP LED state — reported by the WTP or set from the
+    /// management plane. It is re-applied when the WTP next enters Run, so the
+    /// LED setting survives an AP restart.
+    pub fn set_led_on(&self, mac: Mac, on: bool) -> Result<()> {
+        let conn = self.db.lock();
+        conn.execute(
+            "UPDATE devices SET led_on=?2 WHERE mac=?1",
+            params![&mac[..], i64::from(on)],
+        )?;
+        Ok(())
+    }
+
     /// Look up a single device.
     pub fn get(&self, mac: Mac) -> Result<Option<Device>> {
         let conn = self.db.lock();
@@ -265,6 +307,7 @@ impl DeviceStore {
                         last_seen: r.get(10)?,
                         joined_at: r.get(11)?,
                         approved: r.get::<_, i64>(12)? != 0,
+                        led_on: r.get(13)?,
                     })
                 },
             )
@@ -291,6 +334,7 @@ impl DeviceStore {
                 last_seen: r.get(10)?,
                 joined_at: r.get(11)?,
                 approved: r.get::<_, i64>(12)? != 0,
+                led_on: r.get(13)?,
             })
         })?;
         rows.map(|r| row_to_device(r?)).collect()
@@ -384,5 +428,18 @@ mod tests {
 
         // Approving an unknown device fails.
         assert!(s.approve([0xff; 6]).is_err());
+    }
+
+    #[test]
+    fn led_state_is_unknown_until_set_and_then_persists() {
+        let s = store();
+        let mac = [0x00, 0x00, 0x00, 0x00, 0x00, 0x03];
+        s.register(mac, None, None, None, None, "registered").unwrap();
+        assert_eq!(s.get(mac).unwrap().unwrap().led_on, None);
+
+        s.set_led_on(mac, false).unwrap();
+        assert_eq!(s.get(mac).unwrap().unwrap().led_on, Some(false));
+        s.set_led_on(mac, true).unwrap();
+        assert_eq!(s.get(mac).unwrap().unwrap().led_on, Some(true));
     }
 }

@@ -194,10 +194,16 @@ struct DeviceDto {
     last_seen: u64,
     joined_at: Option<u64>,
     approved: bool,
+    /// Whether the WTP currently has a live CAPWAP session, derived from the
+    /// last control packet rather than the persisted lifecycle state.
+    online: bool,
+    /// Last known AP LED state; `null` when the WTP never reported one (the
+    /// TP-Link form reports it in every Echo Request).
+    led_on: Option<bool>,
 }
 
-impl From<&device::Device> for DeviceDto {
-    fn from(d: &device::Device) -> Self {
+impl DeviceDto {
+    fn new(d: &device::Device, online: bool) -> Self {
         DeviceDto {
             mac: device::mac_to_str(d.mac),
             name: d.name.clone(),
@@ -212,6 +218,8 @@ impl From<&device::Device> for DeviceDto {
             last_seen: d.last_seen,
             joined_at: d.joined_at,
             approved: d.approved,
+            online,
+            led_on: d.led_on,
         }
     }
 }
@@ -354,7 +362,12 @@ struct UpgradeReq {
 // --- Handlers ---
 
 async fn list_devices(State(st): State<Arc<AppData>>) -> Result<Json<Vec<DeviceDto>>, ApiError> {
-    let mut out: Vec<DeviceDto> = st.devices.list()?.iter().map(DeviceDto::from).collect();
+    let mut out: Vec<DeviceDto> = st
+        .devices
+        .list()?
+        .iter()
+        .map(|d| DeviceDto::new(d, st.devices.is_online(d.mac)))
+        .collect();
     out.sort_by(|a, b| a.mac.cmp(&b.mac));
     Ok(Json(out))
 }
@@ -365,7 +378,7 @@ async fn get_device(
 ) -> Result<Json<DeviceDto>, ApiError> {
     let mac = device::mac_from_str(&mac).map_err(ApiError::from)?;
     match st.devices.get(mac)? {
-        Some(d) => Ok(Json((&d).into())),
+        Some(d) => Ok(Json(DeviceDto::new(&d, st.devices.is_online(mac)))),
         None => Err(ApiError::not_found("device not found")),
     }
 }
@@ -386,7 +399,7 @@ async fn update_device(
     let description = meta.description.unwrap_or_default();
     st.devices.set_metadata(mac, &name, &description)?;
     match st.devices.get(mac)? {
-        Some(d) => Ok(Json((&d).into())),
+        Some(d) => Ok(Json(DeviceDto::new(&d, st.devices.is_online(mac)))),
         None => Err(ApiError::not_found("device not found")),
     }
 }
@@ -399,7 +412,7 @@ async fn approve_device(
     let mac = device::mac_from_str(&mac).map_err(ApiError::from)?;
     st.devices.approve(mac)?;
     match st.devices.get(mac)? {
-        Some(d) => Ok(Json((&d).into())),
+        Some(d) => Ok(Json(DeviceDto::new(&d, st.devices.is_online(mac)))),
         None => Err(ApiError::not_found("device not found")),
     }
 }
@@ -891,10 +904,26 @@ async fn trigger_config_update(
         });
     }
     let mut elems = Vec::with_capacity(req.elements.len());
+    let led = req.elements.iter().find_map(|e| match e {
+        ConfigUpdateElemReq::Led { value } => Some(*value != 0),
+        _ => None,
+    });
     for e in req.elements {
         elems.push(e.into_elem()?);
     }
+    // The LED state is also a per-device setting: remember the requested value
+    // so it is shown in the UI and re-applied when the WTP next enters Run,
+    // whether or not it currently has a live session.
+    if let Some(on) = led {
+        st.devices.set_led_on(mac, on)?;
+    }
+    let led_only = matches!(elems.as_slice(), [ConfigUpdateElem::Led(_)]);
     if !st.cfg_update.trigger(mac, ConfigUpdateCmd::Push { elems }) {
+        if led_only {
+            // Nothing to send right now; the setting is stored above and takes
+            // effect at the WTP's next join.
+            return Ok(Json(ConfigUpdateAck { queued: false }));
+        }
         return Err(ApiError::not_found(format!(
             "WTP {} is not in a live session",
             device::mac_to_str(mac)
@@ -1982,6 +2011,10 @@ mod tests {
         let macs = device::mac_to_str(mac);
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
         state.cfg_update.register(mac, tx);
+        state
+            .devices
+            .register(mac, Some("10.0.0.1"), None, None, None, "Run")
+            .unwrap();
 
         let body = serde_json::json!({
             "elements": [
@@ -2018,8 +2051,16 @@ mod tests {
             ),
             _ => panic!("expected a queued Push command"),
         }
+        // The LED value is also remembered as the device's setting.
+        assert_eq!(state.devices.get(mac).unwrap().unwrap().led_on, Some(true));
 
-        // A WTP with no live session is rejected.
+        // A WTP with no live session still remembers an LED setting, applied on
+        // its next join; any other push needs the live session.
+        let offline = device::mac_from_str("0a:0b:0c:0d:0e:0f").unwrap();
+        state
+            .devices
+            .register(offline, None, None, None, None, "unknown")
+            .unwrap();
         let res = app
             .oneshot(
                 Request::builder()
@@ -2034,7 +2075,11 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            state.devices.get(offline).unwrap().unwrap().led_on,
+            Some(false)
+        );
     }
 
     async fn put_json(

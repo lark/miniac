@@ -151,7 +151,7 @@ trailing bytes zero the WTP answers 0x0033DD02 with success but never puts the S
 | 0xFDF0 | Keep-alive interval | u32 | AC→WTP message type 7 | code |
 | 0xFDF1 | WLAN batch (runtime WLAN push) | opaque blob `?` | AC→WTP message type 7 | code |
 | 0xFDF2 | AP name | NUL-terminated string | AC→WTP message type 7 | code |
-| 0xFDF4 | LED | u32 | AC→WTP message type 7 | code |
+| 0xFDF4 | LED switch: `0` = all LEDs off (`led_control stop`), non-zero = normal indication (`led_control restart`) | u32, exactly 4B | AC→WTP message type 7; also in the message type 6 snapshot | code |
 | 0xFDF5 | Telnet | u32 | AC→WTP message type 7 | code |
 | 0xFDF7 | Roaming | u32 | AC→WTP message type 7 | code |
 | 0xFDF9 | Channel | 2B `[radio][channel]` | AC→WTP message type 7 | code |

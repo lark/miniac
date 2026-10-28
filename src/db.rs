@@ -27,7 +27,8 @@ CREATE TABLE IF NOT EXISTS devices (
     first_seen  INTEGER NOT NULL,
     last_seen   INTEGER NOT NULL,
     joined_at   INTEGER,
-    approved    INTEGER NOT NULL DEFAULT 0  -- 0=pending(awaiting admin), 1=managed
+    approved    INTEGER NOT NULL DEFAULT 0, -- 0=pending(awaiting admin), 1=managed
+    led_on      INTEGER                     -- NULL=unknown, 0=off, 1=on
 );
 
 CREATE TABLE IF NOT EXISTS radios (
@@ -263,8 +264,15 @@ impl Db {
         conn.execute_batch(SCHEMA).context("create schema")?;
         // Migrations: add columns to pre-existing databases where the
         // CREATE TABLE IF NOT EXISTS above is a no-op.
-        ensure_columns(&conn, "devices", &[("approved", "INTEGER NOT NULL DEFAULT 0")])
-            .context("migrate devices.approved")?;
+        ensure_columns(
+            &conn,
+            "devices",
+            &[
+                ("approved", "INTEGER NOT NULL DEFAULT 0"),
+                ("led_on", "INTEGER"),
+            ],
+        )
+        .context("migrate devices.approved")?;
         ensure_columns(
             &conn,
             "radios",

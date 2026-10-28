@@ -101,7 +101,10 @@ pub struct WtpContext {
     /// (STATION_CONFIG_REQ) after the link enters the Run state.
     pub stations: Vec<RuntimeStation>,
 
-    pub led_enabled: bool,
+    /// AP LED state last reported by the WTP; `None` until it reports one
+    /// (TP-Link carries it in every Echo Request). The same value is persisted
+    /// per device, so the management plane can show and re-apply it.
+    pub led_on: Option<bool>,
     pub session_id: u64,
     pub last_seen: Instant,
     /// The AC's single outstanding Request awaiting its Response.
@@ -290,7 +293,7 @@ impl WtpContext {
             boot_version: 0,
             radios: Vec::new(),
             stations: Vec::new(),
-            led_enabled: true,
+            led_on: None,
             session_id: 0,
             last_seen: Instant::now(),
             last_sent: None,

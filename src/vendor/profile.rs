@@ -15,7 +15,7 @@
 use std::net::Ipv4Addr;
 use std::path::Path;
 
-use crate::capwap::{CtrlMsg, MsgElemType};
+use crate::capwap::{CtrlMsg, MsgElemType, MsgType};
 use crate::config::{self, Akm, Cipher, SecurityPolicy};
 use crate::elements::ImageIdentifier;
 use crate::vendor::framing::CtrlFrame;
@@ -158,6 +158,22 @@ impl VendorProfile {
     /// [`VendorProfile::reset_request`] with a factory-default mask instead.
     pub fn clear_config_request(self, seq: u32) -> CtrlMsg {
         config::clear_config_request(seq)
+    }
+
+    /// LED on/off Configuration Update for this profile.
+    ///
+    /// H3C carries the u32 state in its 0xfdf4 element. TP-Link AC100 wraps the
+    /// same u32 in private 57 inside the Vendor Specific Payload (captured from
+    /// a TL-AC100 ↔ TL-AP1300GI session). RFC has no standard LED element, so
+    /// it keeps the H3C-shaped tag it used before.
+    pub fn led_update_request(self, seq: u32, on: bool) -> CtrlMsg {
+        match self {
+            VendorProfile::TpLink => tplink::led_update_request(seq, on),
+            VendorProfile::H3c | VendorProfile::Rfc => {
+                CtrlMsg::new(MsgType::CONFIG_UPDATE_REQ, seq)
+                    .add_elem(h3c::CFG_LED, &u32::from(on).to_be_bytes())
+            }
+        }
     }
 
     /// Map a vendor-neutral IEEE channel number for a band to this vendor's
