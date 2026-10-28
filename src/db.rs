@@ -87,7 +87,8 @@ CREATE TABLE IF NOT EXISTS firmware_images (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     vendor      TEXT NOT NULL,
     model       TEXT NOT NULL,
-    hw_version  TEXT NOT NULL,
+    hw_version  TEXT NOT NULL DEFAULT '',   -- empty = all hardware revisions
+    version     TEXT NOT NULL DEFAULT '',   -- software version recovered from the image
     file_name   TEXT NOT NULL,             -- e.g. "ac100v3-1.3.bin"
     size        INTEGER NOT NULL,
     hash        BLOB NOT NULL,             -- 16-byte MD5 image hash (RFC 5415)
@@ -192,6 +193,12 @@ CREATE TABLE IF NOT EXISTS cfg_pending (
     mac       BLOB PRIMARY KEY NOT NULL,
     marked_at INTEGER NOT NULL
 );
+
+-- Runtime system settings edited from the web plane (key/value).
+CREATE TABLE IF NOT EXISTS sys_setting (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL DEFAULT ''
+);
 "#;
 
 /// Initialization defaults, applied idempotently on open. These fill the
@@ -273,6 +280,13 @@ impl Db {
             ],
         )
         .context("migrate devices.approved")?;
+        // Images catalogued before format detection have no recovered version.
+        ensure_columns(
+            &conn,
+            "firmware_images",
+            &[("version", "TEXT NOT NULL DEFAULT ''")],
+        )
+        .context("migrate firmware_images.version")?;
         ensure_columns(
             &conn,
             "radios",

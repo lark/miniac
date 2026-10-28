@@ -133,6 +133,53 @@ pub fn image_identifier(name: &[u8]) -> BaseElem {
     BaseElem::ImageIdentifier(ImageIdentifier::new(VENDOR_ID, name.to_vec()))
 }
 
+/// Firmware version carried in the Image Identifier, in the 14-byte binary form
+/// AC100 sends (`apupd_software_version_to_buffer` 0x5386bc): `[major u16]
+/// [minor u16][patch u16][build u32][rel u32]`, all big-endian. The WTP parses
+/// it with `CWParseImageIdentifier` (0x41ca70) after the 0x12345678 vendor id.
+///
+/// TP-Link AP images are named `..._<major>.<minor>.<patch>_Build_<date>_Rel.<rel>`
+/// (e.g. `TL-AP1300GI-PoE_V2.0_1.0.6_Build_20200311_Rel.13347.bin`), so the
+/// version is recovered from the file name. An unparsable name yields all
+/// zeros: still different from the WTP's own identifier, so it still triggers
+/// the download, but it carries no usable version for a comparison.
+pub fn image_version(file_name: &str) -> [u8; 14] {
+    let mut version = [0u8; 14];
+    let parts: Vec<&str> = file_name.split('_').collect();
+    for (i, part) in parts.iter().enumerate() {
+        if part.starts_with('V') {
+            continue; // hardware version, e.g. V2.0
+        }
+        if let Some((major, minor, patch)) = dotted_version(part) {
+            version[0..2].copy_from_slice(&major.to_be_bytes());
+            version[2..4].copy_from_slice(&minor.to_be_bytes());
+            version[4..6].copy_from_slice(&patch.to_be_bytes());
+        } else if part.eq_ignore_ascii_case("Build") {
+            if let Some(date) = parts.get(i + 1).and_then(|p| p.parse::<u32>().ok()) {
+                version[6..10].copy_from_slice(&date.to_be_bytes());
+            }
+        } else if let Some(rel) = part.strip_prefix("Rel.") {
+            let digits: String = rel.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if let Ok(rel) = digits.parse::<u32>() {
+                version[10..14].copy_from_slice(&rel.to_be_bytes());
+            }
+        }
+    }
+    version
+}
+
+/// `X.Y.Z` → three numbers, rejecting anything else (e.g. a bare date).
+fn dotted_version(s: &str) -> Option<(u16, u16, u16)> {
+    let mut it = s.split('.');
+    let major = it.next()?.parse().ok()?;
+    let minor = it.next()?.parse().ok()?;
+    let patch = it.next()?.parse().ok()?;
+    if it.next().is_some() {
+        return None;
+    }
+    Some((major, minor, patch))
+}
+
 /// Wrap private TLVs in the RFC 37 Vendor Specific Payload element.
 pub fn vendor_specific(tlvs: Vec<(u16, Vec<u8>)>) -> BaseElem {
     vendor_specific_rsv(0, tlvs)
@@ -1003,6 +1050,20 @@ mod tests {
         assert_eq!(e[0].0, MsgElemType::IMAGE_ID);
         assert_eq!(e[0].1.len(), 4 + 14);
         assert_eq!(e[0].1[..4], [0x12, 0x34, 0x56, 0x78]);
+    }
+
+    /// The 14-byte version blob AC100 sends in the Image Identifier, recovered
+    /// from a TP-Link AP image file name.
+    #[test]
+    fn image_version_from_file_name() {
+        let v = image_version("TL-AP1300GI-PoE_V2.0_1.0.6_Build_20200311_Rel.13347.bin");
+        assert_eq!(&v[0..2], &1u16.to_be_bytes()); // major
+        assert_eq!(&v[2..4], &0u16.to_be_bytes()); // minor
+        assert_eq!(&v[4..6], &6u16.to_be_bytes()); // patch
+        assert_eq!(&v[6..10], &20200311u32.to_be_bytes()); // build date
+        assert_eq!(&v[10..14], &13347u32.to_be_bytes()); // rel
+        // An unparsable name carries no version (all zeros).
+        assert_eq!(image_version("unparsable.bin"), [0u8; 14]);
     }
 
     #[test]

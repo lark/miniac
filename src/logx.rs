@@ -15,6 +15,57 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Host-local wall-clock timestamp with microsecond precision and its UTC
+/// offset, e.g. `2026-10-28T02:29:03.123456+08:00`.
+///
+/// Log lines and `-D` dumps both use it so the stamps match the clock of the
+/// host running miniac instead of UTC. `localtime_r` is re-entrant and picks up
+/// the host's current zone (and DST) on every call.
+pub fn local_timestamp() -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = now.as_secs() as libc::time_t;
+    let micros = now.subsec_micros();
+    // SAFETY: `localtime_r` fills the caller-provided `tm` and returns it (or
+    // null on failure); it does not touch shared state.
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    let ok = unsafe { libc::localtime_r(&secs, &mut tm) };
+    if ok.is_null() {
+        // No usable local zone: fall back to UTC rather than drop the stamp.
+        return format!("{secs}.{micros:06}+00:00");
+    }
+    let offset = tm.tm_gmtoff;
+    let sign = if offset < 0 { '-' } else { '+' };
+    let abs = offset.unsigned_abs();
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:06}{}{:02}:{:02}",
+        tm.tm_year + 1900,
+        tm.tm_mon + 1,
+        tm.tm_mday,
+        tm.tm_hour,
+        tm.tm_min,
+        tm.tm_sec,
+        micros,
+        sign,
+        abs / 3600,
+        (abs % 3600) / 60,
+    )
+}
+
+/// `tracing` timer that stamps every event with [`local_timestamp`], so log
+/// files carry the host's local time instead of the default UTC clock.
+pub struct LocalTimer;
+
+impl tracing_subscriber::fmt::time::FormatTime for LocalTimer {
+    fn format_time(
+        &self,
+        w: &mut tracing_subscriber::fmt::format::Writer<'_>,
+    ) -> std::fmt::Result {
+        write!(w, "{}", local_timestamp())
+    }
+}
+
 /// Management log event category (mirrors business modules).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)] // most variants are used as higher milestones land
@@ -139,6 +190,18 @@ pub fn admin(msg: impl AsRef<str>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The stamp is ISO 8601 with microseconds and an explicit UTC offset.
+    #[test]
+    fn local_timestamp_shape() {
+        let ts = local_timestamp();
+        assert_eq!(ts.len(), 32, "{ts}");
+        assert_eq!(&ts[4..5], "-");
+        assert_eq!(&ts[10..11], "T");
+        let offset = &ts[26..];
+        assert!(offset.starts_with('+') || offset.starts_with('-'), "{ts}");
+        assert_eq!(&offset[3..4], ":");
+    }
 
     // The shared static MGMT is affected by parallel tests; keep assertions in one test.
     #[test]

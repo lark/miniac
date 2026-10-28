@@ -18,7 +18,7 @@ use std::{
 
 use anyhow::{anyhow, bail, Context, Result};
 use axum::{
-    extract::{Multipart, Path, Query, State},
+    extract::{DefaultBodyLimit, Multipart, Path, Query, State},
     http::StatusCode,
     response::{Html, IntoResponse},
     routing::{get, post},
@@ -35,7 +35,7 @@ use crate::fleet::{ClientGroup, ProductCapsStore};
 use crate::vendor::h3c::ConfigUpdateElem;
 use crate::vendor::profile::VendorProfile;
 use crate::device::{self, DeviceStore};
-use crate::firmware::{FirmwareStore, UpgradeCmd, UpgradeRegistry};
+use crate::firmware::{FirmwarePolicy, FirmwareStore, UpgradeCmd, UpgradeRegistry};
 use crate::logx;
 use crate::radio::{H3cRadioHeader, RadioStore, RadioWlan};
 use crate::security::ProfileStore;
@@ -52,6 +52,7 @@ pub struct AppData {
     pub stations: Arc<StationStore>,
     pub profiles: Arc<ProfileStore>,
     pub fw: Arc<FirmwareStore>,
+    pub fw_policy: Arc<FirmwarePolicy>,
     pub upgrade: Arc<UpgradeRegistry>,
     pub cfg_update: Arc<ConfigUpdateRegistry>,
     pub wtp_cmd: Arc<WtpCmdRegistry>,
@@ -67,6 +68,7 @@ impl AppData {
         stations: Arc<StationStore>,
         profiles: Arc<ProfileStore>,
         fw: Arc<FirmwareStore>,
+        fw_policy: Arc<FirmwarePolicy>,
         upgrade: Arc<UpgradeRegistry>,
         cfg_update: Arc<ConfigUpdateRegistry>,
         wtp_cmd: Arc<WtpCmdRegistry>,
@@ -79,6 +81,7 @@ impl AppData {
             stations,
             profiles,
             fw,
+            fw_policy,
             upgrade,
             cfg_update,
             wtp_cmd,
@@ -98,6 +101,13 @@ impl ApiError {
     fn not_found(msg: impl Into<String>) -> Self {
         ApiError {
             status: StatusCode::NOT_FOUND,
+            msg: msg.into(),
+        }
+    }
+
+    fn bad_request(msg: impl Into<String>) -> Self {
+        ApiError {
+            status: StatusCode::BAD_REQUEST,
             msg: msg.into(),
         }
     }
@@ -142,8 +152,16 @@ fn router(state: Arc<AppData>) -> Router {
         )
         .route("/api/stations", get(list_stations))
         .route("/api/profiles", get(list_profiles).post(create_profile))
-        .route("/api/firmware", get(list_firmware).post(upload_firmware))
+        // AP images are multi-megabyte; axum's 2 MiB default body limit rejects
+        // them before the multipart parser sees a single field.
+        .route(
+            "/api/firmware",
+            get(list_firmware)
+                .post(upload_firmware)
+                .layer(DefaultBodyLimit::max(128 * 1024 * 1024)),
+        )
         .route("/api/devices/{mac}/upgrade", post(trigger_upgrade))
+        .route("/api/system", get(get_system).put(set_system))
         .route("/api/devices/{mac}/config-update", post(trigger_config_update))
         .route("/api/devices/{mac}/reset", post(reset_device))
         .route("/api/devices/{mac}/disable", post(disable_device))
@@ -330,6 +348,7 @@ struct FirmwareImageDto {
     vendor: String,
     model: String,
     hw_version: String,
+    version: String,
     file_name: String,
     size: u64,
     hash: String,
@@ -345,6 +364,7 @@ impl From<&crate::firmware::FirmwareImage> for FirmwareImageDto {
             vendor: i.vendor.clone(),
             model: i.model.clone(),
             hw_version: i.hw_version.clone(),
+            version: i.version.clone(),
             file_name: i.file_name.clone(),
             size: i.size,
             hash,
@@ -781,30 +801,83 @@ async fn upload_firmware(
 
     let file_name = file_name.filter(|f| !f.is_empty());
     let file_bytes = file_bytes.unwrap_or_default();
-    if vendor.is_empty()
-        || model.is_empty()
-        || hw_version.is_empty()
-        || file_name.is_none()
-        || file_bytes.is_empty()
-    {
-        return Err(ApiError::not_found(
-            "missing firmware fields ('vendor','model','hw_version','file')",
-        ));
+    let file_name =
+        file_name.ok_or_else(|| ApiError::bad_request("missing firmware file"))?;
+    if file_bytes.is_empty() {
+        return Err(ApiError::bad_request("empty firmware file"));
     }
 
-    let img = st.fw.save_image(
-        &vendor,
-        &model,
-        &hw_version,
-        file_name.unwrap().as_str(),
+    // Vendor / model / hardware are optional: the image format supplies them,
+    // and a non-empty field only overrides what was detected.
+    fn given(s: &str) -> Option<&str> {
+        let s = s.trim();
+        (!s.is_empty()).then_some(s)
+    }
+    if crate::firmware::detect_image(&file_name, &file_bytes).is_none()
+        && (given(&vendor).is_none() || given(&model).is_none())
+    {
+        return Err(ApiError::bad_request(format!(
+            "unrecognized firmware '{file_name}': supported formats are h3c and tplink; \
+             fill vendor and model to store it explicitly"
+        )));
+    }
+
+    let img = st.fw.save_upload(
+        &file_name,
         &file_bytes,
+        given(&vendor),
+        given(&model),
+        given(&hw_version),
     )?;
+    let version = if img.version.is_empty() {
+        "-"
+    } else {
+        img.version.as_str()
+    };
     logx::firmware(format!(
-        "firmware uploaded: {} ({:.1} KiB)",
+        "firmware uploaded: {} ({:.1} KiB, {} {} {})",
         img.stored_path,
         img.size as f64 / 1024.0,
+        img.vendor,
+        img.model,
+        version,
     ));
     Ok(Json((&img).into()))
+}
+
+#[derive(Serialize)]
+struct SystemDto {
+    update_firmware_on_startup: bool,
+}
+
+#[derive(Deserialize)]
+struct SystemReq {
+    update_firmware_on_startup: bool,
+}
+
+async fn get_system(State(st): State<Arc<AppData>>) -> Json<SystemDto> {
+    Json(SystemDto {
+        update_firmware_on_startup: st.fw_policy.update_on_join(),
+    })
+}
+
+async fn set_system(
+    State(st): State<Arc<AppData>>,
+    Json(req): Json<SystemReq>,
+) -> Result<Json<SystemDto>, ApiError> {
+    st.fw_policy
+        .set_update_on_join(req.update_firmware_on_startup)?;
+    logx::system(format!(
+        "startup firmware update {}",
+        if req.update_firmware_on_startup {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    ));
+    Ok(Json(SystemDto {
+        update_firmware_on_startup: st.fw_policy.update_on_join(),
+    }))
 }
 
 async fn trigger_upgrade(
@@ -824,11 +897,45 @@ async fn trigger_upgrade(
     );
 
     let _record = st.fw.record_start(&mac, &name, img.size as u32, &img.hash);
-    if !st.upgrade.trigger(mac, UpgradeCmd::Start { image: bytes }) {
-        return Err(ApiError::not_found(format!(
-            "WTP {} is not in a live session",
+    if !st.upgrade.trigger(
+        mac,
+        UpgradeCmd::Start {
+            image: bytes,
+            name: img.file_name.clone(),
+        },
+    ) {
+        // No live session: with startup updates disabled an offline WTP cannot
+        // be upgraded at all, so fail instead of queueing silently.
+        if !st.fw_policy.update_on_join() {
+            return Err(ApiError::bad_request(format!(
+                "WTP {} is offline and startup firmware update is disabled",
+                device::mac_to_str(mac)
+            )));
+        }
+        // No live session: queue the image so an H3C WTP is told about it in
+        // its Join Response (the M60 join-time entry) rather than dropping the
+        // request.
+        // Either side can identify the H3C path: the device may not have joined
+        // yet (no vendor recorded) while the selected image is an H3C one.
+        let is_h3c = img.vendor.eq_ignore_ascii_case("h3c")
+            || st
+                .devices
+                .get(mac)?
+                .map(|d| d.vendor.as_deref() == Some("h3c"))
+                .unwrap_or(false);
+        if !is_h3c {
+            return Err(ApiError::not_found(format!(
+                "WTP {} is not in a live session",
+                device::mac_to_str(mac)
+            )));
+        }
+        st.upgrade.queue_pending(mac, img.id);
+        logx::firmware(format!(
+            "firmware {} queued for WTP {} (announced at next join)",
+            name,
             device::mac_to_str(mac)
-        )));
+        ));
+        return Ok(Json((&img).into()));
     }
     logx::firmware(format!(
         "firmware {} queued for WTP {}",
@@ -1784,6 +1891,7 @@ mod tests {
             Arc::new(StationStore::new(db.clone())),
             Arc::new(ProfileStore::new(db.clone())),
             Arc::new(FirmwareStore::new(db.clone())),
+            Arc::new(FirmwarePolicy::new(db.clone()).unwrap()),
             Arc::new(UpgradeRegistry::new()),
             Arc::new(ConfigUpdateRegistry::new()),
             Arc::new(WtpCmdRegistry::new()),

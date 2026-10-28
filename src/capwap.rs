@@ -36,6 +36,10 @@ pub enum WtpState {
     Configure,
     DataCheck,
     Run,
+    /// Firmware download phase (RFC 5415 3.1 "Join to Image Data"): the WTP
+    /// entered it from the Join state and only Image Data / Echo traffic is
+    /// processed until the transfer completes.
+    ImageData,
 }
 
 #[allow(unused)]
@@ -133,6 +137,10 @@ pub struct WtpContext {
     pub retrans_interval: Duration,
     pub max_retries: u32,
 
+    /// Control framing of this session's peer. The Sequence Number is one octet
+    /// under RFC/TP-Link framing (wraps at 256) and four octets under H3C's, so
+    /// the counter's wrap width follows it.
+    pub frame: crate::vendor::framing::CtrlFrame,
     pub seq_counter: u32,
 }
 
@@ -307,6 +315,7 @@ impl WtpContext {
             echo_interval: Duration::from_secs(30),
             retrans_interval: Duration::from_secs(5),
             max_retries: 3,
+            frame: crate::vendor::framing::CtrlFrame::Rfc,
             seq_counter: 100,
         }
     }
@@ -352,9 +361,17 @@ impl WtpContext {
         doubled.min(self.echo_interval / 2)
     }
 
+    /// Next CAPWAP Sequence Number. The counter wraps at the width of the
+    /// session's framing: one octet under RFC/TP-Link (RFC 5415 4.3), so a
+    /// wider counter would make the ACK for wire seq 0 compare unequal to the
+    /// tracked value; four octets under H3C's framing, which must not wrap.
     pub fn next_seq(&mut self) -> u32 {
         let seq = self.seq_counter;
-        self.seq_counter = self.seq_counter.wrapping_add(1);
+        self.seq_counter = if self.frame.seq_len() == 1 {
+            (seq + 1) & 0xff
+        } else {
+            seq.wrapping_add(1)
+        };
         seq
     }
 
@@ -968,6 +985,7 @@ pub static MSG_SCHEMAS: Lazy<HashMap<u32, MsgSchema>> = Lazy::new(|| {
         MsgSchema {
             mandatory: [].into(),
             optional: [
+                MsgElemType::IMAGE_DATA,
                 MsgElemType::IMAGE_ID,
                 MsgElemType::INIT_DOWNLOAD,
                 MsgElemType::VENDOR_SPECIFIC_PAYLOAD,
@@ -1405,6 +1423,26 @@ mod tests {
         assert!(!seq_is_older(511, 255, CtrlFrame::H3c));
         assert!(!seq_is_older(512, 511, CtrlFrame::H3c));
         assert!(!seq_is_older(9, 9, CtrlFrame::H3c));
+    }
+
+    #[test]
+    fn next_seq_wraps_at_the_framing_width() {
+        use crate::vendor::framing::CtrlFrame;
+        // RFC/TP-Link: one octet on the wire, so the counter must wrap at 256 —
+        // otherwise the WTP's ACK for wire seq 0 never matches the tracked seq.
+        let mut rfc = WtpContext::new("127.0.0.1:5000".parse().unwrap());
+        rfc.frame = CtrlFrame::Rfc;
+        rfc.seq_counter = 254;
+        assert_eq!(rfc.next_seq(), 254);
+        assert_eq!(rfc.next_seq(), 255);
+        assert_eq!(rfc.next_seq(), 0);
+        assert_eq!(rfc.next_seq(), 1);
+        // H3C: four octets on the wire, so it keeps counting past 255.
+        let mut h3c = WtpContext::new("127.0.0.1:5001".parse().unwrap());
+        h3c.frame = CtrlFrame::H3c;
+        h3c.seq_counter = 255;
+        assert_eq!(h3c.next_seq(), 255);
+        assert_eq!(h3c.next_seq(), 256);
     }
 
     #[test]

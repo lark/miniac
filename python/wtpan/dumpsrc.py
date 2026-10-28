@@ -27,7 +27,10 @@ AC_TO_WTP = "AC->WTP"
 
 _RUST_ARRAY = re.compile(r"^\s*\[\s*(\d+(?:\s*,\s*\d+)*)\s*\]\s*$")
 _HEX_LINE = re.compile(r"\[DBG\] ([a-z0-9-]+) (wire|app_data) \((\d+)B\): ([0-9a-fA-F]+)$")
-_TS = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+)Z")
+_TS = re.compile(
+    r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+)(Z|[+-]\d{2}:\d{2})?")
+_ISO_TS = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})?$")
 _CTRL_PAYLOAD = re.compile(r"\[\?\] ctrl payload:")
 
 
@@ -41,14 +44,23 @@ class ScriptEntry:
     opaque: bool = False  # not parseable as a control frame (e.g. DTLS)
 
 
+def _iso_to_micros(s):
+    """Epoch microseconds for an ISO 8601 stamp; a missing zone means UTC."""
+    import datetime
+
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    dt = datetime.datetime.fromisoformat(s)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
+    return int(dt.timestamp() * 1_000_000)
+
+
 def _parse_ts(line):
     m = _TS.match(line)
     if not m:
         return 0
-    import datetime
-    s = m.group(1).replace("Z", "")
-    dt = datetime.datetime.strptime(s, "%Y-%m-%dT%H:%M:%S.%f")
-    return int(dt.replace(tzinfo=datetime.timezone.utc).timestamp() * 1_000_000)
+    return _iso_to_micros(m.group(1) + (m.group(2) or "Z"))
 
 
 def parse_miniac_log(path, frm):
@@ -87,8 +99,10 @@ def parse_miniac_log(path, frm):
 
 
 def parse_dumpfile(path, frm):
-    """Parse miniac `-D` dump lines `RX|TX <ts_us> <hex>`. RX (WTP->AC) is
-    what the tool sends; TX is the AC->WTP reference."""
+    """Parse miniac `-D` dump lines `RX|TX <ts> <hex>`. RX (WTP->AC) is
+    what the tool sends; TX is the AC->WTP reference. `<ts>` is the host-local
+    ISO 8601 stamp (with its UTC offset); integer epoch microseconds from older
+    dumps are still accepted."""
     frm = CtrlFrame(frm) if isinstance(frm, str) else frm
     out = []
     with open(path, "r", errors="replace") as fh:
@@ -101,7 +115,12 @@ def parse_dumpfile(path, frm):
                 continue
             direction = WTP_TO_AC if parts[0] == "RX" else AC_TO_WTP
             try:
-                ts = int(parts[1])
+                if parts[1].isdigit():
+                    ts = int(parts[1])
+                elif _ISO_TS.match(parts[1]):
+                    ts = _iso_to_micros(parts[1])
+                else:
+                    continue
                 payload = bytes.fromhex(parts[2])
             except ValueError:
                 continue

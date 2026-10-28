@@ -3,14 +3,16 @@
 //! Copyright (c) 2026  Wang Jian
 //!
 //! One global append-only file opened at startup. `write` appends a single
-//! `RX|TX <ts_us> <hex>` line where the hex is the full plaintext wire frame
+//! `RX|TX <ts> <hex>` line where the hex is the full plaintext wire frame
 //! (8-byte base header included). RX marks WTP->AC traffic (what a replay tool
-//! would re-send), TX marks AC->WTP replies (the reference responses).
+//! would re-send), TX marks AC->WTP replies (the reference responses). `<ts>` is
+//! the host's local wall-clock time in ISO 8601 with microseconds and the UTC
+//! offset (`2026-10-28T02:29:03.123456+08:00`), so dump lines match the host
+//! clock instead of UTC.
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 static DUMP: Mutex<Option<File>> = Mutex::new(None);
 
@@ -21,14 +23,11 @@ pub fn open(path: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Append one `RX|TX <ts_us> <hex>` line for `io` / `payload`.
+/// Append one `RX|TX <ts> <hex>` line for `io` / `payload`.
 pub fn write(io: &str, payload: &[u8]) {
     let mut guard = DUMP.lock().unwrap();
     if let Some(file) = guard.as_mut() {
-        let ts = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_micros())
-            .unwrap_or(0);
+        let ts = crate::logx::local_timestamp();
         let mut hex = String::with_capacity(payload.len() * 2);
         for b in payload {
             use std::fmt::Write as _;

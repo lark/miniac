@@ -120,6 +120,20 @@ pub fn ac_descriptor(hw: &str, sw: &str) -> Vec<u8> {
     config::ac_descriptor(hw, sw, 0)
 }
 
+/// Prefix on the Image Identifier element (`[4B BE][name][0x00]`) of the H3C
+/// control messages that name an image. The M60 AC hardcodes it as 48
+/// (`sub_1005C888` returns 48 in every Image Identifier it assembles, and its
+/// own Reset Request carries the downloaded image's name) and the AX60 checks
+/// it against `sub_5E308()` == 48:
+///   - Configuration Update Request: mismatch -> result 13
+///     (`CWSaveConfigurationUpdateRequest`); the WTP's own Image Data Request
+///     uses the same value.
+///   - Reset Request: mismatch -> result 10 "Vendor ID invalid"
+///     (`CWWTPManageGenericRunMessage` msg 17), so a reset that should flash a
+///     finished download is rejected without it.
+/// A zero prefix is only sent by the vendor's `all_version` plain-restart form.
+pub const IMAGE_ID_PREFIX: u32 = 48;
+
 /// Build the H3C AX60 Join Response (mtype 4).
 ///
 /// On success the element set is [Result Code, AC Descriptor, AC Name, ECN
@@ -139,6 +153,25 @@ pub fn join_response(seq: u32, ac_ip: Ipv4Addr, ok: bool) -> CtrlMsg {
     }
     CtrlMsg::new(MsgType::JOIN_RESP, seq)
         .with_result_success()
+        .add_elem(MsgElemType::AC_DESCRIPTOR, &ac_descriptor("1.0", "1.0"))
+        .add_elem(MsgElemType::AC_NAME, b"miniac")
+        .add_elem(MsgElemType::ECN_SUPPORT, &[1])
+        .add_element(BaseElem::MaxMessageLen(2048))
+        .add_elem(MsgElemType::CAPWAP_CTRL_IPV4_ADDR, &ac_ipv4_entry(ac_ip))
+        .add_elem(MsgElemType::CAPWAP_LOCAL_IPV4_ADDR, &ac_ip.octets())
+}
+
+/// Join Response (mtype 4) that also announces an image to install.
+///
+/// The M60 AC puts the Image Identifier in the Join Response when the WTP's
+/// version differs from the image it holds (`ACEnterJoin`); the AX60
+/// `CWWTPEnterJoin` (WTPJoinState.c 270-274) compares that string with its own
+/// running version and, when they differ, enters the Image Data state and asks
+/// for the download before it takes any configuration.
+pub fn join_response_with_image(seq: u32, ac_ip: Ipv4Addr, image_name: &[u8]) -> CtrlMsg {
+    CtrlMsg::new(MsgType::JOIN_RESP, seq)
+        .with_result_success()
+        .add_elem(MsgElemType::IMAGE_ID, &image_identifier(image_name))
         .add_elem(MsgElemType::AC_DESCRIPTOR, &ac_descriptor("1.0", "1.0"))
         .add_elem(MsgElemType::AC_NAME, b"miniac")
         .add_elem(MsgElemType::ECN_SUPPORT, &[1])
@@ -168,17 +201,36 @@ pub const WTP_CHAN_UTIL_RESP: u32 = 146;
 /// rejects the request unless its value is exactly 6 bytes.
 pub const ELEM_RELEASE_CLIENT_MAC: u16 = 65;
 
-/// Build a Reset Request (mtype 17) that restarts the WTP on its current image.
+/// Build a Reset Request (mtype 17).
 ///
 /// RFC 5415 9.2; the AX60 parser `CWParseResetRequest` (WTP.dis 0x3ddb8) expects
 /// exactly one Image Identifier element (tag 25) whose value is
-/// `[vendor id u32 BE][image name][0x00]` — the parser forces the final byte to
-/// NUL, so the name must carry its own terminator. vendor id 0 skips the image
-/// check, and the name `all_version` selects the running firmware (any other
-/// name that differs from the current image yields Result 10 and no restart).
-pub fn reset_request(seq: u32) -> CtrlMsg {
-    CtrlMsg::new(MsgType::RESET_REQ, seq)
-        .add_elem(MsgElemType::IMAGE_ID, &image_id_all_version())
+/// `[4B BE][image name][0x00]` — the parser forces the final byte to NUL, so the
+/// name must carry its own terminator.
+///
+/// `image_name` selects which image the WTP restarts on: `all_version` (or an
+/// empty name, used by the management-plane Reset) is the zero-prefix form that
+/// skips the image check and reboots the running firmware (`sub_5E2AC`), while
+/// the name the AC announced for a finished download makes the WTP flash the
+/// file it just received before rebooting (`sub_5E1DC` -> `MW_UpdateApp`). That
+/// named form must carry `IMAGE_ID_PREFIX` (48): the AX60 answers result 10
+/// ("Vendor ID invalid") and does not reboot otherwise.
+pub fn reset_request(seq: u32, image_name: &[u8]) -> CtrlMsg {
+    let body = if image_name.is_empty() || image_name == b"all_version" {
+        image_id_all_version()
+    } else {
+        image_identifier(image_name)
+    };
+    CtrlMsg::new(MsgType::RESET_REQ, seq).add_elem(MsgElemType::IMAGE_ID, &body)
+}
+
+/// Image Identifier value naming an image: `[48 4B BE][name][0x00]`.
+pub fn image_identifier(name: &[u8]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(name.len() + 5);
+    v.extend_from_slice(&IMAGE_ID_PREFIX.to_be_bytes());
+    v.extend_from_slice(name);
+    v.push(0);
+    v
 }
 
 /// Value of the Image Identifier element for a plain restart: vendor id 0, the
@@ -235,6 +287,56 @@ pub fn wtp_mac(elems: &std::collections::HashMap<u16, Vec<CwElem>>) -> Option<[u
         }
         _ => None,
     }
+}
+
+/// H3C private element carrying the external (release) version string, e.g.
+/// `SWBA1B0V100R010` — the external version shown on the WTP's own debug
+/// page (`CWAssembleJoinRequest` sub_1A068 on AX60). This is what the WTP
+/// compares against an announced image identifier.
+pub const ELEM_RELEASE_VERSION: u16 = 0x40;
+
+/// H3C private element carrying the internal (build) version string, e.g.
+/// `SWBA1B0V100D017` (the internal version, sub_19F7C on AX60). Sent alongside the
+/// release version; miniac only uses it when the release element is missing.
+pub const ELEM_BUILD_VERSION: u16 = 0x3D;
+
+/// Hardware revision of an H3C WTP from its WTP Descriptor value.
+///
+/// H3C does not use the RFC two-u32 layout: the descriptor starts with a 1-byte
+/// hardware revision followed by 1-byte software revision, two 0x01 bytes and a
+/// u16 (`sub_18D64` on AX60). The AX60 reports 2, which its Web UI renders as
+/// `VER.B` (A=1, B=2, …).
+pub fn descriptor_hardware_version(descriptor: &[u8]) -> Option<u8> {
+    descriptor.first().copied().filter(|v| *v != 0)
+}
+
+/// Short form of an H3C version string: `SWBA1B0V100R010` -> `R010`. Keeps the
+/// trailing marker (`R` = release, `D` = build) and its digits, dropping the
+/// product model and the `V100` platform prefix. Returns `None` when the value
+/// does not follow that `<model>[V<digits>]<marker><digits>` shape, so callers
+/// fall back to the raw descriptor bytes.
+pub fn short_version(value: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(value);
+    let trimmed = text.trim_matches(|c: char| c == '\0' || c.is_whitespace());
+    let bytes = trimmed.as_bytes();
+    let mut i = bytes.len();
+    while i > 0 && bytes[i - 1].is_ascii_digit() {
+        i -= 1;
+    }
+    // Need digits at the end and a marker letter (with a model prefix) before.
+    if i == bytes.len() || i == 0 {
+        return None;
+    }
+    let marker = bytes[i - 1];
+    if !marker.is_ascii_uppercase() {
+        return None;
+    }
+    // A marker without the `V100` platform prefix is a model suffix such as the
+    // trailing "B0" of `SWBA1B0`, not a version.
+    if !bytes[..i - 1].contains(&b'V') {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&bytes[i - 1..]).into_owned())
 }
 
 /// H3C 0xfde8 security selectors for a WLAN policy: the encrypt-type byte plus
@@ -574,9 +676,12 @@ impl ConfigUpdateElem {
             }
             ConfigUpdateElem::AcAddressChange(ip) => (CFG_AC_ADDR_CHANGE, ip.octets().to_vec()),
             ConfigUpdateElem::ImageIdentifier { vendor_id, name } => {
-                let mut b = Vec::with_capacity(4 + name.len());
+                // The M60 sends the name as a C string (its encoder allocates
+                // strlen+5: vendor id, name, terminator).
+                let mut b = Vec::with_capacity(5 + name.len());
                 b.extend_from_slice(&vendor_id.to_be_bytes());
                 b.extend_from_slice(name);
+                b.push(0);
                 (CFG_IMAGE_IDENTIFIER, b)
             }
             ConfigUpdateElem::WlanBatch(blob) => (CFG_WLAN_BATCH, blob.clone()),
@@ -787,6 +892,25 @@ mod tests {
     }
 
     #[test]
+    fn short_version_strips_model_and_platform() {
+        assert_eq!(short_version(b"SWBA1B0V100R010\0").as_deref(), Some("R010"));
+        assert_eq!(short_version(b"SWBA1B0V100D017").as_deref(), Some("D017"));
+        assert_eq!(short_version(b"SWBA1A0V100R006").as_deref(), Some("R006"));
+        // A bare model name (no V-platform prefix) is not a version.
+        assert_eq!(short_version(b"SWBA1B0"), None);
+        assert_eq!(short_version(b""), None);
+    }
+
+    #[test]
+    fn descriptor_hardware_version_is_first_byte() {
+        // AX60 descriptor prefix: hardware 2 (VER.B), software 2, then 0x01 0x01.
+        let body = [0x02u8, 0x02, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00];
+        assert_eq!(descriptor_hardware_version(&body), Some(2));
+        assert_eq!(descriptor_hardware_version(&[]), None);
+        assert_eq!(descriptor_hardware_version(&[0]), None);
+    }
+
+    #[test]
     fn parses_config_status_req() {
         let msg = CtrlMsg::new(MsgType::CONFIG_STATUS_REQ, 1)
             .add_elem(MsgElemType::WTP_NAME, b"AX60name\0")
@@ -943,7 +1067,7 @@ mod tests {
         );
         assert_eq!(
             ImageIdentifier { vendor_id: 1916, name: b"fw".to_vec() }.encode(),
-            (CFG_IMAGE_IDENTIFIER, vec![0, 0, 7, 124, b'f', b'w'])
+            (CFG_IMAGE_IDENTIFIER, vec![0, 0, 7, 124, b'f', b'w', 0])
         );
         assert_eq!(
             WlanBatch(vec![1, 2, 3]).encode(),
@@ -975,7 +1099,7 @@ mod tests {
             image_id_all_version(),
             vec![0, 0, 0, 0, b'a', b'l', b'l', b'_', b'v', b'e', b'r', b's', b'i', b'o', b'n', 0]
         );
-        let msg = reset_request(7);
+        let msg = reset_request(7, b"all_version");
         assert_eq!(msg.hdr.msg_type, MsgType::RESET_REQ);
         assert_eq!(msg.hdr.seq_num, 7);
         assert_eq!(msg.elems.len(), 1);
@@ -984,6 +1108,13 @@ mod tests {
         // Sanity: the element body carries its own trailing NUL (the AX60 parser
         // forces the last byte to NUL, so an unterminated name is truncated).
         assert_eq!(*msg.elems[0].data.last().unwrap(), 0);
+
+        // A named image (finished download) carries the 48 prefix and makes the
+        // WTP flash the received file before rebooting.
+        let fw_msg = reset_request(8, b"SWBA1B0V100D017");
+        assert_eq!(fw_msg.elems[0].data, image_identifier(b"SWBA1B0V100D017"));
+        assert_eq!(&fw_msg.elems[0].data[..4], &IMAGE_ID_PREFIX.to_be_bytes());
+        assert_eq!(*fw_msg.elems[0].data.last().unwrap(), 0);
     }
 
     #[test]

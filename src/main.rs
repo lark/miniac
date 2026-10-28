@@ -46,6 +46,32 @@ use elements::BaseElem;
 /// its reset requests carry the fixed `all_version` image identifier.
 const RESET_IMAGE_NAME: &[u8] = b"all_version";
 
+/// Image Data block size used for firmware downloads. 512 bytes stays well
+/// below the smallest MTU of the control path and matches the historical
+/// transfer shape of the supported WTPs.
+const IMAGE_BLOCK_SIZE: usize = 512;
+
+/// Gap between the Image Data Response and the first block on the H3C path. The
+/// AX60 reads datagrams while it waits for the answer to its Image Data Request
+/// (WTP.dis `sub_15CB0`), so a block sent in the same burst never reaches its
+/// Image Data state.
+const FIRST_BLOCK_DELAY_MS: u64 = 500;
+
+/// Delay before the H3C Run-state Reset Request. The AX60 answers a Reset
+/// Request in the same burst as the last Image Data Response immediately
+/// (result 0) but then does not flash or reboot (`CWWTPManageGenericRunMessage`
+/// still holds the download state); sending the reset a moment later lets the
+/// WTP settle and actually run `MW_UpdateApp`.
+const RESET_DELAY: Duration = Duration::from_secs(3);
+
+/// Gap between Reset Request retries while the WTP keeps its session. A reset
+/// that takes effect reboots the WTP (the session dies), so retries only fire
+/// when the previous reset did not stick.
+const RESET_RETRY: Duration = Duration::from_secs(10);
+
+/// Reset Requests sent before giving up on one transfer.
+const RESET_ATTEMPTS: u32 = 3;
+
 /// How long to wait for the WTP's reply to a serialized vendor push frame
 /// before releasing the next one (`WtpContext::push_queue`). AC100's own pacing
 /// is ~2.3s; this leaves margin for a slower WTP without stalling the push.
@@ -75,8 +101,11 @@ fn is_dtls_client_hello(pkt: &[u8]) -> bool {
 #[tokio::main]
 async fn main() -> Result<()> {
     // Honor RUST_LOG (e.g. RUST_LOG=debug) for runtime message-level tracing.
+    // Stamp events in the host's local time (with its UTC offset) so log files
+    // line up with the host clock instead of UTC.
     tracing_subscriber::fmt()
         .with_target(true)
+        .with_timer(logx::LocalTimer)
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
@@ -129,6 +158,7 @@ async fn main() -> Result<()> {
     let profiles = Arc::new(security::ProfileStore::new(db.clone())); // 802.1X / RSN policy store
     let fw = Arc::new(firmware::FirmwareStore::with_root(db.clone(), "firmware")); // image catalog + upgrade audit
     std::fs::create_dir_all("firmware")?;
+    let fw_policy = Arc::new(firmware::FirmwarePolicy::new(db.clone())?); // join-time upgrade switch (default off)
     let upgrade_reg = Arc::new(firmware::UpgradeRegistry::new()); // web -> live-session firmware trigger
     let cfg_update_reg = Arc::new(config::ConfigUpdateRegistry::new()); // web -> live-session config-update trigger
     let wtp_cmd_reg = Arc::new(wtpcmd::WtpCmdRegistry::new()); // web -> live-session reset/disable/release-client trigger
@@ -150,6 +180,7 @@ async fn main() -> Result<()> {
         stations.clone(),
         profiles.clone(),
         fw.clone(),
+        fw_policy.clone(),
         upgrade_reg.clone(),
         cfg_update_reg.clone(),
         wtp_cmd_reg.clone(),
@@ -168,7 +199,7 @@ async fn main() -> Result<()> {
     // M8: H3C FIT-AP stage-1 discovery responder. The WTP leases its own IP,
     // gateway and the AC address (DHCP-like) over the private port 10087 before
     // it starts CAPWAP unicast on 5246. The pool defaults to
-    // 192.168.0.50..192.168.0.80 (persisted in miniac.db); the AC address is
+    // 192.168.5.50..192.168.5.80 (persisted in miniac.db); the AC address is
     // the address the request arrived on, so a multihomed AC needs no override.
     if settings.stage1.enabled {
         let stage_bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), stage1::STAGE1_PORT);
@@ -232,6 +263,7 @@ async fn main() -> Result<()> {
             radios.clone(),
             stations.clone(),
             fw.clone(),
+            fw_policy.clone(),
             upgrade_reg.clone(),
             cfg_update_reg.clone(),
             wtp_cmd_reg.clone(),
@@ -260,6 +292,7 @@ async fn run_control_socket(
     radios: Arc<radio::RadioStore>,
     stations: Arc<station::StationStore>,
     fw: Arc<firmware::FirmwareStore>,
+    fw_policy: Arc<firmware::FirmwarePolicy>,
     upgrade_reg: Arc<firmware::UpgradeRegistry>,
     cfg_update_reg: Arc<config::ConfigUpdateRegistry>,
     wtp_cmd_reg: Arc<wtpcmd::WtpCmdRegistry>,
@@ -383,6 +416,7 @@ async fn run_control_socket(
                 radios.clone(),
                 stations.clone(),
                 fw.clone(),
+                fw_policy.clone(),
                 upgrade_reg.clone(),
                 cfg_update_reg.clone(),
                 wtp_cmd_reg.clone(),
@@ -459,6 +493,7 @@ async fn start_new_session(
     radios: Arc<radio::RadioStore>,
     stations: Arc<station::StationStore>,
     fw: Arc<firmware::FirmwareStore>,
+    fw_policy: Arc<firmware::FirmwarePolicy>,
     upgrade: Arc<firmware::UpgradeRegistry>,
     cfg_update: Arc<config::ConfigUpdateRegistry>,
     wtp_cmd: Arc<wtpcmd::WtpCmdRegistry>,
@@ -475,8 +510,8 @@ async fn start_new_session(
     tokio::spawn(async move {
         info!("[*] with {}: session thread spawned ({:?})", peer, profile);
         if let Err(e) = handle_session(
-            peer, profile, rx, sock_clone, conf_clone, devices, radios, stations, fw, upgrade,
-            cfg_update, wtp_cmd, wcfg, ac_ip, h3c,
+            peer, profile, rx, sock_clone, conf_clone, devices, radios, stations, fw, fw_policy,
+            upgrade, cfg_update, wtp_cmd, wcfg, ac_ip, h3c,
         )
         .await
         {
@@ -554,6 +589,127 @@ fn apply_station_report(
     Ok(changed)
 }
 
+/// Resolve the image a WTP asked for in the Image Identifier of its Image Data
+/// Request: an exact catalogue match wins, otherwise the newest image for the
+/// device's vendor / model / hardware version is selected.
+fn requested_image(
+    fw: &firmware::FirmwareStore,
+    devices: &device::DeviceStore,
+    mac: Option<device::Mac>,
+    elems: &HashMap<u16, Vec<CwElem>>,
+) -> Option<(firmware::FirmwareImage, firmware::ImageIdentifier)> {
+    // Image Identifier body: vendor id (u32 BE) followed by the image name.
+    let raw = match elems.get(&MsgElemType::IMAGE_ID)?.first()? {
+        CwElem::Unknown(_, data) => data,
+        _ => return None,
+    };
+    if raw.len() < 4 {
+        return None;
+    }
+    let vendor_id = u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]);
+    let id = firmware::ImageIdentifier {
+        vendor_id,
+        name: raw[4..].to_vec(),
+    };
+    let dev = mac.and_then(|m| devices.get(m).ok().flatten());
+    let vendor = dev.as_ref().and_then(|d| d.vendor.clone()).unwrap_or_default();
+    let model = dev.as_ref().and_then(|d| d.model.clone()).unwrap_or_default();
+    let hw = dev.as_ref().and_then(|d| d.hw_version.clone()).unwrap_or_default();
+    // The identifier payload is a UTF-8 name under RFC or H3C and a binary
+    // version under TP-Link; only the catalogue hint is textual either way.
+    let requested = String::from_utf8_lossy(&id.name);
+    let requested = requested.trim_matches('\0');
+    match fw.select_for_wtp(requested, &vendor, &model, &hw) {
+        Ok(Some(img)) => Some((img, id)),
+        Ok(None) => None,
+        Err(e) => {
+            warn!("[!] firmware catalogue lookup failed: {}", e);
+            None
+        }
+    }
+}
+
+/// Image Data Response (RFC 5415 9.1.2): Result Code is mandatory, Image
+/// Information (size + MD5 of the whole image) is AC-side and optional.
+fn image_data_response(seq: u32, result: u8, info: Option<&firmware::ImageInfo>) -> CtrlMsg {
+    let mut msg =
+        CtrlMsg::new(MsgType::IMAGE_DATA_RESP, seq).add_element(BaseElem::ResultCode(result));
+    if let Some(info) = info {
+        msg = msg.add_elem(MsgElemType::IMAGE_INFO, &info.encode());
+    }
+    msg
+}
+
+/// Transmit one Image Data block. `pending_seq` records the request sequence so
+/// a stale Image Data Response cannot advance the transfer.
+async fn send_image_block(
+    capdtls: &mut connection::CapwapDtls,
+    ctx: &mut WtpContext,
+    fw_upgrade: &mut firmware::FirmwareUpgrade,
+    profile: vendor::profile::VendorProfile,
+    peer: SocketAddr,
+    blk: &firmware::ImageDataBlock,
+) -> Result<()> {
+    let mut dl = CtrlMsg::new(MsgType::IMAGE_DATA_REQ, ctx.next_seq())
+        .add_elem(MsgElemType::IMAGE_DATA, &blk.encode());
+    // AC100 repeats the size/MD5 in every Image Data Request (its
+    // `apupd_image_request_create` 0x538df8 adds element 26 alongside 24). The
+    // AX60 rejects any element other than 24 in an Image Data Request
+    // (`sub_249A8` -> "Unrecognized Message Element"), so H3C gets only 24.
+    if profile != vendor::profile::VendorProfile::H3c {
+        if let Some(info) = fw_upgrade.info.as_ref() {
+            dl = dl.add_elem(MsgElemType::IMAGE_INFO, &info.encode());
+        }
+    }
+    let buf = dl.encode_for(frame(profile));
+    capdtls.write(&buf).await?;
+    fw_upgrade.pending_seq = Some(dl.hdr.seq_num);
+    ctx.set_last_sent(&dl, buf);
+    info!("[>] to {}: image data block ({}B) sent", peer, blk.data.len());
+    Ok(())
+}
+
+/// Answer a WTP Image Data Request: the Image Data Response (RFC 5415 9.1.2),
+/// then the first block of the transfer.
+///
+/// The M60 AC answers with the Result Code alone on both upgrade entries
+/// (`CWAssembleImageDataResponseByAC` is called with no image information from
+/// `ACEnterImageData` and `ACEnterRun`), so H3C gets no Image Information
+/// element. Its AX60 then asks for the blocks and flashes the image itself.
+async fn start_image_transfer(
+    capdtls: &mut connection::CapwapDtls,
+    ctx: &mut WtpContext,
+    fw_upgrade: &mut firmware::FirmwareUpgrade,
+    profile: vendor::profile::VendorProfile,
+    peer: SocketAddr,
+    seq: u32,
+) -> Result<()> {
+    let info = if profile == vendor::profile::VendorProfile::H3c {
+        None
+    } else {
+        fw_upgrade.info.clone()
+    };
+    let resp = image_data_response(seq, 0, info.as_ref());
+    let buf = resp.encode_for(frame(profile));
+    capdtls.write(&buf).await?;
+    ctx.set_last_sent(&resp, buf);
+    match &info {
+        Some(i) => info!("[>] to {}: image data resp (size {}, MD5 advertised)", peer, i.file_size),
+        None => info!("[>] to {}: image data resp (result code only)", peer),
+    }
+    // The AX60 reads datagrams itself while waiting for its request's answer
+    // (WTP.dis `sub_15CB0`), so a block written in the same burst is consumed by
+    // that wait and never reaches the Image Data state. The M60 AC leaves that
+    // gap naturally by sending the first block on its next state tick.
+    if profile == vendor::profile::VendorProfile::H3c {
+        tokio::time::sleep(Duration::from_millis(FIRST_BLOCK_DELAY_MS)).await;
+    }
+    if let Some(blk) = fw_upgrade.current().cloned() {
+        send_image_block(capdtls, ctx, fw_upgrade, profile, peer, &blk).await?;
+    }
+    Ok(())
+}
+
 async fn handle_session(
     peer: SocketAddr,
     profile: vendor::profile::VendorProfile,
@@ -564,6 +720,7 @@ async fn handle_session(
     radios: Arc<radio::RadioStore>,
     stations: Arc<station::StationStore>,
     fw: Arc<firmware::FirmwareStore>,
+    fw_policy: Arc<firmware::FirmwarePolicy>,
     upgrade: Arc<firmware::UpgradeRegistry>,
     cfg_update: Arc<config::ConfigUpdateRegistry>,
     wtp_cmd: Arc<wtpcmd::WtpCmdRegistry>,
@@ -583,6 +740,8 @@ async fn handle_session(
     }
 
     let mut ctx = WtpContext::new(peer);
+    // The peer's framing decides the Sequence Number width (and its wrap).
+    ctx.frame = frame(profile);
     // Session-scoped state for configuration push-down tracking and the
     // firmware Image Data transfer exchange.
     let mut cfg_status = config::ConfigStatus::new();
@@ -604,6 +763,10 @@ async fn handle_session(
     let mut pending_cmd: Option<wtpcmd::WtpCmd> = None;
     // WLANs the WTP reports already holding (TP-Link private 30).
     let mut wtp_saved_wlans: Option<Vec<vendor::tplink::SavedWlan>> = None;
+    // H3C Run-state upgrade: the Reset Request is deferred and repeated (see
+    // RESET_DELAY / RESET_RETRY); a successful reset ends the session.
+    let mut reset_due: Option<Instant> = None;
+    let mut reset_attempts: u32 = 0;
 
     loop {
         let retrans_duration = ctx
@@ -626,9 +789,16 @@ async fn handle_session(
             ctx.push_last_sent
                 .map_or(Duration::ZERO, |t| PUSH_REPLY_TIMEOUT.saturating_sub(t.elapsed()))
         };
+        // Also wake in time for a deferred H3C Run-state reset.
+        let next_reset = reset_due
+            .map(|at| at.saturating_duration_since(Instant::now()))
+            .unwrap_or(Duration::from_secs(60));
         let mut sleep_duration = std::cmp::min(
             retrans_duration,
-            std::cmp::min(idle_duration, std::cmp::min(next_echo, next_push)),
+            std::cmp::min(
+                idle_duration,
+                std::cmp::min(next_echo, std::cmp::min(next_push, next_reset)),
+            ),
         );
         // Keep the DTLS retransmit timer ahead of the sleep, so handshake
         // flights are resent even while no CAPWAP message is due.
@@ -705,7 +875,10 @@ async fn handle_session(
                     // RFC 5415 4.5.3: replay the cached Response for a repeated
                     // Request, ignore an older one, process a newer one. Ordering
                     // is over the framing's counter width (RFC 256, H3C 2^32).
-                    if MsgType::is_request(m_type) {
+                    // The AX60 channel-utilization report carries a fixed sequence
+                    // on every retransmission (WTP.dis 0x2c5a4), so it is exempt
+                    // from the ordering check and handled once per arrival.
+                    if MsgType::is_request(m_type) && m_type != vendor::h3c::WTP_CHAN_UTIL_REQ {
                         if let Some(last) = ctx.last_req_seq {
                             if seq == last {
                                 match ctx.last_resp_buf.clone() {
@@ -774,6 +947,39 @@ async fn handle_session(
                                 hw_ver = Some(format!("{:08x}", hardware));
                                 sw_ver = Some(format!("{:08x}", software));
                             }
+                            // H3C's descriptor is not the RFC two-u32 form: its
+                            // first byte is the hardware revision (AX60: 2, shown
+                            // as VER.B), and the human versions ride private
+                            // elements 0x40 (release, e.g. SWBA1B0V100R010 ->
+                            // R010) and 0x3D (build, SWBA1B0V100D017 -> D017).
+                            // The model itself stays the Board Data name
+                            // (SWBA1B0). Override the generic 8-hex reading.
+                            if profile == vendor::profile::VendorProfile::H3c {
+                                if let Some(body) = msg
+                                    .find_elems(MsgElemType::WTP_DESCRIPTOR)
+                                    .next()
+                                    .map(|e| e.data.as_slice())
+                                {
+                                    if let Some(hw) = vendor::h3c::descriptor_hardware_version(body) {
+                                        hw_ver = Some(hw.to_string());
+                                    }
+                                }
+                                sw_ver = msg
+                                    .find_elems(vendor::h3c::ELEM_RELEASE_VERSION)
+                                    .next()
+                                    .and_then(|e| vendor::h3c::short_version(&e.data))
+                                    .or_else(|| {
+                                        msg.find_elems(vendor::h3c::ELEM_BUILD_VERSION)
+                                            .next()
+                                            .and_then(|e| vendor::h3c::short_version(&e.data))
+                                    })
+                                    .or(sw_ver);
+                                info!(
+                                    "[*] h3c versions: hw {}, sw {}",
+                                    hw_ver.as_deref().unwrap_or("-"),
+                                    sw_ver.as_deref().unwrap_or("-")
+                                );
+                            }
                             // TP-Link reports the binary codes in the RFC-shaped
                             // descriptor; the vendor records inside the same
                             // element carry the human versions AC100 displays
@@ -804,6 +1010,7 @@ async fn handle_session(
                                 model = wtp_model_from_elems(&elems);
                             }
                             // Persist device learned from the join exchange (keyed by MAC).
+                            let mut join_image: Option<Vec<u8>> = None;
                             if let Some(mac) = wtp_mac_from_elems(&elems, profile) {
                                 ctx.mac = Some(mac);
                                 devices.mark_live(mac);
@@ -841,6 +1048,55 @@ async fn handle_session(
                                 upgrade.register(mac, upgrade_tx.clone());
                                 cfg_update.register(mac, cfg_update_tx.clone());
                                 wtp_cmd.register(mac, wtp_cmd_tx.clone());
+                                // H3C join-time entry (M60 `ACEnterJoin`): an image
+                                // queued for an offline WTP is announced in the
+                                // Join Response, so this WTP downloads it before
+                                // taking any configuration instead of from the
+                                // Run state.
+                                if profile == vendor::profile::VendorProfile::H3c {
+                                    if !fw_policy.update_on_join() {
+                                        // Startup updates are opt-in: a power
+                                        // restore must not start every AP's
+                                        // download at once.
+                                        debug!("[*] join: startup firmware update disabled, no image announced");
+                                    } else if let Some(id) = upgrade.take_pending(mac) {
+                                        match fw.get_image(id) {
+                                            Ok(Some(img)) => match fw.load_image_bytes(id) {
+                                                Ok(Some(bytes)) => {
+                                                    let name = img.file_name.clone().into_bytes();
+                                                    fw_upgrade.announce(
+                                                        bytes,
+                                                        IMAGE_BLOCK_SIZE,
+                                                        firmware::ImageIdentifier {
+                                                            vendor_id: vendor::h3c::IMAGE_ID_PREFIX,
+                                                            name: name.clone(),
+                                                        },
+                                                    );
+                                                    join_image = Some(name);
+                                                    logx::firmware(format!(
+                                                        "firmware {} announced to {} in the join response",
+                                                        img.stored_path,
+                                                        device::mac_to_str(mac)
+                                                    ));
+                                                }
+                                                Ok(None) => warn!(
+                                                    "[!] queued image {} missing from disk",
+                                                    img.stored_path
+                                                ),
+                                                Err(e) => warn!(
+                                                    "[!] cannot read queued image {}: {}",
+                                                    img.stored_path, e
+                                                ),
+                                            },
+                                            Ok(None) => {
+                                                warn!("[!] queued image {} no longer catalogued", id)
+                                            }
+                                            Err(e) => {
+                                                warn!("[!] queued image {} lookup failed: {}", id, e)
+                                            }
+                                        }
+                                    }
+                                }
                             } else {
                                 debug!("[*] join: no WTP Board Data MAC present");
                             }
@@ -850,13 +1106,26 @@ async fn handle_session(
                             // entry; WTP.dis 0x23754 counts entries and re-parses
                             // each at 0x1df5c). The RFC / TP-Link form uses the
                             // standards-shaped builder.
-                            let resp_msg = profile.join_response(seq, ac_ip, b"miniac", true);
+                            let resp_msg = match join_image.as_deref() {
+                                Some(name) => {
+                                    vendor::h3c::join_response_with_image(seq, ac_ip, name)
+                                }
+                                None => profile.join_response(seq, ac_ip, b"miniac", true),
+                            };
                             let resp_buf = resp_msg.encode_for(frame(profile));
                             capdtls.write(&resp_buf).await?;
                             ctx.set_last_sent(&resp_msg, resp_buf);
 
                             ctx.state = WtpState::Configure;
-                            info!("[>] to {}: join resp sent, state -> Configure", peer);
+                            info!(
+                                "[>] to {}: join resp sent{}, state -> Configure",
+                                peer,
+                                if join_image.is_some() {
+                                    " (image identifier announced)"
+                                } else {
+                                    ""
+                                }
+                            );
                         }
 
                         (WtpState::Configure, MsgType::CONFIG_STATUS_REQ) => {
@@ -1122,7 +1391,7 @@ async fn handle_session(
                             }
                         }
 
-                        (WtpState::Run, MsgType::ECHO_REQ) => {
+                        (WtpState::Run | WtpState::ImageData, MsgType::ECHO_REQ) => {
                             debug!("[<] from {}: echo req (seq {})", peer, seq);
                             // TP-Link repeats its private records in every Echo
                             // Request, including private 56 (LED status): the
@@ -1164,7 +1433,7 @@ async fn handle_session(
                             ctx.set_last_sent(&resp_msg, resp_buf);
                             debug!("[>] to {}: echo resp", peer);
                         }
-                        (WtpState::Run, MsgType::ECHO_RESP) => {
+                        (WtpState::Run | WtpState::ImageData, MsgType::ECHO_RESP) => {
                             debug!("[<] from {}: echo resp (seq {})", peer, seq);
                         }
 
@@ -1181,11 +1450,12 @@ async fn handle_session(
                             }
                         }
 
-                        (WtpState::Run, t) if t == vendor::h3c::WTP_CHAN_UTIL_REQ => {
+                        (_, t) if t == vendor::h3c::WTP_CHAN_UTIL_REQ => {
                             // AX60 channel-utilization report (element 0xfe20,
                             // [2G%, 5G%]); ack with mtype 146 + zero Result Code
                             // so the WTP drops its pending copy instead of
-                            // retransmitting every 10s.
+                            // retransmitting every 10s. The AX60 also reports
+                            // while it is in Configure or Image Data state.
                             debug!("[<] from {}: chan util report (seq {})", peer, seq);
                             let resp_msg = CtrlMsg::new(vendor::h3c::WTP_CHAN_UTIL_RESP, seq)
                                 .with_result_success();
@@ -1394,6 +1664,28 @@ async fn handle_session(
                                         "WTP {} rejected configuration update (result {})",
                                         peer, resp.result_code
                                     ));
+                                    // H3C M60: Result 17 "Image Already Present"
+                                    // makes the AC reset the WTP at once instead
+                                    // of downloading (`CWSaveConfigurationUpdate-
+                                    // ResponseMessage` 0x1002c6bc -> `sub_100315b0`).
+                                    if profile == vendor::profile::VendorProfile::H3c
+                                        && resp.result_code == 17
+                                        && fw_upgrade.state == firmware::UpgradeState::Announced
+                                    {
+                                        let name = match fw_upgrade.image_id.as_ref() {
+                                            Some(id) => id.name.clone(),
+                                            None => RESET_IMAGE_NAME.to_vec(),
+                                        };
+                                        let req = profile.reset_request(ctx.next_seq(), &name);
+                                        let buf = req.encode_for(frame(profile));
+                                        capdtls.write(&buf).await?;
+                                        ctx.set_last_sent(&req, buf);
+                                        fw_upgrade.reset_sent();
+                                        logx::firmware(format!(
+                                            "image already present on {}; reset requested",
+                                            peer
+                                        ));
+                                    }
                                 }
                                 Err(e) => warn!("[!] from {}: malformed config update resp: {}", peer, e),
                             }
@@ -1410,70 +1702,243 @@ async fn handle_session(
                             }
                         }
 
-                        (WtpState::Run, MsgType::IMAGE_DATA_REQ) => {
+                        // RFC 5415 9.1, Image Data state: a WTP that joined
+                        // without the expected image asks for a download before
+                        // configuration. The AC enters Image Data, advertises the
+                        // image (size, MD5) and streams the blocks; the WTP resets
+                        // itself once the transfer completes.
+                        (WtpState::Join | WtpState::Configure | WtpState::ImageData, MsgType::IMAGE_DATA_REQ) => {
                             info!("[<] from {}: image data req (seq {})", peer, seq);
-                            // A WTP that lacks the expected firmware requests a
-                            // download via Image Identifier / Initiate Download.
                             let wants = elems.contains_key(&MsgElemType::INIT_DOWNLOAD)
                                 || elems.contains_key(&MsgElemType::IMAGE_ID);
-                            if wants && fw_upgrade.session.is_none() {
-                                // Placeholder image; replace once a real firmware
-                                // source is wired (M7 upload / config repo).
-                                let image: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
-                                let mac = ctx.mac.unwrap_or([0; 6]);
-                                match fw.record_start(&mac, "miniac-boot", image.len() as u32, &[0u8; 16]) {
-                                    Ok(id) => {
-                                        fw_record_id = Some(id);
-                                        logx::firmware(format!("firmware download started for {}", device::mac_to_str(mac)));
+                            if !wants {
+                                debug!("[<] from {}: image data req carries no download request", peer);
+                                continue;
+                            }
+                            if fw_upgrade.session.is_none() {
+                                let (img, bytes, id) = match requested_image(&fw, &devices, ctx.mac, &elems) {
+                                    Some((img, id)) => match fw.load_image_bytes(img.id) {
+                                        Ok(Some(bytes)) => (img, bytes, id),
+                                        Ok(None) => {
+                                            warn!("[!] image {} missing from disk", img.stored_path);
+                                            continue;
+                                        }
+                                        Err(e) => {
+                                            warn!("[!] cannot read image {}: {}", img.stored_path, e);
+                                            continue;
+                                        }
+                                    },
+                                    None => {
+                                        warn!("[!] from {}: no catalogued image for the requested identifier", peer);
+                                        let resp = image_data_response(seq, 1, None);
+                                        let buf = resp.encode_for(frame(profile));
+                                        capdtls.write(&buf).await?;
+                                        ctx.set_last_sent(&resp, buf);
+                                        continue;
                                     }
+                                };
+                                let mac = ctx.mac.unwrap_or([0; 6]);
+                                match fw.record_start(&mac, &img.stored_path, img.size as u32, &img.hash) {
+                                    Ok(rid) => fw_record_id = Some(rid),
                                     Err(e) => warn!("[!] firmware record start failed: {}", e),
                                 }
-                                fw_upgrade.begin(image, 512);
+                                logx::firmware(format!(
+                                    "firmware {} download started for {} (Image Data state)",
+                                    img.stored_path,
+                                    device::mac_to_str(mac)
+                                ));
+                                fw_upgrade.begin(bytes, IMAGE_BLOCK_SIZE, id);
                             }
-                            if let Some(blk) = fw_upgrade.current() {
-                                let dl = CtrlMsg::new(MsgType::IMAGE_DATA_REQ, ctx.next_seq())
-                                    .add_elem(MsgElemType::IMAGE_DATA, &blk.encode());
-                                let buf = dl.encode_for(frame(profile));
+                            // The image may already be loaded and announced (the
+                            // Join Response carried its identifier): start the
+                            // transfer without re-reading the catalogue.
+                            if fw_upgrade.state == firmware::UpgradeState::Announced {
+                                fw_upgrade.start_download();
+                            }
+                            if fw_upgrade.session.is_some() && ctx.state != WtpState::ImageData {
+                                // The WTP asked for the image before configuration,
+                                // so it is in Image Data state; mirror it here so
+                                // its Image Data Responses advance the transfer.
+                                ctx.state = WtpState::ImageData;
+                                info!("[>] to {}: state -> ImageData", peer);
+                            }
+                            start_image_transfer(
+                                &mut capdtls,
+                                &mut ctx,
+                                &mut fw_upgrade,
+                                profile,
+                                peer,
+                                seq,
+                            )
+                            .await?;
+                        }
+
+                        // RFC 5415 9.1, Run state: the WTP was told the image in
+                        // a Configuration Update Request and answers with its own
+                        // Image Data Request / Initiate Download. The transfer
+                        // then runs in the Run state and the WTP resets only when
+                        // the AC sends a Reset Request.
+                        (WtpState::Run, MsgType::IMAGE_DATA_REQ) => {
+                            info!("[<] from {}: image data req (seq {})", peer, seq);
+                            let wants = elems.contains_key(&MsgElemType::INIT_DOWNLOAD)
+                                || elems.contains_key(&MsgElemType::IMAGE_ID);
+                            if !wants {
+                                debug!("[<] from {}: image data req carries no download request", peer);
+                                continue;
+                            }
+                            if fw_upgrade.session.is_none() {
+                                if let Some((img, id)) = requested_image(&fw, &devices, ctx.mac, &elems) {
+                                    match fw.load_image_bytes(img.id) {
+                                        Ok(Some(bytes)) => {
+                                            let mac = ctx.mac.unwrap_or([0; 6]);
+                                            match fw.record_start(&mac, &img.stored_path, img.size as u32, &img.hash) {
+                                                Ok(rid) => fw_record_id = Some(rid),
+                                                Err(e) => warn!("[!] firmware record start failed: {}", e),
+                                            }
+                                            logx::firmware(format!(
+                                                "firmware {} download started for {} (Run state)",
+                                                img.stored_path,
+                                                device::mac_to_str(mac)
+                                            ));
+                                            fw_upgrade.begin(bytes, IMAGE_BLOCK_SIZE, id);
+                                        }
+                                        Ok(None) => warn!("[!] image {} missing from disk", img.stored_path),
+                                        Err(e) => warn!("[!] cannot read image {}: {}", img.stored_path, e),
+                                    }
+                                }
+                            }
+                            if fw_upgrade.session.is_some() {
+                                if fw_upgrade.state == firmware::UpgradeState::Announced {
+                                    fw_upgrade.start_download();
+                                }
+                                start_image_transfer(
+                                    &mut capdtls,
+                                    &mut ctx,
+                                    &mut fw_upgrade,
+                                    profile,
+                                    peer,
+                                    seq,
+                                )
+                                .await?;
+                            } else {
+                                warn!("[!] from {}: no image available for the download request", peer);
+                                let resp = image_data_response(seq, 1, None);
+                                let buf = resp.encode_for(frame(profile));
                                 capdtls.write(&buf).await?;
-                                ctx.set_last_sent(&dl, buf);
-                                info!("[>] to {}: image data block ({}B) sent", peer, blk.data.len());
+                                ctx.set_last_sent(&resp, buf);
                             }
                         }
 
-                        (WtpState::Run, MsgType::IMAGE_DATA_RESP) => {
+                        (WtpState::Run | WtpState::ImageData, MsgType::IMAGE_DATA_RESP) => {
                             info!("[<] from {}: image data resp (seq {})", peer, seq);
-                            if fw_upgrade.session.is_none() {
-                                ctx.last_sent = None;
+                            if fw_upgrade.pending_seq != Some(seq) || fw_upgrade.inflight.is_none() {
+                                debug!("[<] from {}: image data resp does not ack the in-flight block", peer);
                                 continue;
                             }
+                            let code = vendor::h3c::result_code(&msg).unwrap_or(0);
+                            if code != 0 {
+                                warn!("[!] from {}: image data rejected (result {})", peer, code);
+                                logx::firmware(format!("firmware transfer to {} aborted (result {})", peer, code));
+                                fw_upgrade.abort();
+                                continue;
+                            }
+                            fw_upgrade.pending_seq = None;
                             fw_upgrade.complete_block();
-                            if let Some(blk) = fw_upgrade.current() {
-                                let dl = CtrlMsg::new(MsgType::IMAGE_DATA_REQ, ctx.next_seq())
-                                    .add_elem(MsgElemType::IMAGE_DATA, &blk.encode());
-                                let buf = dl.encode_for(frame(profile));
-                                capdtls.write(&buf).await?;
-                                ctx.set_last_sent(&dl, buf);
-                                info!("[>] to {}: image data block ({}B) sent", peer, blk.data.len());
+                            if let Some(blk) = fw_upgrade.current().cloned() {
+                                send_image_block(&mut capdtls, &mut ctx, &mut fw_upgrade, profile, peer, &blk).await?;
                             } else if fw_upgrade.state == firmware::UpgradeState::AwaitReset {
-                                // All blocks acknowledged; order the WTP to reset
-                                // onto the delivered image.
-                                // The H3C image-name field is NUL-terminated: the
-                                // AX60 parser forces the last value byte to 0, so
-                                // an unterminated name is truncated (and never
-                                // matches the delivered image).
-                                let name = firmware::ImageIdentifier { vendor_id: 1916, name: "miniac-boot".to_string() };
-                                let mut id_body = name.encode();
-                                id_body.push(0);
-                                let reset = CtrlMsg::new(MsgType::RESET_REQ, ctx.next_seq())
-                                    .add_elem(MsgElemType::IMAGE_ID, &id_body);
+                                if let Some(id) = fw_record_id.take() {
+                                    let _ = fw.mark_done(id);
+                                }
+                                if ctx.state == WtpState::Run
+                                    && profile == vendor::profile::VendorProfile::H3c
+                                {
+                                    // The AX60 acknowledges a Reset Request that
+                                    // lands in the same burst as the last Image
+                                    // Data Response but does not act on it, so
+                                    // defer it and retry while the session lives.
+                                    reset_due = Some(Instant::now() + RESET_DELAY);
+                                    reset_attempts = 0;
+                                    logx::firmware(format!(
+                                        "firmware transfer complete; reset scheduled for {}",
+                                        peer
+                                    ));
+                                    fw_upgrade.reset_sent();
+                                } else if ctx.state == WtpState::Run
+                                    && profile != vendor::profile::VendorProfile::TpLink
+                                {
+                                    // Run-state download: the WTP holds the image
+                                    // until the administrative Reset Request.
+                                    let name = match fw_upgrade.image_id.as_ref() {
+                                        Some(id) => id.name.clone(),
+                                        None => RESET_IMAGE_NAME.to_vec(),
+                                    };
+                                    let reset = profile.reset_request(ctx.next_seq(), &name);
+                                    let buf = reset.encode_for(frame(profile));
+                                    capdtls.write(&buf).await?;
+                                    ctx.set_last_sent(&reset, buf);
+                                    logx::firmware(format!("firmware transfer complete; reset requested for {}", peer));
+                                    fw_upgrade.reset_sent();
+                                } else if ctx.state == WtpState::Run {
+                                    // TP-Link APs verify, write and reboot on their
+                                    // own once the EOF block is acknowledged; a
+                                    // Reset Request now could interrupt the flash
+                                    // write, so none is sent.
+                                    logx::firmware(format!(
+                                        "firmware transfer complete for {}; TP-Link AP writes and reboots into the new image",
+                                        peer
+                                    ));
+                                    fw_upgrade.finish();
+                                } else {
+                                    // Image Data state: the WTP enters Reset itself
+                                    // after acknowledging the EOF block.
+                                    logx::firmware(format!(
+                                        "firmware transfer complete for {}; WTP resets into the new image",
+                                        peer
+                                    ));
+                                    fw_upgrade.finish();
+                                }
+                            }
+                        }
+
+                        // RFC 5415 9.1 (Run state): the Configuration Update
+                        // Response confirms the announced image or reports that
+                        // the WTP already holds it.
+                        (WtpState::Run, MsgType::CONFIG_UPDATE_RESP) => {
+                            if fw_upgrade.state != firmware::UpgradeState::Announced {
+                                debug!("[<] from {}: config update resp (seq {})", peer, seq);
+                                continue;
+                            }
+                            let code = vendor::h3c::result_code(&msg).unwrap_or(0);
+                            if code == 0 {
+                                info!("[>] to {}: image announced; awaiting Initiate Download", peer);
+                                continue;
+                            }
+                            let name = match fw_upgrade.image_id.as_ref() {
+                                Some(id) => id.name.clone(),
+                                None => RESET_IMAGE_NAME.to_vec(),
+                            };
+                            fw_upgrade.abort();
+                            if code == 17 {
+                                // Image Already Present: skip the transfer and
+                                // reset the WTP into that image.
+                                logx::firmware(format!(
+                                    "WTP {} already holds the announced image; reset requested",
+                                    peer
+                                ));
+                                if let Some(id) = fw_record_id.take() {
+                                    let _ = fw.mark_done(id);
+                                }
+                                let reset = profile.reset_request(ctx.next_seq(), &name);
                                 let buf = reset.encode_for(frame(profile));
                                 capdtls.write(&buf).await?;
                                 ctx.set_last_sent(&reset, buf);
-                                if let Some(id) = fw_record_id {
-                                    let _ = fw.mark_done(id);
-                                }
-                                logx::firmware(format!("firmware transfer done; reset requested for {}", peer));
-                                fw_upgrade.reset_sent();
+                            } else {
+                                warn!("[!] from {}: image announcement rejected (result {})", peer, code);
+                                logx::firmware(format!(
+                                    "firmware download to {} refused by the WTP (result {})",
+                                    peer, code
+                                ));
                             }
                         }
 
@@ -1556,6 +2021,42 @@ async fn handle_session(
                     capdtls.on_timeout(now).await?;
                 }
 
+                // H3C Run-state upgrade: send (or repeat) the Reset Request once
+                // the deferred deadline passes. A reset that flashes the image
+                // reboots the WTP, so a surviving session means the previous one
+                // was not acted on (see RESET_DELAY).
+                if let Some(at) = reset_due {
+                    if now >= at {
+                        let name = fw_upgrade
+                            .image_id
+                            .as_ref()
+                            .map(|id| id.name.clone())
+                            .unwrap_or_else(|| RESET_IMAGE_NAME.to_vec());
+                        let reset = profile.reset_request(ctx.next_seq(), &name);
+                        let buf = reset.encode_for(frame(profile));
+                        capdtls.write(&buf).await?;
+                        ctx.set_last_sent(&reset, buf);
+                        reset_attempts += 1;
+                        if reset_attempts < RESET_ATTEMPTS {
+                            reset_due = Some(now + RESET_RETRY);
+                            logx::firmware(format!(
+                                "reset sent to {} (attempt {}, seq {}); retrying in {}s if the WTP keeps the session",
+                                peer,
+                                reset_attempts,
+                                reset.hdr.seq_num,
+                                RESET_RETRY.as_secs()
+                            ));
+                        } else {
+                            reset_due = None;
+                            logx::firmware(format!(
+                                "reset sent to {} (attempt {}, seq {}); no more retries",
+                                peer, reset_attempts, reset.hdr.seq_num
+                            ));
+                        }
+                    }
+                }
+
+
                 let retrans_interval = ctx
                     .last_sent
                     .as_ref()
@@ -1611,31 +2112,74 @@ async fn handle_session(
                     ctx.last_echo_sent = now;
                     debug!("[>] to {}: echo keep-alive (seq {})", peer, echo.hdr.seq_num);
                 }
-                if ctx.state == WtpState::Run && now >= ctx.last_seen + ctx.echo_interval {
-                    error!("[!] with {}: echo timeout (no traffic for {}s)", peer, ctx.echo_interval.as_secs());
+                // An announced image may keep the WTP quiet for a while: the AX60
+                // sleeps 45s on its first entry into the Image Data state before
+                // it sends its Initiate Download.
+                let allow = if fw_upgrade.state == firmware::UpgradeState::Announced {
+                    ctx.echo_interval * 4
+                } else {
+                    ctx.echo_interval
+                };
+                if matches!(ctx.state, WtpState::Run | WtpState::ImageData)
+                    && now >= ctx.last_seen + allow
+                {
+                    error!("[!] with {}: echo timeout (no traffic for {}s)", peer, allow.as_secs());
                     return Err(anyhow::anyhow!("echo timeout"));
                 }
             }
 
-            cmd = upgrade_rx.recv(), if !outstanding => {
+            cmd = upgrade_rx.recv(), if !outstanding && ctx.state == WtpState::Run => {
                 match cmd {
-                    Some(firmware::UpgradeCmd::Start { image }) => {
-                        info!("[>] to {}: firmware download triggered via management plane", peer);
-                        fw_upgrade.begin(image, 512);
-                        if let Some(blk) = fw_upgrade.current() {
-                            let dl = CtrlMsg::new(MsgType::IMAGE_DATA_REQ, ctx.next_seq())
-                                .add_elem(MsgElemType::IMAGE_DATA, &blk.encode());
-                            let buf = dl.encode_for(frame(profile));
-                            capdtls.write(&buf).await?;
-                            ctx.set_last_sent(&dl, buf);
-                            info!("[>] to {}: image data block ({}B) sent", peer, blk.data.len());
-                        }
+                    Some(firmware::UpgradeCmd::Start { image, name }) => {
+                        info!("[>] to {}: firmware download announced via management plane", peer);
+                        let name_bytes = name.as_bytes().to_vec();
+                        // TP-Link identifies an image by the 14-byte binary
+                        // version AC100 extracts from the image, not by its
+                        // file name; other profiles keep the textual name.
+                        let (vendor_id, payload) = match profile {
+                            vendor::profile::VendorProfile::TpLink => (
+                                vendor::tplink::VENDOR_ID,
+                                vendor::tplink::image_version(&name).to_vec(),
+                            ),
+                            _ => (0, name_bytes.clone()),
+                        };
+                        let image_id = firmware::ImageIdentifier { vendor_id, name: payload };
+                        fw_upgrade.announce(image, IMAGE_BLOCK_SIZE, image_id.clone());
+                        // RFC 5415 9.1 (Run state): announce the image in a
+                        // Configuration Update Request; the WTP replies and
+                        // then asks for the data with Initiate Download.
+                        let req = match profile {
+                            vendor::profile::VendorProfile::H3c => {
+                                config::config_update(
+                                    ctx.next_seq(),
+                                    &[],
+                                    &[vendor::h3c::ConfigUpdateElem::ImageIdentifier {
+                                        vendor_id: vendor::h3c::IMAGE_ID_PREFIX,
+                                        name: name_bytes,
+                                    }],
+                                )
+                            }
+                            vendor::profile::VendorProfile::TpLink => {
+                                vendor::tplink::image_update_request(ctx.next_seq(), &image_id.name)
+                            }
+                            vendor::profile::VendorProfile::Rfc => config::config_update(
+                                ctx.next_seq(),
+                                &[BaseElem::ImageIdentifier(
+                                    crate::elements::ImageIdentifier::new(0, name_bytes),
+                                )],
+                                &[],
+                            ),
+                        };
+                        let buf = req.encode_for(frame(profile));
+                        capdtls.write(&buf).await?;
+                        ctx.set_last_sent(&req, buf);
+                        logx::firmware(format!("image {} announced to {} for download", name, peer));
                     }
                     None => {}
                 }
             }
 
-            cmd = cfg_update_rx.recv(), if !outstanding => {
+            cmd = cfg_update_rx.recv(), if !outstanding && ctx.state == WtpState::Run => {
                 match cmd {
                     Some(config::ConfigUpdateCmd::Push { elems }) => {
                         info!("[>] to {}: configuration update triggered via management plane", peer);
@@ -1659,7 +2203,7 @@ async fn handle_session(
                 }
             }
 
-            cmd = wtp_cmd_rx.recv(), if !outstanding => {
+            cmd = wtp_cmd_rx.recv(), if !outstanding && ctx.state == WtpState::Run => {
                 match cmd {
                     Some(wtpcmd::WtpCmd::Reset) => {
                         info!("[>] to {}: reset requested via management plane", peer);

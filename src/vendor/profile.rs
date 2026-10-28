@@ -140,7 +140,7 @@ impl VendorProfile {
     /// TP-Link additionally attaches the private reset mask.
     pub fn reset_request(self, seq: u32, image_name: &[u8]) -> CtrlMsg {
         match self {
-            VendorProfile::H3c => h3c::reset_request(seq),
+            VendorProfile::H3c => h3c::reset_request(seq, image_name),
             VendorProfile::TpLink => {
                 tplink::reset_request(seq, image_name, tplink::RESET_MASK_RESTART)
             }
@@ -389,14 +389,20 @@ mod tests {
 
     #[test]
     fn reset_request_per_profile() {
-        // H3C keeps its fixed image identifier and sends no reset mask.
-        let h3c_msg = VendorProfile::H3c.reset_request(5, b"ignored");
+        // H3C: a plain restart keeps the vendor-id-0 `all_version` identifier and
+        // sends no reset mask; a named image rides vendor id 1916 instead.
+        let h3c_msg = VendorProfile::H3c.reset_request(5, b"all_version");
         assert_eq!(h3c_msg.hdr.msg_type, MsgType::RESET_REQ);
         assert_eq!(h3c_msg.elems.len(), 1);
         assert_eq!(h3c_msg.elems[0].tag, crate::capwap::MsgElemType::IMAGE_ID);
         assert_eq!(
             h3c_msg.elems[0].data,
             crate::vendor::h3c::image_id_all_version()
+        );
+        let h3c_fw = VendorProfile::H3c.reset_request(6, b"fw.bin");
+        assert_eq!(
+            h3c_fw.elems[0].data,
+            crate::vendor::h3c::image_identifier(b"fw.bin")
         );
 
         // TP-Link carries the caller's name and the private reset mask.

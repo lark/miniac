@@ -47,6 +47,9 @@
   tbody tr:last-child td{border-bottom:none;}
   th{color:var(--muted);font-weight:600;white-space:nowrap;}
   td.mono,th.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;}
+  /* Hashes keep the whole value in the DOM and only clip the view, so hovering
+     shows the full MD5 and clicking copies it. */
+  .hash{display:inline-block;max-width:13ch;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;vertical-align:bottom;cursor:pointer;}
   tbody tr:hover{background:rgba(2,132,199,.05);}
   .muted{color:var(--muted);}
   .ledtog{display:inline-flex;align-items:center;gap:6px;}
@@ -247,7 +250,7 @@
         </div>
         <div class="card">
           <h2 data-i18n="card.fwlist">镜像列表</h2>
-          <table><thead><tr><th>Path</th><th>Size</th><th>MD5</th><th>Uploaded</th></tr></thead>
+          <table><thead><tr><th data-i18n="th.fwPath">路径</th><th data-i18n="th.fwVersion">版本</th><th data-i18n="th.fwSize">大小</th><th data-i18n="th.fwMd5">MD5</th><th data-i18n="th.fwUploaded">上传时间</th></tr></thead>
             <tbody id="fw-rows"></tbody></table>
         </div>
       </section>
@@ -261,8 +264,12 @@
               <div data-i18n="kv.weblisten">Web 监听</div><div class="muted" data-i18n-html="kv.weblistenVal">由启动参数 <b>-w [addr:]port</b> 指定（默认 127.0.0.1:8246）</div></div>
             <div class="note" data-i18n-html="sys.runNote">运行提示：启动 miniac 测试时绑定内网地址而非 <span class="mono">0.0.0.0</span>。</div>
           </div>
-          <div class="card"><h2 data-i18n="card.notes">说明</h2>
-            <div class="note" data-i18n="sys.notes">登录鉴权、地址池/租约、日志级别等系统项的后端接口尚未提供（列入后续阶段）。</div>
+          <div class="card"><h2 data-i18n="card.syssettings">系统设置</h2>
+            <label class="muted" style="display:flex;align-items:center;gap:8px">
+              <input type="checkbox" id="sys-fwjoin" onchange="saveSystem()">
+              <span data-i18n="sys.fwOnStartup">AP 启动时更新固件</span>
+            </label>
+            <div class="note" data-i18n="sys.fwOnStartupHint">关闭时 AP 启动（Join）阶段不响应固件信息，只在运行时手工更新，避免整体掉电恢复后多台 AP 同时升级。</div>
           </div>
         </div>
       </section>
@@ -320,13 +327,20 @@ const I18N={
   'card.devmgmt':'设备管理','ph.searchAp':'搜索 AP 备注 / MAC','opt.allStates':'全部状态','opt.approved':'已确认','opt.pending':'待确认',
   'btn.reset':'重启','btn.disable':'停用','btn.upgrade':'更新固件','btn.led':'LED',
   'led.onTip':'当前 LED 已开，点击关闭','led.offTip':'当前 LED 已关，点击打开','led.unknownTip':'LED 状态未知，点击打开',
-  'card.fwupload':'上传固件','ph.vendor':'vendor (h3c)','ph.model':'model (mini-ax60)','ph.hw':'hw_version (1.0)','btn.upload':'上传',
+  'card.fwupload':'上传固件','ph.vendor':'厂商（留空自动识别）','ph.model':'型号（留空自动识别）','ph.hw':'硬件版本（留空自动识别）','btn.upload':'上传',
   'card.fwlist':'镜像列表','empty.fw':'暂无镜像',
-  'toast.fwUploaded':'固件已上传','toast.fwUploadFail':'上传失败：{msg}','toast.noFw':'暂无固件镜像，请先上传',
+  'th.fwPath':'路径','th.fwVersion':'版本','th.fwSize':'大小','th.fwMd5':'MD5','th.fwUploaded':'上传时间',
+  'tip.md5Copy':'点击复制','toast.md5Copied':'MD5 已复制',
+  'toast.fwUploaded':'固件已上传：{name}（{vendor}/{model} {version}）','toast.fwUploadFail':'上传失败：{msg}','toast.noFw':'暂无固件镜像，请先上传',
   'modal.upgrade':'更新固件','modal.upgradeSub':'目标 AP：{mac}','field.fwImage':'固件镜像','btn.pushUpgrade':'下发升级','toast.upgradeSent':'升级已下发（Image Data）',
   'card.acinfo':'AC 信息','kv.acname':'AC 名称','kv.ctlport':'控制端口','kv.weblisten':'Web 监听','kv.weblistenVal':'由启动参数 <b>-w [addr:]port</b> 指定（默认 127.0.0.1:8246）',
   'sys.runNote':'运行提示：启动 miniac 测试时绑定内网地址而非 <span class="mono">0.0.0.0</span>。',
-  'card.notes':'说明','sys.notes':'登录鉴权、地址池/租约、日志级别等系统项的后端接口尚未提供（列入后续阶段）。',
+  'card.syssettings':'系统设置','sys.fwOnStartup':'AP 启动时更新固件',
+  'sys.fwOnStartupHint':'关闭时 AP 启动（Join）阶段不响应固件信息，只在运行时手工更新，避免整体掉电恢复后多台 AP 同时升级。',
+  'toast.sysSaved':'系统设置已保存',
+  'fwReason.unsupported':'不支持更新','fwReason.notAdapted':'未适配','fwReason.noFirmware':'没有可用固件，请先上传固件',
+  'fw.current':'当前版本','fw.onlySameOrLower':'固件存储中没有更高版本，继续将覆盖当前版本',
+  'confirm.fwSameOrLower':'所选镜像版本 {next} 不高于当前版本 {cur}，继续将覆盖更新，确定？',
   'btn.save':'保存','btn.cancel':'取消','toast.loadFail':'加载失败：{msg}','toast.opFail':'操作失败：{msg}','toast.fail':'失败：{msg}',
   'modal.override':'AP 覆盖设置','field.channelInherit':'信道（留空=继承全局）','field.powerInherit':'功率%（留空=继承全局）',
   'override.hint':'覆盖会替换该 AP 上对应频段的全局信道/功率；清除请用“恢复全局”。',
@@ -383,13 +397,20 @@ const I18N={
   'card.devmgmt':'Device Management','ph.searchAp':'Search AP name / MAC','opt.allStates':'All states','opt.approved':'Approved','opt.pending':'Pending',
   'btn.reset':'Reboot','btn.disable':'Disable','btn.upgrade':'Upgrade Firmware','btn.led':'LED',
   'led.onTip':'LED is on; click to turn it off','led.offTip':'LED is off; click to turn it on','led.unknownTip':'LED state unknown; click to turn it on',
-  'card.fwupload':'Upload Firmware','ph.vendor':'vendor (h3c)','ph.model':'model (mini-ax60)','ph.hw':'hw_version (1.0)','btn.upload':'Upload',
+  'card.fwupload':'Upload Firmware','ph.vendor':'vendor (auto-detected when blank)','ph.model':'model (auto-detected when blank)','ph.hw':'hw_version (auto-detected when blank)','btn.upload':'Upload',
   'card.fwlist':'Image List','empty.fw':'No images',
-  'toast.fwUploaded':'Firmware uploaded','toast.fwUploadFail':'Upload failed: {msg}','toast.noFw':'No firmware images; upload one first',
+  'th.fwPath':'Path','th.fwVersion':'Version','th.fwSize':'Size','th.fwMd5':'MD5','th.fwUploaded':'Uploaded',
+  'tip.md5Copy':'Click to copy','toast.md5Copied':'MD5 copied',
+  'toast.fwUploaded':'Firmware uploaded: {name} ({vendor}/{model} {version})','toast.fwUploadFail':'Upload failed: {msg}','toast.noFw':'No firmware images; upload one first',
   'modal.upgrade':'Upgrade Firmware','modal.upgradeSub':'Target AP: {mac}','field.fwImage':'Firmware Image','btn.pushUpgrade':'Push Upgrade','toast.upgradeSent':'Upgrade pushed (Image Data)',
   'card.acinfo':'AC Info','kv.acname':'AC Name','kv.ctlport':'Control Port','kv.weblisten':'Web Listen','kv.weblistenVal':'Set by startup option <b>-w [addr:]port</b> (default 127.0.0.1:8246)',
   'sys.runNote':'Tip: bind an internal address instead of <span class="mono">0.0.0.0</span> when testing miniac.',
-  'card.notes':'Notes','sys.notes':'Backend APIs for login/auth, address pools/leases, and log level are not provided yet (planned for a later phase).',
+  'card.syssettings':'System Settings','sys.fwOnStartup':'Update firmware when the AP starts',
+  'sys.fwOnStartupHint':'When off, the AP startup (Join) phase advertises no firmware, so updates only run manually at runtime. This keeps a site-wide power restore from starting every AP download at once.',
+  'toast.sysSaved':'System settings saved',
+  'fwReason.unsupported':'Update not supported','fwReason.notAdapted':'Not adapted yet','fwReason.noFirmware':'No firmware available; upload one first',
+  'fw.current':'Current version','fw.onlySameOrLower':'No newer image is stored; continuing overwrites the current version',
+  'confirm.fwSameOrLower':'Image version {next} is not newer than the current {cur}. Overwrite anyway?',
   'btn.save':'Save','btn.cancel':'Cancel','toast.loadFail':'Load failed: {msg}','toast.opFail':'Operation failed: {msg}','toast.fail':'Failed: {msg}',
   'modal.override':'AP Override','field.channelInherit':'Channel (blank = inherit global)','field.powerInherit':'Power % (blank = inherit global)',
   'override.hint':'Overrides replace the global channel/power for this AP on this band; use “Revert Global” to clear.',
@@ -526,7 +547,7 @@ document.querySelectorAll('main > .page').forEach(sec=>{
 });
 /* page id -> renderer; a page absent here (e.g. the system page) renders nothing */
 const RENDER={status:renderStatus,logs:renderLogs,clients:renderClients,wireless:renderWireless,
-  devices:renderDevices,devmgmt:renderDevmgmt,firmware:renderFirmware};
+  devices:renderDevices,devmgmt:renderDevmgmt,firmware:renderFirmware,system:renderSystem};
 function refresh(id,atEnter){
   if(modalOpen&&!atEnter) return;
   const sec=$('p-'+id); if(sec){const b=sec.querySelector('.pbar .last'); if(b)b.textContent=new Date().toLocaleTimeString(LOC,{hour12:false});}
@@ -766,7 +787,7 @@ async function renderDevices(){
     const rs=DB.radios.filter(r=>r.mac===d.mac).map(r=>
       `${bandLabel(radioBand(r))}:${DB.stations.filter(s=>s.wmac===r.mac&&s.radio_id===r.radio_id).length}`).join('  ')||'—';
     const st=devPill(d);
-    return `<tr><td>${esc(d.name||'—')}</td><td>${esc(d.vendor||'—')}</td><td>${esc(d.model||'—')}</td><td class="mono">${esc(d.mac)}</td><td class="mono">${esc(d.ip_addr||'—')}</td>
+    return `<tr><td>${esc(d.name||'—')}</td><td>${esc(vendorLabel(d.vendor))}</td><td>${esc(d.model||'—')}</td><td class="mono">${esc(d.mac)}</td><td class="mono">${esc(d.ip_addr||'—')}</td>
       <td><span class="pill ${st[1]}">${esc(st[0])}</span></td><td>${rs}</td>
       <td>${!d.approved?`<button class="btn ok sm" onclick="approve('${esc(d.mac)}')">${t('btn.approve')}</button> `:''}
         <button class="btn ghost sm" onclick="editDevice('${esc(d.mac)}')">${t('btn.edit')}</button></td></tr>`;
@@ -776,8 +797,47 @@ async function renderDevices(){
 async function approve(mac){ try{await api(`/api/devices/${mac}/approve`,{method:'POST'});toast(t('toast.approved',{mac}));renderDevices();}catch(e){toast(t('toast.fail',{msg:e.message}));} }
 
 /* ---------- device management ---------- */
+/* Vendors whose over-CAPWAP upgrade path miniac already speaks. Anything else
+   (unknown or not yet adapted) keeps the button disabled with a reason. */
+const FW_ADAPTED=['h3c','tp-link','tplink'];
+const FW_UNSUPPORTED=[]; // known to refuse CAPWAP upgrades; empty until one is found
+const normVendor=(v)=>(v||'').trim().toLowerCase();
+/* Devices carry the family label ("tp-link") while images carry the detected
+   format token ("tplink"), so both sides collapse to one key. */
+const vendorKey=(v)=>{const s=normVendor(v);return s==='tp-link'?'tplink':s;};
+/* Display spelling of a vendor key: the wire value is lowercase ("h3c",
+   "tp-link"), the UI shows the product name. */
+const vendorLabel=(v)=>{const k=vendorKey(v);return k==='h3c'?'H3C':k==='tplink'?'TP-Link':(v||'—');};
+/* Mirrors FirmwareStore::select_for_wtp: vendor/model must match, and an image
+   without a hardware revision applies to every revision of that model. */
+function fwImagesFor(d){
+  const vendor=vendorKey(d.vendor), model=(d.model||'').toLowerCase(), hw=(d.hw_version||'').toLowerCase();
+  return DB.firmware.filter(f=>vendorKey(f.vendor)===vendor&&(f.model||'').toLowerCase()===model
+      &&(!f.hw_version||!hw||f.hw_version.toLowerCase()===hw))
+    .sort((a,b)=>b.uploaded_at-a.uploaded_at);
+}
+/* Compare the dotted numeric prefix of two version strings; null unless both
+   sides have one. Image labels carry a build suffix ("1.0.6 Build 20200311"),
+   while H3C reports a hex build id, which stays incomparable on purpose so no
+   bogus "same or older" verdict is raised for it. */
+function verCmp(a,b){
+  const parts=(s)=>{const m=/\d+(?:\.\d+){1,3}/.exec(String(s||''));return m?m[0].split('.').map(Number):null;};
+  const A=parts(a),B=parts(b); if(!A||!B) return null;
+  for(let i=0;i<Math.max(A.length,B.length);i++){
+    const x=A[i]||0,y=B[i]||0; if(x!==y) return x<y?-1:1;
+  }
+  return 0;
+}
+function fwGate(d){
+  const v=normVendor(d.vendor);
+  if(FW_UNSUPPORTED.includes(v)) return {ok:false,reason:t('fwReason.unsupported')};
+  if(!FW_ADAPTED.includes(v)) return {ok:false,reason:t('fwReason.notAdapted')};
+  const images=fwImagesFor(d);
+  if(!images.length) return {ok:false,reason:t('fwReason.noFirmware')};
+  return {ok:true,images};
+}
 async function renderDevmgmt(){
-  await loadDevices();
+  await Promise.all([loadDevices(),loadFirmware()]);
   const q=($('mgmt-q').value||'').toLowerCase(), f=$('mgmt-f').value;
   const rows=DB.devices.filter(d=>{
     const st=d.approved?'ok':'pending';
@@ -790,8 +850,8 @@ async function renderDevmgmt(){
          <button class="btn ghost sm" onclick="resetAp('${esc(d.mac)}')">${t('btn.reset')}</button>
          <button class="btn ghost sm" onclick="disableAp('${esc(d.mac)}')">${t('btn.disable')}</button>
          <button class="btn ghost sm ledtog ${d.led_on===true?'on':d.led_on===false?'off':'unk'}" onclick="ledToggle('${esc(d.mac)}')" title="${esc(t(d.led_on===true?'led.onTip':d.led_on===false?'led.offTip':'led.unknownTip'))}"><i></i>${t('btn.led')}</button>
-         <button class="btn ghost sm" onclick="upgradeDialog('${esc(d.mac)}')">${t('btn.upgrade')}</button>`;
-    return `<tr><td>${esc(d.name||'—')}</td><td>${esc(d.vendor||'—')}</td><td>${esc(d.model||'—')}</td><td class="mono">${esc(d.mac)}</td>
+         ${upgradeBtn(d)}`;
+    return `<tr><td>${esc(d.name||'—')}</td><td>${esc(vendorLabel(d.vendor))}</td><td>${esc(d.model||'—')}</td><td class="mono">${esc(d.mac)}</td>
       <td>${esc(d.hw_version||'—')}</td><td>${esc(d.sw_version||'—')}</td>
       <td><span class="pill ${st[1]}">${esc(st[0])}</span></td>
       <td><span style="display:flex;gap:8px;flex-wrap:wrap">${ops}</span></td></tr>`;
@@ -802,25 +862,59 @@ async function renderDevmgmt(){
 /* ---------- firmware ---------- */
 async function renderFirmware(){
   await loadFirmware();
-  $('fw-rows').innerHTML=DB.firmware.map(f=>`<tr><td class="mono">${esc(f.stored_path)}</td>
-    <td>${(f.size/1024).toFixed(1)} KiB</td><td class="mono">${esc((f.hash||'').slice(0,16))}…</td>
-    <td>${fmtTime(f.uploaded_at)}</td></tr>`).join('') || `<tr><td colspan="4" class="muted">${t('empty.fw')}</td></tr>`;
+  $('fw-rows').innerHTML=DB.firmware.map(f=>{const h=esc(f.hash||'');
+    return `<tr><td class="mono">${esc(f.stored_path)}</td>
+    <td class="mono">${esc(f.version||'—')}</td>
+    <td>${(f.size/1024).toFixed(1)} KiB</td><td class="mono"><span class="hash" data-hash="${h}" title="${h} — ${t('tip.md5Copy')}" onclick="copyHash(this)">${h}</span></td>
+    <td>${fmtTime(f.uploaded_at)}</td></tr>`;}).join('') || `<tr><td colspan="5" class="muted">${t('empty.fw')}</td></tr>`;
+}
+/* The MD5 is clipped by CSS only; the tooltip and the clipboard see it whole. */
+function copyHash(el){
+  const v=el.dataset.hash||el.textContent;
+  if(navigator.clipboard&&navigator.clipboard.writeText)
+    navigator.clipboard.writeText(v).then(()=>toast(t('toast.md5Copied')),()=>toast(v));
+  else toast(v);
 }
 async function uploadFirmware(){
   const fd=new FormData();
   fd.append('vendor',$('fw-vendor').value); fd.append('model',$('fw-model').value);
   fd.append('hw_version',$('fw-hw').value);
   const file=$('fw-file').files[0]; if(file)fd.append('file',file);
-  try{ await api('/api/firmware',{method:'POST',body:fd}); toast(t('toast.fwUploaded')); renderFirmware(); }
+  try{ const img=await api('/api/firmware',{method:'POST',body:fd});
+    toast(t('toast.fwUploaded',{name:img.file_name,vendor:img.vendor,model:img.model,version:img.version||'—'})); renderFirmware(); }
   catch(e){ toast(t('toast.fwUploadFail',{msg:e.message})); }
 }
+/* A disabled button gets no native tooltip, so it is wrapped in a span that
+   owns the hover area and the reason text. */
+function upgradeBtn(d){
+  const gate=fwGate(d);
+  if(gate.ok)
+    return `<button class="btn ghost sm" onclick="upgradeDialog('${esc(d.mac)}')">${t('btn.upgrade')}</button>`;
+  return `<span title="${esc(gate.reason)}" style="display:inline-flex"><button class="btn ghost sm" disabled>${t('btn.upgrade')}</button></span>`;
+}
 function upgradeDialog(mac){
-  const opts=DB.firmware.map(f=>`<option value="${f.id}">${esc(f.stored_path)}</option>`).join('');
-  if(!opts){ toast(t('toast.noFw')); return; }
+  const d=DEV(mac)||{};
+  const gate=fwGate(d);
+  if(!gate.ok){ toast(gate.reason); return; }
+  const imgs=gate.images, cur=d.sw_version||'';
+  // Only dotted numeric versions are comparable; H3C reports a hex build id,
+  // so a same/lower verdict stays unknown there and no prompt is raised.
+  const known=imgs.filter(f=>verCmp(f.version,cur)!=null);
+  const hasNewer=known.some(f=>verCmp(f.version,cur)>0);
+  const opts=imgs.map(f=>`<option value="${f.id}">${esc(f.stored_path)}${f.version?' — '+esc(f.version):''}</option>`).join('');
+  const warn=known.length&&!hasNewer?`<div class="hint" style="color:var(--warn)">${t('fw.onlySameOrLower')}</div>`:'';
   openModal(t('modal.upgrade'),t('modal.upgradeSub',{mac:esc(APNAME(mac))}),
-    `<div class="field"><label>${t('field.fwImage')}</label><select id="d-fw">${opts}</select></div>`,
-    async()=>{ await apiJson(`/api/devices/${mac}/upgrade`,'POST',{image_id:+$('d-fw').value});
-      toast(t('toast.upgradeSent')); },
+    `<div class="field"><label>${t('fw.current')}</label><div class="mono">${esc(cur||'—')}</div></div>
+     <div class="field"><label>${t('field.fwImage')}</label><select id="d-fw">${opts}</select></div>${warn}`,
+    async()=>{
+      const img=imgs.find(f=>f.id===+$('d-fw').value)||imgs[0];
+      const c=verCmp(img.version,cur);
+      if(c!=null&&c<=0&&!confirm(t('confirm.fwSameOrLower',{cur:cur||'—',next:img.version||'—'}))){
+        const e=new Error(); e.silent=true; throw e; // keep the dialog open
+      }
+      await apiJson(`/api/devices/${mac}/upgrade`,'POST',{image_id:img.id});
+      toast(t('toast.upgradeSent'));
+    },
     t('btn.pushUpgrade'));
 }
 async function resetAp(mac){
@@ -887,6 +981,20 @@ function openSsidModal(wlanId,opt={}){
     });
 }
 
+/* ---------- system settings ---------- */
+async function renderSystem(){
+  const s=await api('/api/system');
+  $('sys-fwjoin').checked=!!s.update_firmware_on_startup;
+}
+async function saveSystem(){
+  const el=$('sys-fwjoin'), on=el.checked;
+  try{
+    const s=await apiJson('/api/system','PUT',{update_firmware_on_startup:on});
+    el.checked=!!s.update_firmware_on_startup;
+    toast(t('toast.sysSaved'));
+  }catch(e){ el.checked=!on; toast(t('toast.saveFail',{msg:e.message})); }
+}
+
 /* ---------- modal ---------- */
 let modalOpen=false, modalOk=null;
 function openModal(title,sub,bodyHtml,onOk,okLabel){
@@ -899,7 +1007,7 @@ function closeModal(){ modalOpen=false; modalOk=null; $('mask').classList.remove
 $('m-ok').addEventListener('click',async()=>{
   if(!modalOk){closeModal();return;}
   try{ await modalOk(); closeModal(); }
-  catch(e){ toast(t('toast.opFail',{msg:e.message})); }
+  catch(e){ if(e&&e.silent) return; toast(t('toast.opFail',{msg:e.message})); }
 });
 
 function toast(msg){const t=document.createElement('div');t.className='toast';t.textContent=msg;document.body.appendChild(t);setTimeout(()=>t.remove(),2400);}
