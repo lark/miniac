@@ -123,13 +123,14 @@ under different `rsv` values. Observed values (`wire`):
  1  WLAN id
  2  capability word   (u16; AC100 sends 0x8000)
  4  key index/status + key length + group TSC + QoS/auth/MAC  (13B, all zero from AC100)
-17  tunnel flag       (AC100 sends 0x01)
-18  broadcast flag    (AC100 sends 0x01)
+17  tunnel flag       (AC100 sends 0x01; required to light the WLAN)
+18  broadcast flag    (1 = SSID visible, 0 = hidden)
 19  SSID              (to the end of the value)
 ```
 
 The trailing `01 01` pair is what actually brings the WLAN up: with capability 0x0001 and both
 trailing bytes zero the WTP answers 0x0033DD02 with success but never puts the SSID on the air.
+miniac sends `01` for the tunnel flag and follows the WLAN's broadcast setting for byte 18.
 
 ### 2.5 TP-Link private message types
 

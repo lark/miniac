@@ -31,7 +31,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::{server::TlsStream, TlsAcceptor};
 
 use crate::config::{Akm, Cipher, Pmf, SecurityPolicy, ConfigUpdateCmd, ConfigUpdateRegistry};
-use crate::fleet::{ClientGroup, ProductCapsStore};
+use crate::fleet::{ClientGroup, FleetClientRange, ProductCapsStore, effective_client_range};
 use crate::vendor::h3c::ConfigUpdateElem;
 use crate::vendor::profile::VendorProfile;
 use crate::device::{self, DeviceStore};
@@ -41,7 +41,7 @@ use crate::radio::{H3cRadioHeader, RadioStore, RadioWlan};
 use crate::security::ProfileStore;
 use crate::settings::{ListenAddr, WebSettings};
 use crate::station::StationStore;
-use crate::wcfg::{ApOverride, Band, GlobalRadio, GlobalWlan, WirelessConfigStore};
+use crate::wcfg::{ApOverride, Band, GlobalRadio, GlobalWlan, WifiVlan, WirelessConfigStore};
 use crate::wtpcmd::{WtpCmd, WtpCmdRegistry};
 
 /// Shared store handles handed to every handler via axum state.
@@ -182,6 +182,14 @@ fn router(state: Arc<AppData>) -> Router {
         .route(
             "/api/wcfg/override/{mac}/{band}",
             get(get_override).put(set_override).delete(clear_override),
+        )
+        .route(
+            "/api/wcfg/vlan",
+            get(list_wifi_vlans).post(add_wifi_vlan),
+        )
+        .route(
+            "/api/wcfg/vlan/{vlan_id}",
+            axum::routing::put(update_wifi_vlan).delete(delete_wifi_vlan),
         )
         .route("/api/wcfg/commit", post(commit_wcfg))
         .route("/api/wcfg/security/recommend", get(recommend_security))
@@ -578,7 +586,9 @@ async fn set_device_wlan(
         req.pmf.as_deref(),
         req.psk.as_deref(),
     )?;
-    let warnings = policy_warnings(&st, &security);
+    let mut warnings = policy_warnings(&st, &security);
+    let (client_count, limit_warning) = clamp_client_limit(device_client_range(&st, mac)?, req.client_count);
+    warnings.extend(limit_warning);
     let wlan_id = req.wlan_id.unwrap_or(1);
     let w = RadioWlan {
         mac,
@@ -589,7 +599,7 @@ async fn set_device_wlan(
         wlan_enable: req.wlan_enable,
         isolate: req.isolate,
         broadcast: req.broadcast,
-        client_count: req.client_count,
+        client_count,
         vlan_id: req.vlan_id,
         rekey_period: req.rekey_period,
     };
@@ -613,7 +623,7 @@ async fn set_device_wlan(
         wlan_enable: req.wlan_enable,
         isolate: req.isolate,
         broadcast: req.broadcast,
-        client_count: req.client_count,
+        client_count,
         vlan_id: req.vlan_id,
         rekey_period: req.rekey_period,
         warnings,
@@ -1274,6 +1284,21 @@ impl From<GlobalWlan> for GlobalWlanDto {
 }
 
 #[derive(Serialize)]
+struct WifiVlanDto {
+    vlan_id: u16,
+    name: String,
+}
+
+impl From<WifiVlan> for WifiVlanDto {
+    fn from(v: WifiVlan) -> Self {
+        WifiVlanDto {
+            vlan_id: v.vlan_id,
+            name: v.name,
+        }
+    }
+}
+
+#[derive(Serialize)]
 struct ApOverrideDto {
     mac: String,
     band: u8,
@@ -1298,8 +1323,26 @@ impl From<ApOverride> for ApOverrideDto {
 struct WcfgDto {
     global_radios: Vec<GlobalRadioDto>,
     global_wlans: Vec<GlobalWlanDto>,
+    vlans: Vec<WifiVlanDto>,
     overrides: Vec<ApOverrideDto>,
     pending: Vec<String>,
+    /// Per-SSID client limit the current approved fleet can express; absent
+    /// when no product has a characterized range.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    client_limit: Option<ClientLimitDto>,
+}
+
+/// Effective per-SSID client range across the fleet, for the UI to render
+/// (rather than hard-code) and for save-time clamping to cite.
+#[derive(Serialize)]
+struct ClientLimitDto {
+    /// 0 means "no limit" is accepted; an explicit limit must be at least this.
+    min: u32,
+    max: u32,
+    /// Product that raised the lower bound (why 0 may be unavailable).
+    min_source: String,
+    /// Product that lowered the upper bound.
+    source: String,
 }
 
 fn wcfg_dto(st: &AppData) -> Result<WcfgDto, ApiError> {
@@ -1309,6 +1352,12 @@ fn wcfg_dto(st: &AppData) -> Result<WcfgDto, ApiError> {
             global_wlans.push(GlobalWlanDto::from(w));
         }
     }
+    let client_limit = fleet_client_range(st)?.map(|f| ClientLimitDto {
+        min: f.range.min,
+        max: f.range.max,
+        min_source: f.min_source,
+        source: f.max_source,
+    });
     Ok(WcfgDto {
         global_radios: st
             .wcfg
@@ -1317,6 +1366,7 @@ fn wcfg_dto(st: &AppData) -> Result<WcfgDto, ApiError> {
             .map(GlobalRadioDto::from)
             .collect(),
         global_wlans,
+        vlans: st.wcfg.list_vlans()?.into_iter().map(Into::into).collect(),
         overrides: st
             .wcfg
             .list_overrides()?
@@ -1329,7 +1379,71 @@ fn wcfg_dto(st: &AppData) -> Result<WcfgDto, ApiError> {
             .iter()
             .map(|m| device::mac_to_str(*m))
             .collect(),
+        client_limit,
     })
+}
+
+/// Capability-registry key for a device: vendor (registry token), model,
+/// firmware version. `None` when the vendor is still unknown.
+fn caps_key(d: &device::Device) -> Option<(String, String, String)> {
+    Some((
+        d.vendor.clone()?,
+        d.model.clone().unwrap_or_default(),
+        d.sw_version.clone().unwrap_or_default(),
+    ))
+}
+
+/// Effective client range across the approved fleet (the global SSID template
+/// is pushed to all of them).
+fn fleet_client_range(st: &AppData) -> Result<Option<FleetClientRange>, ApiError> {
+    let devices = st.devices.list()?;
+    let keys: Vec<_> = devices
+        .iter()
+        .filter(|d| d.approved)
+        .filter_map(caps_key)
+        .collect();
+    Ok(effective_client_range(&st.caps, &keys)?)
+}
+
+/// Effective client range for a single AP (a per-device WLAN edit).
+fn device_client_range(st: &AppData, mac: device::Mac) -> Result<Option<FleetClientRange>, ApiError> {
+    let Some(d) = st.devices.get(mac)? else {
+        return Ok(None);
+    };
+    let keys: Vec<_> = caps_key(&d).into_iter().collect();
+    Ok(effective_client_range(&st.caps, &keys)?)
+}
+
+/// Fold a requested client limit (0 = no limit) into what the target products
+/// can express, returning the effective value plus a caveat when it changed.
+fn clamp_client_limit(
+    range: Option<FleetClientRange>,
+    requested: u32,
+) -> (u32, Option<String>) {
+    let Some(f) = range else {
+        return (requested, None);
+    };
+    let (min, max) = (f.range.min, f.range.max);
+    let value = f.range.clamp(requested);
+    let warning = (value != requested).then(|| {
+        if requested == 0 {
+            format!(
+                "{} cannot express 'no limit'; the client limit becomes {value} (allowed range {min}-{max})",
+                f.min_source
+            )
+        } else if requested > max {
+            format!(
+                "{} accepts {min}-{max} clients per SSID; {requested} is clamped to {value}",
+                f.max_source
+            )
+        } else {
+            format!(
+                "{} accepts {min}-{max} clients per SSID; {requested} is clamped to {value}",
+                f.min_source
+            )
+        }
+    });
+    (value, warning)
 }
 
 /// Materialize the global template into every approved WTP's per-AP rows and
@@ -1458,7 +1572,24 @@ async fn set_global_wlan(
         req.pmf.as_deref(),
         req.psk.as_deref(),
     )?;
-    let warnings = policy_warnings(&st, &security);
+    let mut warnings = policy_warnings(&st, &security);
+    let (client_count, limit_warning) = clamp_client_limit(fleet_client_range(&st)?, req.client_count);
+    warnings.extend(limit_warning);
+    // Only defined VLANs may be referenced; 0 means untagged.
+    if req.vlan_id != 0 {
+        let defined = u16::try_from(req.vlan_id)
+            .ok()
+            .filter(|id| *id <= 4094)
+            .map(|id| st.wcfg.vlan_exists(id))
+            .transpose()?
+            .unwrap_or(false);
+        if !defined {
+            return Err(ApiError::bad_request(format!(
+                "VLAN {} is not defined",
+                req.vlan_id
+            )));
+        }
+    }
     let w = GlobalWlan {
         band: req.band,
         wlan_id: req.wlan_id.unwrap_or(1),
@@ -1467,7 +1598,7 @@ async fn set_global_wlan(
         wlan_enable: req.wlan_enable,
         isolate: req.isolate,
         broadcast: req.broadcast,
-        client_count: req.client_count,
+        client_count,
         vlan_id: req.vlan_id,
         rekey_period: req.rekey_period,
     };
@@ -1544,6 +1675,109 @@ async fn delete_global_wlan(
     st.wcfg.delete_global_wlan(band, wlan_id)?;
     propagate_global(&st)?;
     logx::admin(format!("global WLAN removed: band {band} wlan {wlan_id}"));
+    Ok(Json(wcfg_dto(&st)?))
+}
+
+#[derive(Deserialize)]
+struct WifiVlanReq {
+    vlan_id: u16,
+    #[serde(default)]
+    name: String,
+}
+
+fn vlan_validate(req: &WifiVlanReq) -> Result<String, ApiError> {
+    if req.vlan_id == 0 || req.vlan_id > 4094 {
+        return Err(ApiError::bad_request("VLAN id must be within 1-4094"));
+    }
+    let name = req.name.trim();
+    if name.is_empty() {
+        return Err(ApiError::bad_request("VLAN name cannot be empty"));
+    }
+    Ok(name.to_string())
+}
+
+async fn list_wifi_vlans(
+    State(st): State<Arc<AppData>>,
+) -> Result<Json<Vec<WifiVlanDto>>, ApiError> {
+    Ok(Json(
+        st.wcfg.list_vlans()?.into_iter().map(Into::into).collect(),
+    ))
+}
+
+async fn add_wifi_vlan(
+    State(st): State<Arc<AppData>>,
+    Json(req): Json<WifiVlanReq>,
+) -> Result<Json<WcfgDto>, ApiError> {
+    let name = vlan_validate(&req)?;
+    if st.wcfg.vlan_exists(req.vlan_id)? {
+        return Err(ApiError::bad_request(format!(
+            "VLAN {} is already defined",
+            req.vlan_id
+        )));
+    }
+    st.wcfg.set_vlan(
+        None,
+        &WifiVlan {
+            vlan_id: req.vlan_id,
+            name: name.clone(),
+        },
+    )?;
+    logx::admin(format!("WiFi VLAN added: id {}", req.vlan_id));
+    Ok(Json(wcfg_dto(&st)?))
+}
+
+/// Rename a VLAN or re-key its id. A re-key moves every SSID referencing it,
+/// so the change is propagated to the APs as pending configuration.
+async fn update_wifi_vlan(
+    State(st): State<Arc<AppData>>,
+    Path(vlan_id): Path<u16>,
+    Json(req): Json<WifiVlanReq>,
+) -> Result<Json<WcfgDto>, ApiError> {
+    if !st.wcfg.vlan_exists(vlan_id)? {
+        return Err(ApiError::not_found(format!("VLAN {vlan_id} is not defined")));
+    }
+    let name = vlan_validate(&req)?;
+    if req.vlan_id != vlan_id && st.wcfg.vlan_exists(req.vlan_id)? {
+        return Err(ApiError::bad_request(format!(
+            "VLAN {} is already defined",
+            req.vlan_id
+        )));
+    }
+    st.wcfg.set_vlan(
+        Some(vlan_id),
+        &WifiVlan {
+            vlan_id: req.vlan_id,
+            name,
+        },
+    )?;
+    if req.vlan_id != vlan_id {
+        propagate_global(&st)?;
+    }
+    logx::admin(format!("WiFi VLAN updated: id {vlan_id} -> {}", req.vlan_id));
+    Ok(Json(wcfg_dto(&st)?))
+}
+
+async fn delete_wifi_vlan(
+    State(st): State<Arc<AppData>>,
+    Path(vlan_id): Path<u16>,
+) -> Result<Json<WcfgDto>, ApiError> {
+    if !st.wcfg.vlan_exists(vlan_id)? {
+        return Err(ApiError::not_found(format!("VLAN {vlan_id} is not defined")));
+    }
+    let used = st
+        .wcfg
+        .list_global_wlans(Band::Ghz24.radio_id())?
+        .into_iter()
+        .chain(st.wcfg.list_global_wlans(Band::Ghz5.radio_id())?)
+        .filter(|w| w.vlan_id == u32::from(vlan_id))
+        .count();
+    if used > 0 {
+        return Err(ApiError::bad_request(format!(
+            "VLAN {vlan_id} is still used by {used} SSID(s)"
+        )));
+    }
+    st.wcfg.delete_vlan(vlan_id)?;
+    logx::admin(format!("WiFi VLAN removed: id {vlan_id}"));
     Ok(Json(wcfg_dto(&st)?))
 }
 

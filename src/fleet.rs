@@ -99,6 +99,41 @@ impl SecurityPolicy {
     }
 }
 
+/// Inclusive per-SSID client-count range a product can express. A `min` of 0
+/// means the product also accepts "no limit" (miniac stores 0); otherwise 0 is
+/// not expressible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClientRange {
+    pub min: u32,
+    pub max: u32,
+}
+
+impl ClientRange {
+    /// Clamp a requested limit (0 = no limit) into what this product can
+    /// express. "No limit" becomes the maximum when the product cannot express
+    /// it, so the user's intent degrades to "as many as the device allows".
+    pub fn clamp(self, requested: u32) -> u32 {
+        if requested == 0 {
+            if self.min == 0 {
+                0
+            } else {
+                self.max
+            }
+        } else {
+            requested.clamp(self.min, self.max)
+        }
+    }
+
+    /// The range both products can express (a fleet can only express what every
+    /// member of it can).
+    pub fn intersect(self, other: Self) -> Self {
+        ClientRange {
+            min: self.min.max(other.min),
+            max: self.max.min(other.max),
+        }
+    }
+}
+
 /// What a product can express, keyed by (vendor, model, version). The masks are
 /// bit sets over [`Akm`]/[`Cipher`]/[`Pmf`]; a zero mask means
 /// "uncharacterized", which imposes no constraint rather than "unsupported".
@@ -113,6 +148,8 @@ pub struct ProductCaps {
     pub pmf_mask: u8,
     pub source: String,
     pub notes: String,
+    /// Per-SSID client-count range; `None` when uncharacterized.
+    pub client_range: Option<ClientRange>,
 }
 
 /// The adaptation-time capability text, embedded so initialization can import it
@@ -120,10 +157,10 @@ pub struct ProductCaps {
 pub const PRODUCT_CAPS_TEXT: &str = include_str!("../data/product_caps.txt");
 
 /// Parse the capability text into rows. One record per line,
-/// `vendor | model | version | akm | cipher | pmf | source | notes`,
+/// `vendor | model | version | akm | cipher | pmf | limits | source | notes`,
 /// `'|'`-separated; blank lines and `#` comments are skipped; the capability
 /// fields are comma lists of [`Akm`]/[`Cipher`]/[`Pmf`] names (empty =
-/// uncharacterized).
+/// uncharacterized) and `limits` is a comma list of `key=value` limits.
 pub fn parse_product_caps(text: &str) -> Result<Vec<ProductCaps>> {
     let mut out = Vec::new();
     for (n, raw) in text.lines().enumerate() {
@@ -131,10 +168,10 @@ pub fn parse_product_caps(text: &str) -> Result<Vec<ProductCaps>> {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let f: Vec<&str> = line.splitn(8, '|').map(str::trim).collect();
-        if f.len() < 8 {
+        let f: Vec<&str> = line.splitn(9, '|').map(str::trim).collect();
+        if f.len() < 9 {
             anyhow::bail!(
-                "product_caps.txt line {}: expected 8 '|'-separated fields, got {}",
+                "product_caps.txt line {}: expected 9 '|'-separated fields, got {}",
                 n + 1,
                 f.len()
             );
@@ -149,8 +186,10 @@ pub fn parse_product_caps(text: &str) -> Result<Vec<ProductCaps>> {
                 .map_err(|e| anyhow::anyhow!("product_caps.txt line {}: {e}", n + 1))?,
             pmf_mask: pmf_mask_from_list(f[5])
                 .map_err(|e| anyhow::anyhow!("product_caps.txt line {}: {e}", n + 1))?,
-            source: f[6].to_string(),
-            notes: f[7].to_string(),
+            client_range: client_range_from_limits(f[6])
+                .map_err(|e| anyhow::anyhow!("product_caps.txt line {}: {e}", n + 1))?,
+            source: f[7].to_string(),
+            notes: f[8].to_string(),
         });
     }
     Ok(out)
@@ -182,6 +221,37 @@ fn pmf_mask_from_list(list: &str) -> Result<u8> {
         m |= Pmf::from_str(n).ok_or_else(|| anyhow::anyhow!("unknown pmf '{n}'"))?.bit();
     }
     Ok(m)
+}
+
+/// Parse the `limits` field: a comma list of `key=value` pairs. Only
+/// `max_clients=MIN-MAX` (or `N`) is recognized today; unknown keys are ignored
+/// so new limits can be added without a format change.
+fn client_range_from_limits(list: &str) -> Result<Option<ClientRange>> {
+    let mut out = None;
+    for item in names(list) {
+        let Some((key, value)) = item.split_once('=') else {
+            continue;
+        };
+        if key.trim() != "max_clients" {
+            continue;
+        }
+        let value = value.trim();
+        let (min, max) = match value.split_once('-') {
+            Some((a, b)) => (a.trim(), b.trim()),
+            None => (value, value),
+        };
+        let min: u32 = min
+            .parse()
+            .map_err(|_| anyhow::anyhow!("invalid max_clients '{value}'"))?;
+        let max: u32 = max
+            .parse()
+            .map_err(|_| anyhow::anyhow!("invalid max_clients '{value}'"))?;
+        if min > max {
+            anyhow::bail!("max_clients range {min}-{max} is inverted");
+        }
+        out = Some(ClientRange { min, max });
+    }
+    Ok(out)
 }
 
 impl ProductCaps {
@@ -233,12 +303,34 @@ impl ProductCapsStore {
         self.get(profile.caps_token(), "", "")
     }
 
+    /// Capability row for a learned device, falling back from the specific
+    /// (vendor, model, version) row to narrower wildcard forms. Device rows
+    /// carry the display name `tp-link` while the registry keys `tplink`.
+    pub fn for_device(
+        &self,
+        vendor: &str,
+        model: &str,
+        version: &str,
+    ) -> Result<Option<ProductCaps>> {
+        let vendor = match vendor {
+            "tp-link" => "tplink",
+            other => other,
+        };
+        for (m, v) in [(model, version), (model, ""), ("", version), ("", "")] {
+            if let Some(c) = self.get(vendor, m, v)? {
+                return Ok(Some(c));
+            }
+        }
+        Ok(None)
+    }
+
     /// Look up a specific (vendor, model, version) row; empty `model`/`version`
     /// match the vendor's wildcard row.
     pub fn get(&self, vendor: &str, model: &str, version: &str) -> Result<Option<ProductCaps>> {
         let conn = self.db.lock();
         conn.query_row(
-            "SELECT vendor,model,version,akm_mask,cipher_mask,pmf_mask,source,notes \
+            "SELECT vendor,model,version,akm_mask,cipher_mask,pmf_mask, \
+                    client_min,client_max,source,notes \
              FROM product_caps WHERE vendor=?1 AND model=?2 AND version=?3",
             params![vendor, model, version],
             row_to_caps,
@@ -250,7 +342,8 @@ impl ProductCapsStore {
     pub fn list(&self) -> Result<Vec<ProductCaps>> {
         let conn = self.db.lock();
         let mut stmt = conn.prepare(
-            "SELECT vendor,model,version,akm_mask,cipher_mask,pmf_mask,source,notes \
+            "SELECT vendor,model,version,akm_mask,cipher_mask,pmf_mask, \
+                    client_min,client_max,source,notes \
              FROM product_caps ORDER BY vendor,model,version",
         )?;
         let rows = stmt.query_map([], row_to_caps)?;
@@ -259,6 +352,8 @@ impl ProductCapsStore {
 }
 
 fn row_to_caps(r: &rusqlite::Row) -> rusqlite::Result<ProductCaps> {
+    let client_min: Option<i64> = r.get(6)?;
+    let client_max: Option<i64> = r.get(7)?;
     Ok(ProductCaps {
         vendor: r.get(0)?,
         model: r.get(1)?,
@@ -266,9 +361,72 @@ fn row_to_caps(r: &rusqlite::Row) -> rusqlite::Result<ProductCaps> {
         akm_mask: r.get::<_, i64>(3)? as u8,
         cipher_mask: r.get::<_, i64>(4)? as u8,
         pmf_mask: r.get::<_, i64>(5)? as u8,
-        source: r.get(6)?,
-        notes: r.get(7)?,
+        source: r.get(8)?,
+        notes: r.get(9)?,
+        client_range: match (client_min, client_max) {
+            (Some(min), Some(max)) => Some(ClientRange {
+                min: min as u32,
+                max: max as u32,
+            }),
+            _ => None,
+        },
     })
+}
+
+/// A client range plus the products that shaped each bound, so a caveat can
+/// name the actual constraint ("TP-Link cannot express no limit", "H3C caps at
+/// 32") instead of blaming one product for both.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FleetClientRange {
+    pub range: ClientRange,
+    /// Product that raised the lower bound.
+    pub min_source: String,
+    /// Product that lowered the upper bound.
+    pub max_source: String,
+}
+
+/// Effective per-SSID client-count range across a set of products: the
+/// intersection of their characterized ranges. `None` when no product has a
+/// characterized range (nothing to enforce).
+pub fn effective_client_range(
+    caps: &ProductCapsStore,
+    devices: &[(String, String, String)],
+) -> Result<Option<FleetClientRange>> {
+    let mut acc: Option<FleetClientRange> = None;
+    for (vendor, model, version) in devices {
+        let Some(c) = caps.for_device(vendor, model, version)? else {
+            continue;
+        };
+        let Some(range) = c.client_range else {
+            continue;
+        };
+        let label = if model.is_empty() {
+            vendor.clone()
+        } else {
+            format!("{vendor} {model}")
+        };
+        acc = Some(match acc {
+            None => FleetClientRange {
+                range,
+                min_source: label.clone(),
+                max_source: label,
+            },
+            Some(cur) => FleetClientRange {
+                range: cur.range.intersect(range),
+                min_source: if range.min > cur.range.min {
+                    label.clone()
+                } else {
+                    cur.min_source
+                },
+                max_source: if range.max < cur.range.max {
+                    label
+                } else {
+                    cur.max_source
+                },
+            },
+        });
+    }
+    Ok(acc)
 }
 
 /// Verdict level of an assessment, ordered so a merge keeps the worst.
@@ -554,16 +712,50 @@ mod tests {
         assert_eq!(h3c.akm_mask, 0b0111); // open|psk|psk-sae
         assert_eq!(h3c.cipher_mask, 0b0111); // tkip|ccmp|tkip+ccmp
         assert_eq!(h3c.pmf_mask, 0); // uncharacterized
+        assert_eq!(h3c.client_range, Some(ClientRange { min: 0, max: 32 }));
         let tl = caps.iter().find(|c| c.vendor == "tplink").expect("tplink row");
         assert_eq!(tl.akm_mask, 0b0011); // open|psk
         assert_eq!(tl.cipher_mask, 0b0010); // ccmp
+        assert_eq!(tl.client_range, Some(ClientRange { min: 1, max: 100 }));
         assert_eq!(tl.model, "");
         assert_eq!(tl.version, "");
     }
 
     #[test]
+    fn client_range_clamps_and_intersects() {
+        let h3c = ClientRange { min: 0, max: 32 };
+        let tl = ClientRange { min: 1, max: 100 };
+        // H3C expresses "no limit"; TP-Link does not, so it degrades to its max.
+        assert_eq!(h3c.clamp(0), 0);
+        assert_eq!(h3c.clamp(64), 32);
+        assert_eq!(tl.clamp(0), 100);
+        assert_eq!(tl.clamp(1), 1);
+        assert_eq!(tl.clamp(200), 100);
+
+        let both = h3c.intersect(tl);
+        assert_eq!(both, ClientRange { min: 1, max: 32 });
+        assert_eq!(both.clamp(0), 32);
+    }
+
+    #[test]
+    fn effective_client_range_intersects_fleet() {
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let store = ProductCapsStore::new(db);
+        let keys = vec![
+            ("h3c".to_string(), String::new(), String::new()),
+            // Device rows spell the vendor `tp-link`; the registry keys `tplink`.
+            ("tp-link".to_string(), String::new(), String::new()),
+        ];
+        let fleet = effective_client_range(&store, &keys).unwrap().unwrap();
+        assert_eq!(fleet.range, ClientRange { min: 1, max: 32 });
+        // TP-Link raises the lower bound (no "no limit"), H3C lowers the ceiling.
+        assert_eq!(fleet.min_source, "tp-link");
+        assert_eq!(fleet.max_source, "h3c");
+    }
+
+    #[test]
     fn product_caps_text_rejects_unknown_name_and_short_line() {
-        let bad_akm = "h3c | | | wpa2 | ccmp | | src | note\n";
+        let bad_akm = "h3c | | | wpa2 | ccmp | | | src | note\n";
         assert!(parse_product_caps(bad_akm).is_err());
         let short = "h3c | | | open,psk\n";
         assert!(parse_product_caps(short).is_err());

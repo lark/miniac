@@ -4,14 +4,18 @@
 # model + version), not a live-sampled registry. It is embedded into the binary
 # and imported into the `product_caps` table on every initialization.
 #
-# Record format, one per line, '|'-separated (8 fields):
-#   vendor | model | version | akm | cipher | pmf | source | notes
+# Record format, one per line, '|'-separated (9 fields):
+#   vendor | model | version | akm | cipher | pmf | limits | source | notes
 #     vendor  : profile token, one of 'h3c' | 'tplink' | 'rfc'
 #     model   : device model; empty = any model of the vendor
 #     version : firmware/hardware version; empty = any version
 #     akm     : comma list of open, psk, psk-sae, sae
 #     cipher  : comma list of tkip, ccmp, tkip+ccmp
 #     pmf     : comma list of disabled, capable, required
+#     limits  : comma list of key=value limits; the only key today is
+#               'max_clients=MIN-MAX' (inclusive per-SSID client range; MIN 0
+#               means the device also accepts "no limit", stored as 0). Unknown
+#               keys are ignored, so limits can grow without a format change.
 #     source  : where the data came from (adaptation evidence)
 #     notes   : free text; may contain '|' since it is the last field
 #
@@ -22,9 +26,9 @@
 # 4 (WPA-PSK/WPA2-PSK, cipher-selected) and 6 (WPA2-PSK/WPA3-SAE mixed); the
 # chosen cipher is wpa_key_type 1/2/3 (TKIP/AES/AES+TKIP). There is no pure WPA2
 # and no pure WPA3 value, so AKM carries open|psk|psk-sae only.
-h3c | | | open,psk,psk-sae | tkip,ccmp,tkip+ccmp | | AX60 rootfs web: ssid_enc 0/1(WEP)/4(WPA or WPA2-PSK)/6(WPA2-WPA3 mixed); wpa_key_type 1/2/3 | mixed modes only: pure WPA2 and pure WPA3 are not expressible
+h3c | | | open,psk,psk-sae | tkip,ccmp,tkip+ccmp | | max_clients=0-32 | AX60 rootfs web: ssid_enc 0/1(WEP)/4(WPA or WPA2-PSK)/6(WPA2-WPA3 mixed); wpa_key_type 1/2/3 | mixed modes only: pure WPA2 and pure WPA3 are not expressible; WTPEditSsidInit caps each SSID at 32 clients
 
 # TP-Link AC100: private 9 carries auth=2 (WPA2) and cipher=2 (AES/CCMP); an
 # open WLAN omits the private 9 element entirely. WPA3 and TKIP are not
 # characterized, so only open|psk and AES/CCMP are claimed.
-tplink | | | open,psk | ccmp | | TL-AC100 mitm6: private 9 auth=2 (WPA2), cipher=2 (AES); open omits private 9 | PSK/WPA2-AES characterized; WPA3 and TKIP uncharacterized
+tplink | | | open,psk | ccmp | | max_clients=1-100 | TL-AC100 mitm6: private 9 auth=2 (WPA2), cipher=2 (AES); open omits private 9 | PSK/WPA2-AES characterized; WPA3 and TKIP uncharacterized; per-SSID client limit is 1-100

@@ -173,6 +173,14 @@ CREATE TABLE IF NOT EXISTS global_wlan (
     PRIMARY KEY (band, wlan_id)
 );
 
+-- WLAN-only VLAN definitions. SSIDs reference a row by id; the name is a local
+-- label and is never pushed to an AP. Wired/port/trunk configuration does not
+-- belong here.
+CREATE TABLE IF NOT EXISTS wifi_vlan (
+    vlan_id  INTEGER PRIMARY KEY,          -- 802.1Q id, 1..=4094
+    name     TEXT NOT NULL DEFAULT ''
+);
+
 -- Product capability registry (`product_caps`) is created and imported
 -- separately by `init_product_caps` from the embedded adaptation text.
 
@@ -225,7 +233,8 @@ INSERT OR IGNORE INTO global_wlan
 /// collected during device adaptation can pin a firmware/hardware revision;
 /// empty `model`/`version` are wildcards. The masks are bit sets over
 /// config::{Akm,Cipher,Pmf}; a zero mask means "uncharacterized" rather than
-/// "unsupported".
+/// "unsupported". `client_min`/`client_max` hold the per-SSID client-count range
+/// (min 0 = "no limit" expressible); both NULL means uncharacterized.
 const PRODUCT_CAPS_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS product_caps (
     vendor      TEXT NOT NULL,
@@ -234,6 +243,8 @@ CREATE TABLE IF NOT EXISTS product_caps (
     akm_mask    INTEGER NOT NULL DEFAULT 0,
     cipher_mask INTEGER NOT NULL DEFAULT 0,
     pmf_mask    INTEGER NOT NULL DEFAULT 0,
+    client_min  INTEGER,
+    client_max  INTEGER,
     source      TEXT NOT NULL DEFAULT '',
     notes       TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (vendor, model, version)
@@ -376,19 +387,26 @@ impl Db {
 
 /// (Re)import the capability registry from the embedded adaptation text. The
 /// table is fully derived data, so it is rebuilt on every initialization: a
-/// schema predating the `version` dimension is dropped and recreated, then the
-/// text is parsed and inserted fresh.
+/// schema predating the `version` dimension or the client-limit columns is
+/// dropped and recreated, then the text is parsed and inserted fresh.
 fn init_product_caps(conn: &Connection) -> Result<()> {
-    if !has_column(conn, "product_caps", "version")? {
+    if !has_column(conn, "product_caps", "version")?
+        || !has_column(conn, "product_caps", "client_max")?
+    {
         conn.execute("DROP TABLE IF EXISTS product_caps", [])?;
     }
     conn.execute_batch(PRODUCT_CAPS_SCHEMA)?;
     conn.execute("DELETE FROM product_caps", [])?;
     for c in crate::fleet::parse_product_caps(crate::fleet::PRODUCT_CAPS_TEXT)? {
+        let (client_min, client_max) = match c.client_range {
+            Some(r) => (Some(r.min as i64), Some(r.max as i64)),
+            None => (None, None),
+        };
         conn.execute(
             "INSERT INTO product_caps
-                (vendor,model,version,akm_mask,cipher_mask,pmf_mask,source,notes)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+                (vendor,model,version,akm_mask,cipher_mask,pmf_mask, \
+                 client_min,client_max,source,notes)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
             params![
                 c.vendor,
                 c.model,
@@ -396,6 +414,8 @@ fn init_product_caps(conn: &Connection) -> Result<()> {
                 c.akm_mask as i64,
                 c.cipher_mask as i64,
                 c.pmf_mask as i64,
+                client_min,
+                client_max,
                 c.source,
                 c.notes
             ],

@@ -179,8 +179,13 @@
 
       <!-- wireless -->
       <section class="page" id="p-wireless">
+        <div class="tabs" id="w-toptabs">
+          <button class="on" data-i18n="wtab.ssidrf" onclick="wTopTab('ssid',this)">SSID 与射频</button>
+          <button data-i18n="wtab.vlan" onclick="wTopTab('vlan',this)">VLAN</button>
+        </div>
+        <div id="w-tab-ssid">
         <div class="toolbar">
-          <div class="tabs" style="margin:0;border:none">
+          <div class="tabs" id="w-bandtabs" style="margin:0;border:none">
             <button class="on" onclick="wSetBand(1,this)">2.4GHz</button><button onclick="wSetBand(2,this)">5GHz</button>
           </div>
           <span style="flex:1"></span>
@@ -212,6 +217,18 @@
           <h2 data-i18n="card.overrides">AP 覆盖设置</h2>
           <table><thead><tr><th data-i18n="th.apname2">AP 备注</th><th data-i18n="th.channel">信道</th><th data-i18n="th.power">功率</th><th data-i18n="th.state">状态</th><th data-i18n="th.ops">操作</th></tr></thead>
             <tbody id="w-ov-rows"></tbody></table>
+        </div>
+        </div>
+        <div id="w-tab-vlan" style="display:none">
+          <div class="card">
+            <h2 data-i18n="card.vlan">VLAN 定义（仅无线）</h2>
+            <table><thead><tr><th data-i18n="th.vlanId">VLAN ID</th><th data-i18n="th.vlanName">名称</th><th data-i18n="th.vlanUsed">用于 SSID</th><th data-i18n="th.ops">操作</th></tr></thead>
+              <tbody id="v-rows"></tbody></table>
+            <div class="toolbar" style="margin:12px 0 0">
+              <button class="btn ghost sm" data-i18n="btn.addVlan" onclick="openVlanModal(0)">添加 VLAN</button>
+            </div>
+            <div class="note" data-i18n="vlan.note"></div>
+          </div>
         </div>
       </section>
 
@@ -354,8 +371,20 @@ const I18N={
   'modal.editSsid':'修改 SSID','modal.addSsid':'新增 SSID','modal.ssidSub':'全局 · {band}',
   'field.ssidName':'无线网络名称','field.akm':'密钥管理','field.cipher':'加密算法','field.pmf':'管理帧保护','field.psk':'PSK 密码',
   'field.rekey':'组密钥更新','field.seconds':'秒','field.broadcast':'开启广播','field.broadcastChk':'广播 SSID','field.isolate':'内部隔离','field.isolateChk':'隔离客户端',
+  'field.maxClients':'最大客户端数','ssid.maxClientsHint':'0 表示不限；可设 {min}–{max}（受 {src} 限制）','ssid.maxClientsHintFinite':'可设 {min}–{max}；0（不限）将按上限 {max} 下发（受 {srcMin} 限制）','ssid.maxClientsUnknown':'0 表示不限；上限以 AP 实际能力为准','ssid.unlimited':'不限',
   'field.enable':'启用此网络','field.enableChk':'启用',
   'ssid.modalHint':'非「不加密」需 8~63 字符；密钥管理与加密算法为两个独立维度',
+  'wtab.ssidrf':'SSID 与射频','wtab.vlan':'VLAN','card.vlan':'VLAN 定义（仅无线）',
+  'th.vlanId':'VLAN ID','th.vlanName':'名称','th.vlanUsed':'用于 SSID','btn.addVlan':'添加 VLAN','btn.deleteVlan':'删除',
+  'vlan.note':'VLAN 仅用于无线：AP 会给该 SSID 下终端报文打 802.1Q 标签，上行口需为 trunk。名称仅用于本页识别，不下发 AP；仍被 SSID 使用的 VLAN 不能删除。',
+  'vlan.unused':'未使用','vlan.undefined':'未定义','vlan.modalSub':'仅无线使用 · 名称不下发 AP',
+  'modal.addVlan':'添加 VLAN','modal.editVlan':'修改 VLAN','field.vlan':'VLAN','field.vlanNone':'无标签（VLAN 0）',
+  'field.vlanId':'VLAN ID','field.vlanName':'名称',
+  'vlan.hint':'VLAN ID 范围 1–4094，需与上游交换机的 VLAN 一致；改 ID 会同步更新引用它的 SSID。',
+  'ssid.vlanHint':'终端报文会打上该 VLAN 的 802.1Q 标签（上行需为 trunk）；未定义的 VLAN 请先到 VLAN 页添加。',
+  'err.vlanId':'VLAN ID 需在 1–4094 之间','err.vlanName':'VLAN 名称不能为空',
+  'toast.vlanSaved':'VLAN 已保存：{id}','toast.vlanDeleted':'VLAN 已删除：{id}','confirm.vlanDelete':'确定删除 VLAN {id} ？',
+  'empty.vlans':'尚未定义 VLAN，添加后即可在 SSID 编辑中选择。','tip.showPsk':'显示密码','tip.hidePsk':'隐藏密码',
   'err.ssidEmpty':'名称不能为空','toast.ssidSaved':'SSID 已保存，待提交同步','toast.ssidWarn':' · 兼容性提示：{msg}',
   'toast.recommendFail':'无法推荐：{msg}','rec.insufficient':'设备能力不足','rec.note':'推荐：{akm} / {cipher}','rec.legacy':'另建 legacy 独立 SSID：{akm} / {cipher}','toast.recommendErr':'推荐失败：{msg}',
   'akm.open':'不加密','akm.psk':'WPA2-PSK','akm.psksae':'WPA2/WPA3 混合','akm.sae':'WPA3-SAE',
@@ -424,8 +453,20 @@ const I18N={
   'modal.editSsid':'Edit SSID','modal.addSsid':'Add SSID','modal.ssidSub':'Global · {band}',
   'field.ssidName':'Network Name','field.akm':'Key Management','field.cipher':'Cipher','field.pmf':'PMF','field.psk':'PSK',
   'field.rekey':'Group Rekey','field.seconds':'s','field.broadcast':'Broadcast','field.broadcastChk':'Broadcast SSID','field.isolate':'Client Isolation','field.isolateChk':'Isolate clients',
+  'field.maxClients':'Max Clients','ssid.maxClientsHint':'0 means no limit; allowed {min}–{max} (limited by {src})','ssid.maxClientsHintFinite':'Allowed {min}–{max}; 0 (no limit) is pushed as the ceiling {max} (limited by {srcMin})','ssid.maxClientsUnknown':'0 means no limit; the ceiling follows AP capability','ssid.unlimited':'Unlimited',
   'field.enable':'Enable Network','field.enableChk':'Enable',
   'ssid.modalHint':'Anything but “Open” needs 8–63 characters; key management and cipher are two independent dimensions',
+  'wtab.ssidrf':'SSIDs & Radios','wtab.vlan':'VLAN','card.vlan':'VLAN Definitions (WLAN only)',
+  'th.vlanId':'VLAN ID','th.vlanName':'Name','th.vlanUsed':'Used by SSID','btn.addVlan':'Add VLAN','btn.deleteVlan':'Delete',
+  'vlan.note':'VLANs apply to WLAN traffic only: the AP tags clients of that SSID with 802.1Q, so its uplink must be a trunk. Names are local labels and are never pushed to APs; a VLAN still used by an SSID cannot be deleted.',
+  'vlan.unused':'Unused','vlan.undefined':'Undefined','vlan.modalSub':'WLAN only · name is not pushed to APs',
+  'modal.addVlan':'Add VLAN','modal.editVlan':'Edit VLAN','field.vlan':'VLAN','field.vlanNone':'Untagged (VLAN 0)',
+  'field.vlanId':'VLAN ID','field.vlanName':'Name',
+  'vlan.hint':'VLAN id must be 1–4094 and match the upstream switch; changing the id updates every SSID that references it.',
+  'ssid.vlanHint':'Client traffic is tagged with this VLAN (uplink must be a trunk); add missing VLANs on the VLAN tab first.',
+  'err.vlanId':'VLAN id must be within 1–4094','err.vlanName':'VLAN name cannot be empty',
+  'toast.vlanSaved':'VLAN saved: {id}','toast.vlanDeleted':'VLAN deleted: {id}','confirm.vlanDelete':'Delete VLAN {id}?',
+  'empty.vlans':'No VLANs defined yet; add one to select it when editing an SSID.','tip.showPsk':'Show password','tip.hidePsk':'Hide password',
   'err.ssidEmpty':'Name cannot be empty','toast.ssidSaved':'SSID saved, pending commit','toast.ssidWarn':' · Compatibility: {msg}',
   'toast.recommendFail':'Cannot recommend: {msg}','rec.insufficient':'insufficient device capability','rec.note':'Recommended: {akm} / {cipher}','rec.legacy':'Also create a legacy SSID: {akm} / {cipher}','toast.recommendErr':'Recommend failed: {msg}',
   'akm.open':'Open','akm.psk':'WPA2-PSK','akm.psksae':'WPA2/WPA3 Mixed','akm.sae':'WPA3-SAE',
@@ -653,15 +694,29 @@ async function disconnect(wmac,smac){
 
 /* ---------- wireless (global config + AP overrides + commit) ---------- */
 let wBandSel=1;              // band: 1=2.4GHz, 2=5GHz (radio_id = band)
+function wTopTab(tab,btn){
+  document.querySelectorAll('#w-toptabs button').forEach(x=>x.classList.toggle('on',x===btn));
+  $('w-tab-ssid').style.display=tab==='ssid'?'':'none';
+  $('w-tab-vlan').style.display=tab==='vlan'?'':'none';
+  if(tab==='vlan')renderVlan();
+}
 function wSetBand(b,btn){
   wBandSel=b;
-  document.querySelectorAll('#p-wireless .tabs button').forEach(x=>x.classList.remove('on'));
+  document.querySelectorAll('#w-bandtabs button').forEach(x=>x.classList.remove('on'));
   if(btn)btn.classList.add('on');
   renderWireless();
 }
 const gRadio=()=>(DB.wcfg?.global_radios||[]).find(g=>g.band===wBandSel)||
   {band:wBandSel,enable:true,channel_mode:0,channel:0,power:6,mode:0};
 const gWlans=()=>(DB.wcfg?.global_wlans||[]).filter(w=>w.band===wBandSel).sort((a,b)=>a.wlan_id-b.wlan_id);
+const clientLimit=()=>(DB.wcfg&&DB.wcfg.client_limit)||null;
+function clientLimitHint(){
+  const l=clientLimit();
+  if(!l) return t('ssid.maxClientsUnknown');
+  return l.min>0
+    ? t('ssid.maxClientsHintFinite',{min:l.min,max:l.max,srcMin:l.min_source})
+    : t('ssid.maxClientsHint',{min:l.min,max:l.max,src:l.source});
+}
 const ovOf=(mac)=>(DB.wcfg?.overrides||[]).find(o=>o.mac===mac&&o.band===wBandSel);
 async function renderWireless(){
   await Promise.all([loadDevices(),loadWcfg()]);
@@ -670,9 +725,9 @@ async function renderWireless(){
       <td>${i+1}</td>
       <td>${esc(w.ssid)}</td>
       <td>${esc(secLabel(w.security))}</td>
-      <td>${esc((w.security&&w.security.psk)||'—')}</td>
+      <td>${pskCell(w)}</td>
       <td><span class="pill ${w.wlan_enable?'p-ok':'p-muted'}">${w.wlan_enable?t('ssid.enabled'):t('ssid.disabled')}</span></td>
-      <td>${w.client_count}</td>
+      <td>${w.client_count||t('ssid.unlimited')}</td>
       <td><button class="btn ghost sm" onclick="openSsidModal(${w.wlan_id})">${t('btn.editSsid')}</button></td></tr>`).join('')
     + blankSsidRow();
   const g=gRadio();
@@ -692,9 +747,84 @@ async function renderWireless(){
   }).join('') || `<tr><td colspan="5" class="muted">${t('empty.approvedAps')}</td></tr>`;
   const pend=(DB.wcfg?.pending||[]);
   $('w-pending').textContent=pend.length?t('wireless.pending',{n:pend.length}):t('wireless.synced');
-  const tb=document.querySelectorAll('#p-wireless .tabs button');
+  const tb=document.querySelectorAll('#w-bandtabs button');
   if(tb[0])tb[0].classList.toggle('on',wBandSel===1);
   if(tb[1])tb[1].classList.toggle('on',wBandSel===2);
+  renderVlan();
+}
+/* ---------- WLAN-only VLAN definitions ---------- */
+const vlans=()=>(DB.wcfg?.vlans||[]);
+/* Usage is looked up across both bands: a definition is AC-wide. */
+function vlanUsage(){
+  const m={};
+  for(const w of (DB.wcfg?.global_wlans||[])){
+    if(!w.vlan_id)continue;
+    (m[w.vlan_id]=m[w.vlan_id]||[]).push(w);
+  }
+  return m;
+}
+function renderVlan(){
+  const use=vlanUsage();
+  $('v-rows').innerHTML=vlans().map(v=>{
+    const us=use[v.vlan_id]||[];
+    const who=us.length?us.map(w=>`<span class="pill p-muted">${esc(w.ssid)} (${bandLabel(bandOfRid(w.band))})</span>`).join(' ')
+      :`<span class="muted">${t('vlan.unused')}</span>`;
+    return `<tr><td class="mono">${v.vlan_id}</td><td>${esc(v.name)}</td><td>${who}</td><td>
+      <button class="btn ghost sm" onclick="openVlanModal(${v.vlan_id})">${t('btn.modify')}</button>
+      <button class="btn ghost sm" ${us.length?'disabled':''} onclick="delVlan(${v.vlan_id})">${t('btn.deleteVlan')}</button></td></tr>`;
+  }).join('') || `<tr><td colspan="4" class="muted">${t('empty.vlans')}</td></tr>`;
+}
+function openVlanModal(id){
+  const v=vlans().find(x=>x.vlan_id===id)||{vlan_id:'',name:''};
+  openModal(id?t('modal.editVlan'):t('modal.addVlan'),t('vlan.modalSub'),
+    `<div class="field"><label>${t('field.vlanId')}</label><input type="number" id="v-id" min="1" max="4094" value="${v.vlan_id}" style="width:110px"></div>
+     <div class="field"><label>${t('field.vlanName')}</label><input id="v-name" value="${esc(v.name)}" style="width:100%"></div>
+     <div class="hint">${t('vlan.hint')}</div>`,
+    async()=>{
+      const vlan_id=+$('v-id').value||0, name=$('v-name').value.trim();
+      if(!(vlan_id>=1&&vlan_id<=4094))throw new Error(t('err.vlanId'));
+      if(!name)throw new Error(t('err.vlanName'));
+      if(id)await apiJson(`/api/wcfg/vlan/${id}`,'PUT',{vlan_id,name});
+      else await apiJson('/api/wcfg/vlan','POST',{vlan_id,name});
+      toast(t('toast.vlanSaved',{id:vlan_id})); await loadWcfg(); renderWireless(); renderVlan();
+    });
+}
+async function delVlan(id){
+  if(!confirm(t('confirm.vlanDelete',{id})))return;
+  try{ await apiJson(`/api/wcfg/vlan/${id}`,'DELETE');
+    toast(t('toast.vlanDeleted',{id})); await loadWcfg(); renderWireless(); renderVlan();
+  }catch(e){ toast(t('toast.opFail',{msg:e.message})); }
+}
+const EYE='<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6-10-6-10-6z"/><circle cx="12" cy="12" r="2.6"/></svg>';
+const EYE_OFF='<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3l18 18"/><path d="M10.6 6.2A10 10 0 0 1 12 6c6.5 0 10 6 10 6a17.6 17.6 0 0 1-3.4 3.9"/><path d="M6.3 7.9A17.3 17.3 0 0 0 2 12s3.5 6 10 6a9.8 9.8 0 0 0 3.6-.7"/><path d="M9.9 9.9a3 3 0 0 0 4.2 4.2"/></svg>';
+/* PSKs are masked by default; the eye toggles one cell/input at a time. */
+function pskCell(w){
+  const v=(w.security&&w.security.psk)||'';
+  if(!v)return '<span class="muted">—</span>';
+  return `<span class="mono" data-psk="${esc(v)}" data-shown="0">••••••••</span> <button class="btn ghost sm" title="${t('tip.showPsk')}" onclick="togglePsk(this)">${EYE_OFF}</button>`;
+}
+function togglePsk(btn){
+  const sp=btn.parentNode.querySelector('[data-psk]');
+  const shown=sp.dataset.shown==='1';
+  sp.textContent=shown?'••••••••':sp.dataset.psk;
+  sp.dataset.shown=shown?'0':'1';
+  btn.innerHTML=shown?EYE_OFF:EYE;
+  btn.title=shown?t('tip.showPsk'):t('tip.hidePsk');
+}
+function togglePskInput(btn){
+  const inp=btn.parentNode.querySelector('input');
+  const masked=inp.type==='password';
+  inp.type=masked?'text':'password';
+  btn.innerHTML=masked?EYE:EYE_OFF;
+  btn.title=masked?t('tip.hidePsk'):t('tip.showPsk');
+}
+function vlanOptions(cur){
+  const list=vlans();
+  let out=`<option value="0" ${!cur?'selected':''}>${t('field.vlanNone')}</option>`;
+  for(const v of list)out+=`<option value="${v.vlan_id}" ${v.vlan_id===cur?'selected':''}>${v.vlan_id} — ${esc(v.name)}</option>`;
+  if(cur&&!list.some(v=>v.vlan_id===cur))
+    out+=`<option value="${cur}" selected>${cur} — ${t('vlan.undefined')}</option>`;
+  return out;
 }
 /* Security is two orthogonal dimensions (key management vs. cipher) plus PMF;
    label each part on its own and join for compact display. */
@@ -954,6 +1084,8 @@ function openSsidModal(wlanId,opt={}){
      wlan_enable:true,isolate:false,broadcast:true,vlan_id:0,rekey_period:0,client_count:0};
   const s=w.security||{};
   const note=opt.note?`<div class="hint">${esc(opt.note)}</div>`:'';
+  const lim=clientLimit();
+  const limAttrs=lim?`max="${lim.max}"`:'min="0"';
   openModal(wlanId>0&&!opt.create?t('modal.editSsid'):t('modal.addSsid'),
     t('modal.ssidSub',{band:bandLabel(bandOfRid(wBandSel))}),
     `${note}
@@ -961,9 +1093,13 @@ function openSsidModal(wlanId,opt={}){
      <div class="field"><label>${t('field.akm')}</label><select id="d-akm">${optHtml(AKMK,s.akm)}</select></div>
      <div class="field"><label>${t('field.cipher')}</label><select id="d-cipher">${optHtml(CIPHERK,s.cipher)}</select></div>
      <div class="field"><label>${t('field.pmf')}</label><select id="d-pmf">${optHtml(PMFK,s.pmf)}</select></div>
-     <div class="field"><label>${t('field.psk')}</label><input id="d-psk" value="${esc(s.psk||'')}" style="width:100%"></div>
+     <div class="field"><label>${t('field.psk')}</label><div style="display:flex;align-items:center;gap:8px"><input type="password" id="d-psk" value="${esc(s.psk||'')}" style="flex:1"><button type="button" class="btn ghost sm" title="${t('tip.showPsk')}" onclick="togglePskInput(this)">${EYE_OFF}</button></div></div>
      <div class="hint">${t('ssid.modalHint')}</div>
+     <div class="field"><label>${t('field.vlan')}</label><select id="d-vlan" style="width:100%">${vlanOptions(w.vlan_id||0)}</select></div>
+     <div class="hint">${t('ssid.vlanHint')}</div>
      <div class="field"><label>${t('field.rekey')}</label><div style="display:flex;align-items:center;gap:8px"><input type="number" id="d-rekey" value="${w.rekey_period}" style="width:110px"><span class="muted">${t('field.seconds')}</span></div></div>
+     <div class="field"><label>${t('field.maxClients')}</label><input type="number" id="d-max" value="${w.client_count||0}" ${limAttrs} style="width:110px"></div>
+     <div class="hint">${clientLimitHint()}</div>
      <div class="field"><label>${t('field.broadcast')}</label><label class="muted"><input type="checkbox" id="d-bc" ${w.broadcast?'checked':''}> ${t('field.broadcastChk')}</label></div>
      <div class="field"><label>${t('field.isolate')}</label><label class="muted"><input type="checkbox" id="d-iso" ${w.isolate?'checked':''}> ${t('field.isolateChk')}</label></div>
      <div class="field"><label>${t('field.enable')}</label><label class="muted"><input type="checkbox" id="d-en" ${w.wlan_enable?'checked':''}> ${t('field.enableChk')}</label></div>`,
@@ -973,7 +1109,7 @@ function openSsidModal(wlanId,opt={}){
         akm:$('d-akm').value,cipher:$('d-cipher').value,pmf:$('d-pmf').value,
         psk:$('d-psk').value||null,
         wlan_enable:$('d-en').checked,isolate:$('d-iso').checked,broadcast:$('d-bc').checked,
-        client_count:w.client_count||0,vlan_id:w.vlan_id||0,rekey_period:+$('d-rekey').value||0};
+        client_count:+$('d-max').value||0,vlan_id:+$('d-vlan').value||0,rekey_period:+$('d-rekey').value||0};
       const r=await apiJson('/api/wcfg/global/wlan','POST',body);
       let m=t('toast.ssidSaved'); const wn=r&&r.warnings;
       if(wn&&wn.length)m+=t('toast.ssidWarn',{msg:wn.join(t('sep.semi'))});

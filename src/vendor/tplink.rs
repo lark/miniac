@@ -493,7 +493,7 @@ pub fn wsrv_para(w: &config::WlanConfig) -> Option<Vec<u8>> {
     v.push(w.radio_id);
     v.push(w.wlan_id);
     v.extend_from_slice(&(w.vlan_id as u16).to_be_bytes());
-    v.extend_from_slice(&(w.client_count as u16).to_be_bytes());
+    v.extend_from_slice(&client_limit(w.client_count).to_be_bytes());
     v.push(1); // network type (AC100 sends 1)
     v.push(u8::from(w.isolate));
     v.push(wlan_sec::PSK);
@@ -503,6 +503,20 @@ pub fn wsrv_para(w: &config::WlanConfig) -> Option<Vec<u8>> {
     v.extend_from_slice(&(psk.len() as u16).to_be_bytes());
     v.extend_from_slice(psk.as_bytes());
     Some(v)
+}
+
+/// Per-SSID client ceiling the AP's own web UI exposes (1-100). miniac stores 0
+/// for "no limit", which this product cannot express, so 0 maps to the ceiling.
+const MAX_CLIENTS: u16 = 100;
+
+/// Wire value of the private-9 `max users` field (u16), clamped to the range
+/// the WTP accepts.
+fn client_limit(client_count: u32) -> u16 {
+    if client_count == 0 {
+        MAX_CLIENTS
+    } else {
+        client_count.clamp(1, u32::from(MAX_CLIENTS)) as u16
+    }
 }
 
 /// Private 7 (Add MAC ACL) trailing value AC100 appends to each WLAN push
@@ -518,8 +532,8 @@ const WLAN_CFG_MAC_ACL: [u8; 2] = [0x00, 0x30];
 ///  4  key index/status + key length   (4 bytes, zero)
 ///  8  group TSC                       (6 bytes, zero)
 /// 14  QoS, auth, MAC mode             (3 bytes, zero)
-/// 17  tunnel/broadcast flag           (AC100 sends 0x01)
-/// 18  broadcast flag                  (AC100 sends 0x01)
+/// 17  tunnel flag                    (AC100 sends 0x01; required to light the WLAN)
+/// 18  broadcast flag                 (1 = SSID visible, 0 = hidden)
 /// 19  SSID                            (to the end of the value)
 /// ```
 ///
@@ -535,7 +549,7 @@ fn add_wlan_value(w: &config::WlanConfig) -> Vec<u8> {
     v.push(w.wlan_id);
     v.extend_from_slice(&[0x80, 0x00]); // AC100 sends capability 0x8000
     v.extend_from_slice(&[0u8; 13]); // key idx/status, key len, group TSC, QoS, auth, MAC
-    v.extend_from_slice(&[0x01, 0x01]); // AC100 sends the tunnel/broadcast flags as 01 01
+    v.extend_from_slice(&[0x01, u8::from(w.broadcast)]); // tunnel flag, SSID broadcast flag
     v.extend_from_slice(&w.ssid);
     v
 }
@@ -1201,6 +1215,15 @@ mod tests {
     }
 
     #[test]
+    fn client_limit_maps_no_limit_to_ceiling() {
+        // 0 means "no limit" in miniac, which this product cannot express.
+        assert_eq!(client_limit(0), 100);
+        assert_eq!(client_limit(1), 1);
+        assert_eq!(client_limit(32), 32);
+        assert_eq!(client_limit(200), 100);
+    }
+
+    #[test]
     fn wsrv_para_omitted_without_key() {
         let w = config::WlanConfig {
             security: config::SecurityPolicy::default(),
@@ -1237,7 +1260,7 @@ mod tests {
         assert_eq!(body[0], 1);
         assert_eq!(body[1], 1);
         assert_eq!(&body[2..4], &[0x80, 0x00]); // AC100 capability
-        assert_eq!(&body[17..19], &[0x01, 0x01]); // AC100 enable/broadcast flags
+        assert_eq!(&body[17..19], &[0x01, 0x00]); // tunnel, then hidden SSID
         assert_eq!(body.len(), 19 + 6);
         assert_eq!(&body[19..], b"office");
         assert_eq!(e[1].0, MsgElemType::VENDOR_SPECIFIC_PAYLOAD);

@@ -111,6 +111,14 @@ impl GlobalWlan {
     }
 }
 
+/// WLAN-only VLAN definition. SSIDs reference it by `vlan_id`; `name` is a
+/// local label and is never pushed to an AP (the vendors only carry the id).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WifiVlan {
+    pub vlan_id: u16,
+    pub name: String,
+}
+
 /// Per-AP override of the global radio settings; `None` inherits the global.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ApOverride {
@@ -255,6 +263,102 @@ impl WirelessConfigStore {
             "DELETE FROM global_wlan WHERE band=?1 AND wlan_id=?2",
             params![band, wlan_id],
         )?;
+        Ok(())
+    }
+
+    // --- WLAN-only VLAN definitions ---
+
+    /// Every defined VLAN, ascending by id.
+    pub fn list_vlans(&self) -> Result<Vec<WifiVlan>> {
+        let conn = self.db.lock();
+        let mut stmt = conn.prepare("SELECT vlan_id,name FROM wifi_vlan ORDER BY vlan_id")?;
+        let rows = stmt.query_map([], |r| {
+            Ok(WifiVlan {
+                vlan_id: r.get::<_, i64>(0)? as u16,
+                name: r.get(1)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn vlan_exists(&self, vlan_id: u16) -> Result<bool> {
+        let conn = self.db.lock();
+        let n = conn.query_row(
+            "SELECT COUNT(*) FROM wifi_vlan WHERE vlan_id=?1",
+            params![vlan_id],
+            |r| r.get::<_, i64>(0),
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Insert a definition, or update the one at `old_id`. Re-keying an id
+    /// also moves every SSID that referenced the old id, so a VLAN stays
+    /// attached to its SSIDs.
+    pub fn set_vlan(&self, old_id: Option<u16>, v: &WifiVlan) -> Result<()> {
+        if v.vlan_id == 0 {
+            anyhow::bail!("VLAN id 0 means untagged and cannot be defined");
+        }
+        let conn = self.db.lock();
+        let defined = |id: u16| -> Result<bool> {
+            let n = conn.query_row(
+                "SELECT COUNT(*) FROM wifi_vlan WHERE vlan_id=?1",
+                params![id],
+                |r| r.get::<_, i64>(0),
+            )?;
+            Ok(n > 0)
+        };
+        match old_id {
+            Some(old) => {
+                if !defined(old)? {
+                    anyhow::bail!("VLAN {old} is not defined");
+                }
+                if old == v.vlan_id {
+                    conn.execute(
+                        "UPDATE wifi_vlan SET name=?1 WHERE vlan_id=?2",
+                        params![v.name, v.vlan_id],
+                    )?;
+                } else {
+                    if defined(v.vlan_id)? {
+                        anyhow::bail!("VLAN {} is already defined", v.vlan_id);
+                    }
+                    let tx = conn.unchecked_transaction()?;
+                    tx.execute(
+                        "UPDATE global_wlan SET vlan_id=?1 WHERE vlan_id=?2",
+                        params![v.vlan_id, old],
+                    )?;
+                    tx.execute(
+                        "UPDATE wifi_vlan SET vlan_id=?1, name=?2 WHERE vlan_id=?3",
+                        params![v.vlan_id, v.name, old],
+                    )?;
+                    tx.commit()?;
+                }
+            }
+            None => {
+                if defined(v.vlan_id)? {
+                    anyhow::bail!("VLAN {} is already defined", v.vlan_id);
+                }
+                conn.execute(
+                    "INSERT INTO wifi_vlan (vlan_id,name) VALUES (?1,?2)",
+                    params![v.vlan_id, v.name],
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Delete an unused definition. A VLAN still referenced by any SSID is
+    /// refused so no SSID is left pointing at a missing id.
+    pub fn delete_vlan(&self, vlan_id: u16) -> Result<()> {
+        let conn = self.db.lock();
+        let used = conn.query_row(
+            "SELECT COUNT(*) FROM global_wlan WHERE vlan_id=?1",
+            params![vlan_id],
+            |r| r.get::<_, i64>(0),
+        )?;
+        if used > 0 {
+            anyhow::bail!("VLAN {vlan_id} is still used by {used} SSID(s)");
+        }
+        conn.execute("DELETE FROM wifi_vlan WHERE vlan_id=?1", params![vlan_id])?;
         Ok(())
     }
 
@@ -458,6 +562,32 @@ mod tests {
             vlan_id: 0,
             rekey_period: 0,
         }
+    }
+
+    #[test]
+    fn vlan_rekey_follows_ssids_and_referenced_delete_is_refused() {
+        let (_db, w, _r) = store();
+        let v = |id: u16, name: &str| WifiVlan {
+            vlan_id: id,
+            name: name.into(),
+        };
+        w.set_vlan(None, &v(10, "office")).unwrap();
+        let mut g = gw(1, 1, "miniac");
+        g.vlan_id = 10;
+        w.set_global_wlan(&g).unwrap();
+        // Duplicate id and the untagged id 0 are refused.
+        assert!(w.set_vlan(None, &v(10, "dup")).is_err());
+        assert!(w.set_vlan(None, &v(0, "x")).is_err());
+        // Re-keying moves the referencing SSID to the new id.
+        w.set_vlan(Some(10), &v(20, "office")).unwrap();
+        assert_eq!(w.list_global_wlans(1).unwrap()[0].vlan_id, 20);
+        assert!(!w.vlan_exists(10).unwrap());
+        // A referenced VLAN cannot be deleted; after untagging it can.
+        assert!(w.delete_vlan(20).is_err());
+        g.vlan_id = 0;
+        w.set_global_wlan(&g).unwrap();
+        w.delete_vlan(20).unwrap();
+        assert!(w.list_vlans().unwrap().is_empty());
     }
 
     #[test]

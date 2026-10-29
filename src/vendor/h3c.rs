@@ -398,12 +398,30 @@ fn emit_h3c_band(v: &mut Vec<u8>, wlans: &[&config::WlanConfig], prefix: &[u8], 
     }
 }
 
+/// Per-SSID client ceiling the AX60 web UI exposes and `WTPEditSsidInit`
+/// enforces (`<=32` kept, `>32` clamped to 32).
+const MAX_CLIENTS: u32 = 32;
+
+/// Wire value of the H3C record client-limit word (record offset +116,
+/// `CFG_SetWifiSsidClientNum` in `WTPEditSsidInit`). The AX60 reads `0xffffffff`
+/// as "no limit"; miniac stores 0 for "no limit", so 0 maps to that sentinel and
+/// a configured limit is clamped to the per-SSID ceiling.
+fn h3c_client_limit(client_count: u32) -> u32 {
+    if client_count == 0 {
+        0xffff_ffff
+    } else {
+        client_count.min(MAX_CLIENTS)
+    }
+}
+
 /// Append one WLAN record: [33B anchor][u32 enable][33B SSID name][u32
-/// isolate=0][u32 broadcast=1][u32 client=0xffffffff][u32 vlan][u32 encrypt]
+/// isolate][u32 broadcast][u32 client limit][u32 vlan][u32 encrypt]
 /// and, when encrypted, [65B PSK][u32 cipher][u32 rekey=3600]. SSID, PSK,
-/// enable, VLAN and security come from the miniac DB; the remaining fields are
-/// the M60 defaults the AX60 applies (isolate off, SSID visible, no client
-/// limit, one-hour rekey).
+/// enable, isolate, SSID broadcast, client limit, VLAN and security come from
+/// the miniac DB; the rekey period uses the M60 default (one hour). Words 4 and
+/// 5 reach the WTP as the isolation and SSID broadcast flags (record offsets
+/// +108/+112 in `WTPEditSsidInit`, handed to `CFG_SetWifiIsolate` and
+/// `CFG_SetWifiSsidBroadcast`); word 6 is the per-SSID client limit (+116).
 fn emit_h3c_record(v: &mut Vec<u8>, w: &config::WlanConfig, prefix: &[u8], idx: u32) {
     let mut anchor = [0u8; 33];
     anchor[..prefix.len()].copy_from_slice(prefix);
@@ -425,9 +443,9 @@ fn emit_h3c_record(v: &mut Vec<u8>, w: &config::WlanConfig, prefix: &[u8], idx: 
     v.extend_from_slice(&anchor);
     v.extend_from_slice(&u32::from(w.wlan_enable).to_be_bytes());
     v.extend_from_slice(&name);
-    v.extend_from_slice(&0u32.to_be_bytes());
-    v.extend_from_slice(&1u32.to_be_bytes());
-    v.extend_from_slice(&0xffff_ffffu32.to_be_bytes());
+    v.extend_from_slice(&u32::from(w.isolate).to_be_bytes());
+    v.extend_from_slice(&u32::from(w.broadcast).to_be_bytes());
+    v.extend_from_slice(&h3c_client_limit(w.client_count).to_be_bytes());
     v.extend_from_slice(&w.vlan_id.to_be_bytes());
     v.extend_from_slice(&enc.to_be_bytes());
     if enc != 0 {
@@ -1145,5 +1163,42 @@ mod tests {
         let rfc = CtrlMsg::new(MsgType::RESET_RESP, 2).add_elem(MsgElemType::RESULT_CODE, &[10]);
         assert_eq!(result_code(&rfc), Some(10));
         assert_eq!(result_code(&CtrlMsg::new(MsgType::RESET_RESP, 3)), None);
+    }
+
+    #[test]
+    fn record_carries_isolation_and_broadcast() {
+        let record = 28; // after the band header
+        let isolate_at = record + 33 + 4 + 33;
+        let broadcast_at = isolate_at + 4;
+        let mut w = wlan(1, 1, "miniac24");
+        w.isolate = true;
+        w.broadcast = false;
+        let b = encode_h3c(&[w]);
+        let word = |at: usize| u32::from_be_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]]);
+        assert_eq!(word(isolate_at), 1);
+        assert_eq!(word(broadcast_at), 0);
+    }
+
+    #[test]
+    fn record_carries_client_limit() {
+        let client_at = 28 + 33 + 4 + 33 + 4 + 4;
+        let limit = |b: &[u8]| {
+            u32::from_be_bytes([
+                b[client_at],
+                b[client_at + 1],
+                b[client_at + 2],
+                b[client_at + 3],
+            ])
+        };
+        // 0 in the DB means "no limit", which H3C spells 0xffffffff.
+        assert_eq!(limit(&encode_h3c(&[wlan(1, 1, "miniac24")])), 0xffff_ffff);
+        // A configured per-SSID limit rides as-is.
+        let mut w = wlan(1, 1, "miniac24");
+        w.client_count = 20;
+        assert_eq!(limit(&encode_h3c(&[w])), 20);
+        // Values above the AX60 ceiling are clamped on the wire.
+        let mut w = wlan(1, 1, "miniac24");
+        w.client_count = 64;
+        assert_eq!(limit(&encode_h3c(&[w])), 32);
     }
 }
