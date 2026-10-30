@@ -158,6 +158,35 @@ impl DeviceStore {
             .is_some_and(|t| t.elapsed() < ONLINE_WINDOW)
     }
 
+    /// Replace a stored row's `last_seen` with the in-memory value. Liveness is
+    /// runtime state: it is kept out of the DB while the AC runs (see
+    /// [`Self::flush_last_seen`]), so reads overlay it.
+    fn with_live_last_seen(&self, mut d: Device) -> Device {
+        if let Some(t) = self.live.get(&d.mac) {
+            d.last_seen = now_unix().saturating_sub(t.elapsed().as_secs());
+        }
+        d
+    }
+
+    /// Persist the in-memory `last_seen` values. Called on an orderly exit so
+    /// the table ends up current without a write per WTP report.
+    pub fn flush_last_seen(&self) -> Result<()> {
+        let ts = now_unix() as i64;
+        let seen: Vec<(Mac, i64)> = self
+            .live
+            .iter()
+            .map(|e| (*e.key(), ts - e.value().elapsed().as_secs() as i64))
+            .collect();
+        let conn = self.db.lock();
+        for (mac, at) in seen {
+            conn.execute(
+                "UPDATE devices SET last_seen=?2 WHERE mac=?1",
+                params![&mac[..], at],
+            )?;
+        }
+        Ok(())
+    }
+
     /// Upsert device learned from the CAPWAP flow (`None` sw/ip leave existing
     /// values intact). `state` records the lifecycle value observed so far (e.g.
     /// "registered" on first join); later FSM transitions overwrite it via
@@ -199,17 +228,6 @@ impl DeviceStore {
             )?;
         }
         Ok(created)
-    }
-
-    /// Mark a device online (join) — record `joined_at` if absent.
-    pub fn mark_joined(&self, mac: Mac) -> Result<()> {
-        let ts = now_unix() as i64;
-        let conn = self.db.lock();
-        conn.execute(
-            "UPDATE devices SET joined_at = COALESCE(joined_at, ?2), last_seen = ?2 WHERE mac = ?1",
-            params![&mac[..], ts],
-        )?;
-        Ok(())
     }
 
     /// Record the current CAPWAP lifecycle state and refresh `last_seen`;
@@ -287,57 +305,68 @@ impl DeviceStore {
 
     /// Look up a single device.
     pub fn get(&self, mac: Mac) -> Result<Option<Device>> {
-        let conn = self.db.lock();
-        let row = conn
-            .query_row(
-                &format!("SELECT {COLS} FROM devices WHERE mac=?1"),
-                params![&mac[..]],
-                |r| {
-                    Ok(Row {
-                        mac: r.get(0)?,
-                        name: r.get(1)?,
-                        description: r.get(2)?,
-                        vendor: r.get(3)?,
-                        model: r.get(4)?,
-                        hw_version: r.get(5)?,
-                        sw_version: r.get(6)?,
-                        ip_addr: r.get(7)?,
-                        state: r.get(8)?,
-                        first_seen: r.get(9)?,
-                        last_seen: r.get(10)?,
-                        joined_at: r.get(11)?,
-                        approved: r.get::<_, i64>(12)? != 0,
-                        led_on: r.get(13)?,
-                    })
-                },
-            )
-            .optional()?;
-        row.map(row_to_device).transpose()
+        let dev = {
+            let conn = self.db.lock();
+            let row = conn
+                .query_row(
+                    &format!("SELECT {COLS} FROM devices WHERE mac=?1"),
+                    params![&mac[..]],
+                    |r| {
+                        Ok(Row {
+                            mac: r.get(0)?,
+                            name: r.get(1)?,
+                            description: r.get(2)?,
+                            vendor: r.get(3)?,
+                            model: r.get(4)?,
+                            hw_version: r.get(5)?,
+                            sw_version: r.get(6)?,
+                            ip_addr: r.get(7)?,
+                            state: r.get(8)?,
+                            first_seen: r.get(9)?,
+                            last_seen: r.get(10)?,
+                            joined_at: r.get(11)?,
+                            approved: r.get::<_, i64>(12)? != 0,
+                            led_on: r.get(13)?,
+                        })
+                    },
+                )
+                .optional()?;
+            row.map(row_to_device).transpose()?
+        };
+        Ok(dev.map(|d| self.with_live_last_seen(d)))
     }
 
     /// List all known devices.
     pub fn list(&self) -> Result<Vec<Device>> {
-        let conn = self.db.lock();
-        let mut stmt = conn.prepare(&format!("SELECT {COLS} FROM devices ORDER BY first_seen"))?;
-        let rows = stmt.query_map([], |r| {
-            Ok(Row {
-                mac: r.get(0)?,
-                name: r.get(1)?,
-                description: r.get(2)?,
-                vendor: r.get(3)?,
-                model: r.get(4)?,
-                hw_version: r.get(5)?,
-                sw_version: r.get(6)?,
-                ip_addr: r.get(7)?,
-                state: r.get(8)?,
-                first_seen: r.get(9)?,
-                last_seen: r.get(10)?,
-                joined_at: r.get(11)?,
-                approved: r.get::<_, i64>(12)? != 0,
-                led_on: r.get(13)?,
-            })
-        })?;
-        rows.map(|r| row_to_device(r?)).collect()
+        let devices: Vec<Device> = {
+            let conn = self.db.lock();
+            let mut stmt =
+                conn.prepare(&format!("SELECT {COLS} FROM devices ORDER BY first_seen"))?;
+            let rows = stmt.query_map([], |r| {
+                Ok(Row {
+                    mac: r.get(0)?,
+                    name: r.get(1)?,
+                    description: r.get(2)?,
+                    vendor: r.get(3)?,
+                    model: r.get(4)?,
+                    hw_version: r.get(5)?,
+                    sw_version: r.get(6)?,
+                    ip_addr: r.get(7)?,
+                    state: r.get(8)?,
+                    first_seen: r.get(9)?,
+                    last_seen: r.get(10)?,
+                    joined_at: r.get(11)?,
+                    approved: r.get::<_, i64>(12)? != 0,
+                    led_on: r.get(13)?,
+                })
+            })?;
+            rows.map(|r| row_to_device(r?))
+                .collect::<Result<Vec<_>>>()?
+        };
+        Ok(devices
+            .into_iter()
+            .map(|d| self.with_live_last_seen(d))
+            .collect())
     }
 
     /// Remove a device.
@@ -369,10 +398,24 @@ mod tests {
         let s = store();
         let mac = [0x00, 0x00, 0x00, 0x00, 0x00, 0x01];
         assert!(s
-            .register(mac, Some("10.0.0.2"), Some("v1.0"), None, None, "registered")
+            .register(
+                mac,
+                Some("10.0.0.2"),
+                Some("v1.0"),
+                None,
+                None,
+                "registered"
+            )
             .unwrap());
         assert!(!s
-            .register(mac, Some("10.0.0.2"), Some("v1.0"), None, None, "registered")
+            .register(
+                mac,
+                Some("10.0.0.2"),
+                Some("v1.0"),
+                None,
+                None,
+                "registered"
+            )
             .unwrap());
 
         s.set_metadata(mac, "Living-Room-AP", "Ground floor WAP")
@@ -395,10 +438,24 @@ mod tests {
         let s = store();
         let first = [0x00, 0x00, 0x00, 0x00, 0x00, 0x11];
         let second = [0x00, 0x00, 0x00, 0x00, 0x00, 0x22];
-        s.register(first, Some("10.0.0.10"), Some("v1"), Some("a"), None, "registered")
-            .unwrap();
-        s.register(second, Some("10.0.0.20"), Some("v2"), Some("b"), None, "registered")
-            .unwrap();
+        s.register(
+            first,
+            Some("10.0.0.10"),
+            Some("v1"),
+            Some("a"),
+            None,
+            "registered",
+        )
+        .unwrap();
+        s.register(
+            second,
+            Some("10.0.0.20"),
+            Some("v2"),
+            Some("b"),
+            None,
+            "registered",
+        )
+        .unwrap();
 
         let a = s.get(first).unwrap().unwrap();
         assert_eq!(a.ip_addr.as_deref(), Some("10.0.0.10"));
@@ -434,12 +491,40 @@ mod tests {
     fn led_state_is_unknown_until_set_and_then_persists() {
         let s = store();
         let mac = [0x00, 0x00, 0x00, 0x00, 0x00, 0x03];
-        s.register(mac, None, None, None, None, "registered").unwrap();
+        s.register(mac, None, None, None, None, "registered")
+            .unwrap();
         assert_eq!(s.get(mac).unwrap().unwrap().led_on, None);
 
         s.set_led_on(mac, false).unwrap();
         assert_eq!(s.get(mac).unwrap().unwrap().led_on, Some(false));
         s.set_led_on(mac, true).unwrap();
         assert_eq!(s.get(mac).unwrap().unwrap().led_on, Some(true));
+    }
+
+    /// `last_seen` refreshes stay in memory and reach the DB only on flush.
+    #[test]
+    fn last_seen_is_runtime_state() {
+        let s = store();
+        let mac = [0x00, 0x00, 0x00, 0x00, 0x00, 0x33];
+        s.register(mac, None, None, None, None, "registered")
+            .unwrap();
+        let stored = || {
+            let conn = s.db.lock();
+            conn.query_row(
+                "SELECT last_seen FROM devices WHERE mac=?1",
+                params![&mac[..]],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap()
+        };
+
+        let before = stored();
+        s.mark_live(mac);
+        assert_eq!(stored(), before, "a live report must not write last_seen");
+        let shown = s.get(mac).unwrap().unwrap().last_seen;
+        assert!(shown >= before as u64, "reads overlay the in-memory value");
+
+        s.flush_last_seen().unwrap();
+        assert!(stored() as u64 >= shown, "flush persists the live value");
     }
 }

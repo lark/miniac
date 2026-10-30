@@ -11,6 +11,7 @@
 use std::sync::Arc;
 
 use anyhow::Result;
+use dashmap::DashMap;
 use rusqlite::{params, OptionalExtension};
 
 use crate::config::{Akm, Cipher, Pmf, SecurityPolicy};
@@ -107,11 +108,25 @@ impl Default for H3cRadioHeader {
 /// Operations over the radios table.
 pub struct RadioStore {
     db: Arc<Db>,
+    /// Last RF report seen per radio. Vendors repeat the same band/channel/TX
+    /// power every ~20 s, so the sample lets an unchanged report skip the DB
+    /// write entirely.
+    rf: DashMap<(Mac, u8), RfSample>,
+}
+
+/// RF values last reported for one radio.
+struct RfSample {
+    band: Option<String>,
+    channel: u32,
+    tx_power: i32,
 }
 
 impl RadioStore {
     pub fn new(db: Arc<Db>) -> Self {
-        RadioStore { db }
+        RadioStore {
+            db,
+            rf: DashMap::new(),
+        }
     }
 
     /// Upsert a radio's learned state. Returns `Ok(true)` when newly created.
@@ -174,17 +189,57 @@ impl RadioStore {
         channel: u32,
         tx_power: i32,
     ) -> Result<()> {
-        let conn = self.db.lock();
-        conn.execute(
-            "INSERT INTO radios (mac,radio_id,band,admin_state,op_state,channel,tx_power,last_seen)
-             VALUES (?1,?2,?3,0,0,?4,?5,?6)
-             ON CONFLICT(mac,radio_id) DO UPDATE SET
-                band=COALESCE(excluded.band, band),
-                channel=excluded.channel, tx_power=excluded.tx_power,
-                last_seen=excluded.last_seen",
-            params![&mac[..], radio_id, band, channel, tx_power, now_unix() as i64],
-        )?;
+        let key = (mac, radio_id);
+        // A repeated report with the same values changes nothing in the table,
+        // so skip the write; the first report after start compares against the
+        // stored row instead of the (still empty) sample.
+        let unchanged = match self.rf.get(&key) {
+            Some(s) => s.band.as_deref() == band && s.channel == channel && s.tx_power == tx_power,
+            None => self.matches_stored(mac, radio_id, band, channel, tx_power)?,
+        };
+        if !unchanged {
+            let conn = self.db.lock();
+            conn.execute(
+                "INSERT INTO radios (mac,radio_id,band,admin_state,op_state,channel,tx_power,last_seen)
+                 VALUES (?1,?2,?3,0,0,?4,?5,?6)
+                 ON CONFLICT(mac,radio_id) DO UPDATE SET
+                    band=COALESCE(excluded.band, band),
+                    channel=excluded.channel, tx_power=excluded.tx_power,
+                    last_seen=excluded.last_seen",
+                params![&mac[..], radio_id, band, channel, tx_power, now_unix() as i64],
+            )?;
+        }
+        self.rf.insert(
+            key,
+            RfSample {
+                band: band.map(str::to_owned),
+                channel,
+                tx_power,
+            },
+        );
         Ok(())
+    }
+
+    /// Whether the stored row already holds these RF values.
+    fn matches_stored(
+        &self,
+        mac: Mac,
+        radio_id: u8,
+        band: Option<&str>,
+        channel: u32,
+        tx_power: i32,
+    ) -> Result<bool> {
+        let conn = self.db.lock();
+        let row: Option<(Option<String>, Option<i64>, Option<i64>)> = conn
+            .query_row(
+                "SELECT band, channel, tx_power FROM radios WHERE mac=?1 AND radio_id=?2",
+                params![&mac[..], radio_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        Ok(row.is_some_and(|(b, c, p)| {
+            b.as_deref() == band && c == Some(channel as i64) && p == Some(tx_power as i64)
+        }))
     }
 
     /// All radios owned by a device.
@@ -534,5 +589,24 @@ mod tests {
         assert_eq!(g5.power, 5);
         assert_eq!(g5.mode, 10);
         assert_eq!(g5.channel, 9);
+    }
+
+    /// An RF report that repeats the stored values must not rewrite the row.
+    #[test]
+    fn unchanged_rf_report_is_skipped() {
+        let s = store();
+        let w = mac(3);
+        s.set_rf(w, 1, Some("2.4G"), 6, 20).unwrap();
+        let first = s.list_by_device(w).unwrap()[0].last_seen;
+
+        s.set_rf(w, 1, Some("2.4G"), 6, 20).unwrap();
+        let second = s.list_by_device(w).unwrap()[0].last_seen;
+        assert_eq!(first, second, "same values must not touch last_seen");
+
+        // A real RF change still lands.
+        s.set_rf(w, 1, Some("2.4G"), 11, 20).unwrap();
+        let r = &s.list_by_device(w).unwrap()[0];
+        assert_eq!(r.channel, Some(11));
+        assert!(r.last_seen >= second);
     }
 }

@@ -132,10 +132,16 @@ async fn main() -> Result<()> {
 
     // One DTLS identity per vendor profile: the detected device profile picks
     // the certificate directory (and whether the client certificate is pinned).
-    let dtls_configs: Arc<HashMap<vendor::profile::VendorProfile, Arc<rtc_dtls::config::HandshakeConfig>>> = {
+    let dtls_configs: Arc<
+        HashMap<vendor::profile::VendorProfile, Arc<rtc_dtls::config::HandshakeConfig>>,
+    > = {
         use vendor::profile::VendorProfile;
         let mut m = HashMap::new();
-        for p in [VendorProfile::H3c, VendorProfile::TpLink, VendorProfile::Rfc] {
+        for p in [
+            VendorProfile::H3c,
+            VendorProfile::TpLink,
+            VendorProfile::Rfc,
+        ] {
             m.insert(p, generate_dtls_config(p)?);
         }
         Arc::new(m)
@@ -153,6 +159,32 @@ async fn main() -> Result<()> {
 
     let db = Arc::new(db::Db::open("miniac.db")?);
     let devices = Arc::new(device::DeviceStore::new(db.clone()));
+    // Liveness is runtime state: it stays in memory while the AC runs and is
+    // written once on an orderly exit, so a WTP reporting every ~20 s costs no
+    // disk write.
+    {
+        let devices = devices.clone();
+        tokio::spawn(async move {
+            let mut term =
+                match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                    Ok(sig) => sig,
+                    Err(e) => {
+                        warn!("[!] SIGTERM handler unavailable: {e}");
+                        return;
+                    }
+                };
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {},
+                _ = term.recv() => {},
+            }
+            info!("[*] exit: flushing runtime state");
+            if let Err(e) = devices.flush_last_seen() {
+                warn!("[!] last_seen flush failed: {e}");
+            }
+            logx::system("runtime state flushed".to_string());
+            std::process::exit(0);
+        });
+    }
     let radios = Arc::new(radio::RadioStore::new(db.clone()));
     let stations = Arc::new(station::StationStore::new(db.clone()));
     let profiles = Arc::new(security::ProfileStore::new(db.clone())); // 802.1X / RSN policy store
@@ -287,7 +319,9 @@ async fn run_control_socket(
     socket: Arc<UdpSocket>,
     dispatcher_map: Arc<Mutex<HashMap<SocketAddr, mpsc::Sender<Vec<u8>>>>>,
     peer_profiles: Arc<Mutex<HashMap<IpAddr, vendor::profile::VendorProfile>>>,
-    dtls_configs: Arc<HashMap<vendor::profile::VendorProfile, Arc<rtc_dtls::config::HandshakeConfig>>>,
+    dtls_configs: Arc<
+        HashMap<vendor::profile::VendorProfile, Arc<rtc_dtls::config::HandshakeConfig>>,
+    >,
     devices: Arc<device::DeviceStore>,
     radios: Arc<radio::RadioStore>,
     stations: Arc<station::StationStore>,
@@ -350,7 +384,10 @@ async fn run_control_socket(
             // from a live address that means its old session is gone, so drop it
             // and answer. Anything else belongs to the live session.
             if pkt.get(0) == Some(&0) && pkt.get(11) == Some(&1) {
-                info!("[<] from {}: Discovery Request on a live address, replacing session", peer);
+                info!(
+                    "[<] from {}: Discovery Request on a live address, replacing session",
+                    peer
+                );
                 dispatcher_map.lock().await.remove(&peer);
                 // fall through to answer the Discovery
             } else {
@@ -379,10 +416,7 @@ async fn run_control_socket(
                         logx::device(format!("Discovery response to {} ({}B)", peer, resp.len()));
                         socket.send_to(&resp, peer).await?;
                     }
-                    None => warn!(
-                        "[?] disc req from {} not {:?}-framed, dropped",
-                        peer, prof
-                    ),
+                    None => warn!("[?] disc req from {} not {:?}-framed, dropped", peer, prof),
                 }
             }
         }
@@ -448,7 +482,10 @@ fn wtp_mac_from_elems(
             return Some(mac);
         }
     }
-    match elems.get(&MsgElemType::WTP_BOARD_DATA).and_then(|v| v.first()) {
+    match elems
+        .get(&MsgElemType::WTP_BOARD_DATA)
+        .and_then(|v| v.first())
+    {
         Some(CwElem::Unknown(_, body)) => elements::WtpBoardData::decode(body)?.base_mac(),
         _ => None,
     }
@@ -458,8 +495,9 @@ fn wtp_mac_from_elems(
 /// sub-element 0). WTPs report it either as a NUL-padded text name (H3C
 /// "SWBA1B0") or as a binary model code, which is rendered as hex.
 fn wtp_model_from_elems(elems: &HashMap<u16, Vec<CwElem>>) -> Option<String> {
-    let Some(CwElem::Unknown(_, body)) =
-        elems.get(&MsgElemType::WTP_BOARD_DATA).and_then(|v| v.first())
+    let Some(CwElem::Unknown(_, body)) = elems
+        .get(&MsgElemType::WTP_BOARD_DATA)
+        .and_then(|v| v.first())
     else {
         return None;
     };
@@ -612,9 +650,18 @@ fn requested_image(
         name: raw[4..].to_vec(),
     };
     let dev = mac.and_then(|m| devices.get(m).ok().flatten());
-    let vendor = dev.as_ref().and_then(|d| d.vendor.clone()).unwrap_or_default();
-    let model = dev.as_ref().and_then(|d| d.model.clone()).unwrap_or_default();
-    let hw = dev.as_ref().and_then(|d| d.hw_version.clone()).unwrap_or_default();
+    let vendor = dev
+        .as_ref()
+        .and_then(|d| d.vendor.clone())
+        .unwrap_or_default();
+    let model = dev
+        .as_ref()
+        .and_then(|d| d.model.clone())
+        .unwrap_or_default();
+    let hw = dev
+        .as_ref()
+        .and_then(|d| d.hw_version.clone())
+        .unwrap_or_default();
     // The identifier payload is a UTF-8 name under RFC or H3C and a binary
     // version under TP-Link; only the catalogue hint is textual either way.
     let requested = String::from_utf8_lossy(&id.name);
@@ -665,7 +712,11 @@ async fn send_image_block(
     capdtls.write(&buf).await?;
     fw_upgrade.pending_seq = Some(dl.hdr.seq_num);
     ctx.set_last_sent(&dl, buf);
-    info!("[>] to {}: image data block ({}B) sent", peer, blk.data.len());
+    info!(
+        "[>] to {}: image data block ({}B) sent",
+        peer,
+        blk.data.len()
+    );
     Ok(())
 }
 
@@ -694,7 +745,10 @@ async fn start_image_transfer(
     capdtls.write(&buf).await?;
     ctx.set_last_sent(&resp, buf);
     match &info {
-        Some(i) => info!("[>] to {}: image data resp (size {}, MD5 advertised)", peer, i.file_size),
+        Some(i) => info!(
+            "[>] to {}: image data resp (size {}, MD5 advertised)",
+            peer, i.file_size
+        ),
         None => info!("[>] to {}: image data resp (result code only)", peer),
     }
     // The AX60 reads datagrams itself while waiting for its request's answer
@@ -780,14 +834,17 @@ async fn handle_session(
             .unwrap_or(Duration::from_secs(60));
         let idle_duration = ctx.echo_interval.saturating_sub(ctx.last_seen.elapsed());
         // Also wake in time to send the next keep-alive Echo Request in Run state.
-        let next_echo = ctx.echo_interval.saturating_sub(ctx.last_echo_sent.elapsed());
+        let next_echo = ctx
+            .echo_interval
+            .saturating_sub(ctx.last_echo_sent.elapsed());
         // Also wake in time to release the next serialized vendor push frame if
         // the WTP's reply does not arrive.
         let next_push = if ctx.push_queue.is_empty() {
             Duration::from_secs(60)
         } else {
-            ctx.push_last_sent
-                .map_or(Duration::ZERO, |t| PUSH_REPLY_TIMEOUT.saturating_sub(t.elapsed()))
+            ctx.push_last_sent.map_or(Duration::ZERO, |t| {
+                PUSH_REPLY_TIMEOUT.saturating_sub(t.elapsed())
+            })
         };
         // Also wake in time for a deferred H3C Run-state reset.
         let next_reset = reset_due
@@ -1544,9 +1601,11 @@ async fn handle_session(
                                         }
                                     }
                                 }
-                                // This traffic also proves the WTP is alive.
+                                // This traffic also proves the WTP is alive;
+                                // `last_seen` stays in memory and only reaches
+                                // the DB when the AC exits normally.
                                 if let Some(mac) = ctx.mac {
-                                    devices.mark_joined(mac)?;
+                                    devices.mark_live(mac);
                                 }
                             }
                             // Periodic event reports carry no auditable state
@@ -2276,7 +2335,9 @@ fn generate_dtls_config(
             let root_der = dtls_local::load_root_cert_der(cert_dir)?;
             builder = builder
                 .with_client_auth(ClientAuthType::RequireAnyClientCert)
-                .with_verify_peer_certificate(Some(dtls_local::verify_client_chain_callback(root_der)));
+                .with_verify_peer_certificate(Some(dtls_local::verify_client_chain_callback(
+                    root_der,
+                )));
         }
         let config = builder
             .with_insecure_hashes(true)
