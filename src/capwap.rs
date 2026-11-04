@@ -604,16 +604,94 @@ impl MsgElemType {
     pub const MTU_DISC_PADDING: u16 = 52;
     pub const ECN_SUPPORT: u16 = 53;
 
-    /* RFC 5416 IEEE 802.11 Binding Elements */
+    /* IEEE 802.11 binding elements. Type values follow the IANA "CAPWAP
+       Message Element Type" registry: RFC 5416 for 1024-1048, the China
+       BWIPS (WAPI) extensions for 1049-1059, RFC 7494 for 1060-1061 and
+       RFC 8350 for 1062. */
     /// IEEE 802.11 Add WLAN (RFC 5416 6.1).
     pub const ADD_WLAN: u16 = 1024;
+    /// IEEE 802.11 Antenna (RFC 5416 6.2).
+    pub const ANTENNA: u16 = 1025;
+    /// IEEE 802.11 Assigned WTP BSSID (RFC 5416 6.3).
+    pub const ASSIGNED_WTP_BSSID: u16 = 1026;
     /// IEEE 802.11 Delete WLAN (RFC 5416 6.4).
     pub const DEL_WLAN: u16 = 1027;
+    /// IEEE 802.11 Direct Sequence Control (RFC 5416 6.5). TP-Link carries
+    /// its per-radio channel record under this type (see `vendor::tplink`).
+    pub const DIRECT_SEQUENCE_CONTROL: u16 = 1028;
+    /// IEEE 802.11 Information Element (RFC 5416 6.6).
+    pub const INFORMATION_ELEMENT: u16 = 1029;
+    /// IEEE 802.11 MAC Operation (RFC 5416 6.7). TP-Link sends its 16-byte
+    /// per-radio RTS/Frag record under this type.
+    pub const MAC_OPERATION: u16 = 1030;
+    /// IEEE 802.11 MIC Countermeasures (RFC 5416 6.8).
+    pub const MIC_COUNTERMEASURES: u16 = 1031;
+    /// IEEE 802.11 Multi-Domain Capability (RFC 5416 6.9).
+    pub const MULTI_DOMAIN_CAPABILITY: u16 = 1032;
+    /// IEEE 802.11 OFDM Control (RFC 5416 6.10).
+    pub const OFDM_CONTROL: u16 = 1033;
+    /// IEEE 802.11 Rate Set (RFC 5416 6.11).
+    pub const RATE_SET: u16 = 1034;
+    /// IEEE 802.11 RSNA Error Report From Station (RFC 5416 6.12).
+    pub const RSNA_ERROR_REPORT_FROM_STATION: u16 = 1035;
+    /// IEEE 802.11 Station (RFC 5416 6.13).
+    pub const STATION: u16 = 1036;
+    /// IEEE 802.11 Station QoS Profile (RFC 5416 6.14).
+    pub const STATION_QOS_PROFILE: u16 = 1037;
+    /// IEEE 802.11 Station Session Key (RFC 5416 6.15).
+    pub const STATION_SESSION_KEY: u16 = 1038;
+    /// IEEE 802.11 Statistics (RFC 5416 6.16).
+    pub const STATISTICS: u16 = 1039;
+    /// IEEE 802.11 Supported Rates (RFC 5416 6.17).
+    pub const SUPPORTED_RATES: u16 = 1040;
+    /// IEEE 802.11 Tx Power (RFC 5416 6.25): `[radio u8][reserved u8][current
+    /// tx power u16, dBm]`. AC100 uses it per radio in the Configuration Update
+    /// Request.
+    pub const RADIO_TX_POWER: u16 = 1041;
+    /// IEEE 802.11 Tx Power Level (RFC 5416 6.26).
+    pub const RADIO_TX_POWER_LEVEL: u16 = 1042;
+    /// IEEE 802.11 Update Station QoS (RFC 5416 6.27).
+    pub const UPDATE_STATION_QOS: u16 = 1043;
+    /// IEEE 802.11 Update WLAN (RFC 5416 6.28).
+    pub const UPDATE_WLAN: u16 = 1044;
+    /// IEEE 802.11 WTP Quality of Service (RFC 5416 6.29).
+    pub const WTP_QOS: u16 = 1045;
+    /// IEEE 802.11 WTP Radio Configuration (RFC 5416 6.23). AC100 sends the
+    /// 16-byte form per radio alongside the Tx Power element.
+    pub const WTP_RADIO_CONFIGURATION: u16 = 1046;
+    /// IEEE 802.11 WTP Radio Fail Alarm Indication (RFC 5416 6.30).
+    pub const RADIO_FAIL_ALARM_INDICATION: u16 = 1047;
+    /// IEEE 802.11 WTP Radio Information (RFC 5416 6.24).
     pub const WTP_RADIO_INFO: u16 = 1048;
-    pub const WTP_RADIO_CONFIG: u16 = 1049;
-    pub const WTP_RADIO_CAPS: u16 = 1050;
-    pub const MAC_OPERATION: u16 = 1041;
-    pub const STATION_EVENT_TYPE: u16 = 1046;
+    /// WAPI Error Report from Station (China BWIPS). Note this slot is a WAPI
+    /// element, not a radio configuration element.
+    pub const WAPI_ERROR_REPORT_FROM_STATION: u16 = 1049;
+    /// GB15629.11AC Capability (China BWIPS).
+    pub const GB15629_11AC_CAPABILITY: u16 = 1050;
+    /// GB15629.11WTP Capability (China BWIPS).
+    pub const GB15629_11WTP_CAPABILITY: u16 = 1051;
+    /// GB15629.11WTP Information (China BWIPS).
+    pub const GB15629_11WTP_INFORMATION: u16 = 1052;
+    /// GB15629.11WTP Config (China BWIPS).
+    pub const GB15629_11WTP_CONFIG: u16 = 1053;
+    /// GB15629.11Add STA Request (China BWIPS).
+    pub const GB15629_11_ADD_STA_REQUEST: u16 = 1054;
+    /// GB15629.11VLAN Tag (China BWIPS).
+    pub const GB15629_11_VLAN_TAG: u16 = 1055;
+    /// GB15629.11STA SID (China BWIPS).
+    pub const GB15629_11_STA_SID: u16 = 1056;
+    /// GB15629.11STA Payload Tunnel (China BWIPS).
+    pub const GB15629_11_STA_PAYLOAD_TUNNEL: u16 = 1057;
+    /// GB15629.11CCK Control (China BWIPS).
+    pub const GB15629_11_CCK_CONTROL: u16 = 1058;
+    /// GB15629.11WTP OFDM Control (China BWIPS).
+    pub const GB15629_11_WTP_OFDM_CONTROL: u16 = 1059;
+    /// IEEE 802.11 Supported MAC Profiles (RFC 7494).
+    pub const SUPPORTED_MAC_PROFILES: u16 = 1060;
+    /// IEEE 802.11 MAC Profile (RFC 7494).
+    pub const MAC_PROFILE: u16 = 1061;
+    /// IEEE 802.11 WTP Alternate Tunnel Failure Indication (RFC 8350).
+    pub const WTP_ALTERNATE_TUNNEL_FAILURE_INDICATION: u16 = 1062;
 }
 
 pub static MSG_SCHEMAS: Lazy<HashMap<u32, MsgSchema>> = Lazy::new(|| {

@@ -60,7 +60,11 @@ pub struct GlobalRadio {
     /// IEEE channel number; 0 = auto (ACS / the vendor's stable band default).
     pub channel: u32,
     pub power: u32,
+    /// Normalized 802.11 mode (`vendor::mode`); 0 = the product's default.
+    /// Each vendor maps it to its own selector at encode time.
     pub mode: u32,
+    /// Channel width in MHz; 0 = auto.
+    pub bandwidth: u32,
 }
 
 impl Default for GlobalRadio {
@@ -71,6 +75,7 @@ impl Default for GlobalRadio {
             channel: 0,
             power: 6,
             mode: 0,
+            bandwidth: 20,
         }
     }
 }
@@ -127,6 +132,7 @@ pub struct ApOverride {
     pub channel: Option<u32>,
     pub power: Option<u32>,
     pub mode: Option<u32>,
+    pub bandwidth: Option<u32>,
 }
 
 /// Global wireless configuration store: templates, overrides and pending set.
@@ -151,7 +157,7 @@ impl WirelessConfigStore {
         let conn = self.db.lock();
         let g = conn
             .query_row(
-                "SELECT band,enable,channel,power,mode FROM global_radio WHERE band=?1",
+                "SELECT band,enable,channel,power,mode,bandwidth FROM global_radio WHERE band=?1",
                 params![band],
                 |r| {
                     Ok(GlobalRadio {
@@ -160,6 +166,7 @@ impl WirelessConfigStore {
                         channel: r.get::<_, i64>(2)? as u32,
                         power: r.get::<_, i64>(3)? as u32,
                         mode: r.get::<_, i64>(4)? as u32,
+                        bandwidth: r.get::<_, i64>(5)? as u32,
                     })
                 },
             )
@@ -178,12 +185,13 @@ impl WirelessConfigStore {
     pub fn set_global_radio(&self, g: &GlobalRadio) -> Result<()> {
         let conn = self.db.lock();
         conn.execute(
-            "INSERT INTO global_radio (band,enable,channel,power,mode)
-             VALUES (?1,?2,?3,?4,?5)
+            "INSERT INTO global_radio (band,enable,channel,power,mode,bandwidth)
+             VALUES (?1,?2,?3,?4,?5,?6)
              ON CONFLICT(band) DO UPDATE SET enable=excluded.enable,
                 channel=excluded.channel,
-                power=excluded.power, mode=excluded.mode",
-            params![g.band, i64::from(g.enable), g.channel, g.power, g.mode],
+                power=excluded.power, mode=excluded.mode,
+                bandwidth=excluded.bandwidth",
+            params![g.band, i64::from(g.enable), g.channel, g.power, g.mode, g.bandwidth],
         )?;
         Ok(())
     }
@@ -368,7 +376,7 @@ impl WirelessConfigStore {
     pub fn list_overrides(&self) -> Result<Vec<ApOverride>> {
         let conn = self.db.lock();
         let mut stmt = conn.prepare(
-            "SELECT mac,band,channel,power,mode FROM ap_override ORDER BY mac, band",
+            "SELECT mac,band,channel,power,mode,bandwidth FROM ap_override ORDER BY mac, band",
         )?;
         let rows = stmt.query_map([], |r| {
             let mac: Vec<u8> = r.get(0)?;
@@ -380,6 +388,7 @@ impl WirelessConfigStore {
                 channel: r.get(2)?,
                 power: r.get(3)?,
                 mode: r.get(4)?,
+                bandwidth: r.get(5)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -389,7 +398,7 @@ impl WirelessConfigStore {
         let conn = self.db.lock();
         let o = conn
             .query_row(
-                "SELECT mac,band,channel,power,mode FROM ap_override WHERE mac=?1 AND band=?2",
+                "SELECT mac,band,channel,power,mode,bandwidth FROM ap_override WHERE mac=?1 AND band=?2",
                 params![&mac[..], band],
                 |r| {
                     let m: Vec<u8> = r.get(0)?;
@@ -401,6 +410,7 @@ impl WirelessConfigStore {
                         channel: r.get(2)?,
                         power: r.get(3)?,
                         mode: r.get(4)?,
+                        bandwidth: r.get(5)?,
                     })
                 },
             )
@@ -411,10 +421,12 @@ impl WirelessConfigStore {
     pub fn set_override(&self, o: &ApOverride) -> Result<()> {
         let conn = self.db.lock();
         conn.execute(
-            "INSERT INTO ap_override (mac,band,channel,power,mode) VALUES (?1,?2,?3,?4,?5)
+            "INSERT INTO ap_override (mac,band,channel,power,mode,bandwidth)
+             VALUES (?1,?2,?3,?4,?5,?6)
              ON CONFLICT(mac,band) DO UPDATE SET channel=excluded.channel,
-                power=excluded.power, mode=excluded.mode",
-            params![&o.mac[..], o.band, o.channel, o.power, o.mode],
+                power=excluded.power, mode=excluded.mode,
+                bandwidth=excluded.bandwidth",
+            params![&o.mac[..], o.band, o.channel, o.power, o.mode, o.bandwidth],
         )?;
         Ok(())
     }
@@ -482,8 +494,8 @@ impl WirelessConfigStore {
     }
 
     /// The effective H3C radio header for a WTP: the global template merged with
-    /// any per-AP override, with the channel number mapped to the H3C 0xfde8
-    /// header's channel field (the IEEE number, 0 = auto).
+    /// any per-AP override, with the channel number kept as the IEEE number
+    /// (0 = auto). The H3C selector space mappings live in `vendor::h3c`.
     pub fn effective_radio(&self, mac: Mac, band: u8) -> Result<H3cRadioHeader> {
         let g = self.get_global_radio(band)?;
         let o = self.get_override(mac, band)?;
@@ -493,6 +505,7 @@ impl WirelessConfigStore {
             enable: g.enable,
             power: o.as_ref().and_then(|o| o.power).unwrap_or(g.power),
             mode: o.as_ref().and_then(|o| o.mode).unwrap_or(g.mode),
+            bandwidth: o.as_ref().and_then(|o| o.bandwidth).unwrap_or(g.bandwidth),
             channel: VendorProfile::H3c.radio_channel_field(band, channel),
         })
     }
@@ -595,6 +608,7 @@ mod tests {
         let (_db, w, _r) = store();
         assert_eq!(w.get_global_radio(1).unwrap().power, 6);
         assert_eq!(w.get_global_radio(1).unwrap().channel, 0);
+        assert_eq!(w.get_global_radio(1).unwrap().bandwidth, 20);
         assert_eq!(w.list_global_radios().unwrap().len(), 2);
         w.set_global_radio(&GlobalRadio {
             band: 2,
@@ -602,10 +616,11 @@ mod tests {
             channel: 9,
             power: 3,
             mode: 5,
+            bandwidth: 80,
         })
         .unwrap();
         let g = w.get_global_radio(2).unwrap();
-        assert_eq!((g.channel, g.power, g.mode), (9, 3, 5));
+        assert_eq!((g.channel, g.power, g.mode, g.bandwidth), (9, 3, 5, 80));
     }
 
     #[test]
@@ -617,6 +632,7 @@ mod tests {
             channel: 6,
             power: 6,
             mode: 0,
+            bandwidth: 20,
         })
         .unwrap();
         // No override: global channel applies.
@@ -629,22 +645,27 @@ mod tests {
             channel: None,
             power: Some(2),
             mode: None,
+            bandwidth: None,
         })
         .unwrap();
         let e = w.effective_radio(mac(1), 1).unwrap();
         assert_eq!(e.channel, 6);
         assert_eq!(e.power, 2);
-        // Override channel: wins; and another AP is unaffected.
+        assert_eq!(e.bandwidth, 20);
+        // Override channel + bandwidth: both win; another AP is unaffected.
         w.set_override(&ApOverride {
             mac: mac(1),
             band: 1,
             channel: Some(11),
             power: Some(2),
             mode: None,
+            bandwidth: Some(40),
         })
         .unwrap();
         assert_eq!(w.effective_radio(mac(1), 1).unwrap().channel, 11);
+        assert_eq!(w.effective_radio(mac(1), 1).unwrap().bandwidth, 40);
         assert_eq!(w.effective_radio(mac(2), 1).unwrap().channel, 6);
+        assert_eq!(w.effective_radio(mac(2), 1).unwrap().bandwidth, 20);
         // Override channel 0 pins auto for that AP.
         w.set_override(&ApOverride {
             mac: mac(1),
@@ -652,6 +673,7 @@ mod tests {
             channel: Some(0),
             power: Some(2),
             mode: None,
+            bandwidth: Some(40),
         })
         .unwrap();
         assert_eq!(w.effective_radio(mac(1), 1).unwrap().channel, 0);
@@ -659,6 +681,7 @@ mod tests {
         w.clear_override(mac(1), 1).unwrap();
         assert_eq!(w.effective_radio(mac(1), 1).unwrap().channel, 6);
         assert_eq!(w.effective_radio(mac(1), 1).unwrap().power, 6);
+        assert_eq!(w.effective_radio(mac(1), 1).unwrap().bandwidth, 20);
     }
 
     #[test]
@@ -698,6 +721,7 @@ mod tests {
         // Effective radio header persisted (auto channel -> H3C AUTO 0).
         assert_eq!(r.h3c_header(mac(1), 1).unwrap().channel, 0);
         assert_eq!(r.h3c_header(mac(1), 2).unwrap().channel, 0);
+        assert_eq!(r.h3c_header(mac(1), 1).unwrap().bandwidth, 20);
         // Marked pending.
         assert!(w.is_pending(mac(1)).unwrap());
         assert_eq!(w.list_pending().unwrap(), vec![mac(1)]);

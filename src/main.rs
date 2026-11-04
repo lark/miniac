@@ -1271,6 +1271,13 @@ async fn handle_session(
                             // reboots gets its saved state (typically "off") in
                             // this Configure-stage snapshot, before it enters Run.
                             let led = devices.get(mac)?.and_then(|d| d.led_on);
+                            // Effective per-band radio settings (global template
+                            // merged with the AP override) are carried by the
+                            // H3C 0xfde8 band headers; H3C only.
+                            let radio_headers = [
+                                wcfg.effective_radio(mac, 1)?,
+                                wcfg.effective_radio(mac, 2)?,
+                            ];
                             let resp_msg = match profile {
                                 // TP-Link WTPs accept only a narrow set of base
                                 // element types here (2/3/12/16/23/32/37/40) and
@@ -1296,6 +1303,7 @@ async fn handle_session(
                                         peer,
                                         declared_radios: &declared_radios,
                                         wlans: &wlans,
+                                        radios: radio_headers,
                                         fe28,
                                         fe31,
                                         led,
@@ -1395,8 +1403,20 @@ async fn handle_session(
                                 // Request per reply (the WTP admits a single
                                 // in-flight radio op). See `WtpContext::push_queue`.
                                 for radio_id in 1..=2u8 {
-                                    let channel = wcfg.effective_channel(mac, radio_id)?;
-                                    let channel = vendor::tplink::channel_field(channel);
+                                    let hdr = wcfg.effective_radio(mac, radio_id)?;
+                                    // A disabled radio stays administratively down:
+                                    // only the bare state element goes out, with no
+                                    // channel record that would bring it up.
+                                    if !hdr.enable {
+                                        let msg = vendor::tplink::radio_admin_state_request(
+                                            ctx.next_seq(),
+                                            radio_id,
+                                            2,
+                                        );
+                                        ctx.push_msg(msg.encode_for(frame(profile)));
+                                        continue;
+                                    }
+                                    let channel = vendor::tplink::channel_field(hdr.channel);
                                     for msg in [
                                         vendor::tplink::radio_admin_state_request(
                                             ctx.next_seq(),
@@ -1407,6 +1427,9 @@ async fn handle_session(
                                             ctx.next_seq(),
                                             radio_id,
                                             channel,
+                                            hdr.power,
+                                            hdr.mode,
+                                            hdr.bandwidth,
                                         ),
                                     ] {
                                         ctx.push_msg(msg.encode_for(frame(profile)));

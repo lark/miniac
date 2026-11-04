@@ -226,6 +226,11 @@ struct DeviceDto {
     /// Last known AP LED state; `null` when the WTP never reported one (the
     /// TP-Link form reports it in every Echo Request).
     led_on: Option<bool>,
+    /// Radio modes the product can express, as bitmasks over the normalized
+    /// `vendor::mode` values (bit N = mode N). The UI greys out modes a band
+    /// cannot run; uncatalogued products advertise every band mode.
+    mode_mask_24: u16,
+    mode_mask_5: u16,
 }
 
 impl DeviceDto {
@@ -246,6 +251,16 @@ impl DeviceDto {
             approved: d.approved,
             online,
             led_on: d.led_on,
+            mode_mask_24: crate::vendor::mode::device_mask(
+                d.vendor.as_deref().unwrap_or(""),
+                d.model.as_deref().unwrap_or(""),
+                1,
+            ),
+            mode_mask_5: crate::vendor::mode::device_mask(
+                d.vendor.as_deref().unwrap_or(""),
+                d.model.as_deref().unwrap_or(""),
+                2,
+            ),
         }
     }
 }
@@ -636,6 +651,7 @@ struct H3cRadioHeaderDto {
     enable: bool,
     power: u32,
     mode: u32,
+    bandwidth: u32,
     channel: u32,
 }
 
@@ -646,6 +662,7 @@ impl From<H3cRadioHeader> for H3cRadioHeaderDto {
             enable: h.enable,
             power: h.power,
             mode: h.mode,
+            bandwidth: h.bandwidth,
             channel: h.channel,
         }
     }
@@ -657,6 +674,7 @@ struct H3cRadioHeaderPatch {
     enable: Option<bool>,
     power: Option<u32>,
     mode: Option<u32>,
+    bandwidth: Option<u32>,
     channel: Option<u32>,
 }
 
@@ -687,17 +705,21 @@ async fn set_radio_h3c_header(
     if let Some(v) = p.mode {
         h.mode = v;
     }
+    if let Some(v) = p.bandwidth {
+        h.bandwidth = v;
+    }
     if let Some(v) = p.channel {
         h.channel = v;
     }
     st.radios.set_h3c_header(mac, &h)?;
     logx::admin(format!(
-        "H3C radio header set for {} radio {}: enable={}, power={}, mode={}, channel={}",
+        "H3C radio header set for {} radio {}: enable={}, power={}, mode={}, bandwidth={}, channel={}",
         device::mac_to_str(mac),
         h.radio_id,
         h.enable,
         h.power,
         h.mode,
+        h.bandwidth,
         h.channel
     ));
     Ok(Json(h.into()))
@@ -1225,6 +1247,7 @@ struct GlobalRadioDto {
     channel: u32,
     power: u32,
     mode: u32,
+    bandwidth: u32,
 }
 
 impl From<GlobalRadio> for GlobalRadioDto {
@@ -1238,6 +1261,7 @@ impl From<GlobalRadio> for GlobalRadioDto {
             channel: g.channel,
             power: g.power,
             mode: g.mode,
+            bandwidth: g.bandwidth,
         }
     }
 }
@@ -1305,6 +1329,7 @@ struct ApOverrideDto {
     channel: Option<u32>,
     power: Option<u32>,
     mode: Option<u32>,
+    bandwidth: Option<u32>,
 }
 
 impl From<ApOverride> for ApOverrideDto {
@@ -1315,6 +1340,7 @@ impl From<ApOverride> for ApOverrideDto {
             channel: o.channel,
             power: o.power,
             mode: o.mode,
+            bandwidth: o.bandwidth,
         }
     }
 }
@@ -1473,6 +1499,7 @@ struct GlobalRadioReq {
     channel: Option<u32>,
     power: Option<u32>,
     mode: Option<u32>,
+    bandwidth: Option<u32>,
 }
 
 async fn get_global_radio(
@@ -1511,15 +1538,19 @@ async fn set_global_radio(
     if let Some(v) = req.mode {
         g.mode = v;
     }
+    if let Some(v) = req.bandwidth {
+        g.bandwidth = v;
+    }
     st.wcfg.set_global_radio(&g)?;
     propagate_global(&st)?;
     logx::admin(format!(
-        "global radio set for band {band}: enable={}, channel_mode={}, channel={}, power={}, mode={}",
+        "global radio set for band {band}: enable={}, channel_mode={}, channel={}, power={}, mode={}, bandwidth={}",
         g.enable,
         u8::from(g.channel != 0),
         g.channel,
         g.power,
-        g.mode
+        g.mode,
+        g.bandwidth
     ));
     Ok(Json(g.into()))
 }
@@ -1786,6 +1817,7 @@ struct OverrideReq {
     channel: Option<u32>,
     power: Option<u32>,
     mode: Option<u32>,
+    bandwidth: Option<u32>,
 }
 
 async fn get_override(
@@ -1810,16 +1842,18 @@ async fn set_override(
         channel: req.channel,
         power: req.power,
         mode: req.mode,
+        bandwidth: req.bandwidth,
     };
     st.wcfg.set_override(&o)?;
     st.wcfg.materialize(&st.radios, mac)?;
     st.wcfg.mark_pending(mac)?;
     logx::admin(format!(
-        "override set for {} band {band}: channel={:?}, power={:?}, mode={:?}",
+        "override set for {} band {band}: channel={:?}, power={:?}, mode={:?}, bandwidth={:?}",
         device::mac_to_str(mac),
         o.channel,
         o.power,
-        o.mode
+        o.mode,
+        o.bandwidth
     ));
     Ok(Json(o.into()))
 }
@@ -1856,8 +1890,10 @@ struct CommitResult {
 }
 
 /// Commit the pending configuration: for each target WTP push a Configuration
-/// Update Request carrying the effective channel/power per band. The pending
-/// entry clears when the WTP acknowledges (CONFIG_UPDATE_RESP, main.rs).
+/// Update Request carrying the effective channel/power per band. Mode and
+/// bandwidth have no confirmed runtime element (0xfde8 is Configure-stage only),
+/// so they reach the WTP at its next Configure push. The pending entry clears
+/// when the WTP acknowledges (CONFIG_UPDATE_RESP, main.rs).
 async fn commit_wcfg(
     State(st): State<Arc<AppData>>,
     Json(req): Json<CommitReq>,

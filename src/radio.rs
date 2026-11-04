@@ -80,16 +80,19 @@ impl Default for RadioWlan {
 }
 
 /// H3C per-band radio header settings carried by the leading 7 x u32 of each
-/// band's 0xfde8 section: enable (word0), power (word2), mode (word3) and
-/// channel (word5). `channel` is the IEEE channel number (0 = auto / ACS),
-/// carried verbatim on the wire. Stored per (mac, radio_id); radio_id 1 = 2.4G,
-/// 2 = 5G.
+/// band's 0xfde8 section: enable (word0), power (word2), mode (word3),
+/// bandwidth (word4) and channel (word5). `channel` is the IEEE channel number
+/// (0 = auto / ACS); `bandwidth` is MHz with 0 = auto; `mode` is the
+/// normalized 802.11 mode (`vendor::mode`, 0 = product default). All three are
+/// mapped to the H3C selector space when the 0xfde8 element is encoded. Stored
+/// per (mac, radio_id); radio_id 1 = 2.4G, 2 = 5G.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct H3cRadioHeader {
     pub radio_id: u8,
     pub enable: bool,
     pub power: u32,
     pub mode: u32,
+    pub bandwidth: u32,
     pub channel: u32,
 }
 
@@ -100,6 +103,7 @@ impl Default for H3cRadioHeader {
             enable: true,
             power: 6,
             mode: 0,
+            bandwidth: 20,
             channel: 0,
         }
     }
@@ -372,7 +376,7 @@ impl RadioStore {
         let conn = self.db.lock();
         let h = conn
             .query_row(
-                "SELECT radio_enable,radio_power,radio_mode,radio_channel FROM radios
+                "SELECT radio_enable,radio_power,radio_mode,radio_bandwidth,radio_channel FROM radios
                  WHERE mac=?1 AND radio_id=?2",
                 params![&mac[..], radio_id],
                 |r| {
@@ -381,7 +385,8 @@ impl RadioStore {
                         enable: r.get::<_, i64>(0)? != 0,
                         power: r.get::<_, i64>(1)? as u32,
                         mode: r.get::<_, i64>(2)? as u32,
-                        channel: r.get::<_, i64>(3)? as u32,
+                        bandwidth: r.get::<_, i64>(3)? as u32,
+                        channel: r.get::<_, i64>(4)? as u32,
                     })
                 },
             )
@@ -400,17 +405,20 @@ impl RadioStore {
     pub fn set_h3c_header(&self, mac: Mac, hdr: &H3cRadioHeader) -> Result<()> {
         let conn = self.db.lock();
         conn.execute(
-            "INSERT INTO radios (mac,radio_id,radio_enable,radio_power,radio_mode,radio_channel,last_seen)
-             VALUES (?1,?2,?3,?4,?5,?6,?7)
+            "INSERT INTO radios (mac,radio_id,radio_enable,radio_power,radio_mode,
+                radio_bandwidth,radio_channel,last_seen)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
              ON CONFLICT(mac,radio_id) DO UPDATE SET
                 radio_enable=excluded.radio_enable, radio_power=excluded.radio_power,
-                radio_mode=excluded.radio_mode, radio_channel=excluded.radio_channel",
+                radio_mode=excluded.radio_mode, radio_bandwidth=excluded.radio_bandwidth,
+                radio_channel=excluded.radio_channel",
             params![
                 &mac[..],
                 hdr.radio_id,
                 i64::from(hdr.enable),
                 hdr.power as i64,
                 hdr.mode as i64,
+                hdr.bandwidth as i64,
                 hdr.channel as i64,
                 now_unix() as i64,
             ],
@@ -581,6 +589,7 @@ mod tests {
                 enable: true,
                 power: 5,
                 mode: 10,
+                bandwidth: 80,
                 channel: 9,
             },
         )
@@ -588,6 +597,7 @@ mod tests {
         let g5 = s.h3c_header(w, 2).unwrap();
         assert_eq!(g5.power, 5);
         assert_eq!(g5.mode, 10);
+        assert_eq!(g5.bandwidth, 80);
         assert_eq!(g5.channel, 9);
     }
 

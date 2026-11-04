@@ -209,13 +209,18 @@
             <select id="r-chmode"><option value="0" data-i18n="radio.auto">自动</option><option value="1" data-i18n="radio.manual">手动</option></select>
             <input type="number" id="r-ch" style="width:80px">
             <label class="muted" data-i18n="radio.power">功率(%)</label>
-            <input type="number" id="r-pw" style="width:80px">
+            <select id="r-pw"></select>
+            <label class="muted" data-i18n="radio.mode">模式</label>
+            <select id="r-mode"></select>
+            <label class="muted" data-i18n="radio.bandwidth">带宽</label>
+            <select id="r-bw"><option value="0" data-i18n="bw.auto">自动</option><option value="20">20 MHz</option><option value="40">40 MHz</option><option value="80">80 MHz</option><option value="160">160 MHz</option></select>
             <button class="btn sm" data-i18n="btn.apply" onclick="saveGlobalRadio()">应用</button>
           </div>
+          <div class="note" data-i18n="radio.bwHint">带宽按所选值作为上限设置设备的最大支持带宽；设备能力低于该值时按其最大能力生效。</div>
         </div>
         <div class="card">
           <h2 data-i18n="card.overrides">AP 覆盖设置</h2>
-          <table><thead><tr><th data-i18n="th.apname2">AP 备注</th><th data-i18n="th.channel">信道</th><th data-i18n="th.power">功率</th><th data-i18n="th.state">状态</th><th data-i18n="th.ops">操作</th></tr></thead>
+          <table><thead><tr><th data-i18n="th.apname2">AP 备注</th><th data-i18n="th.channel">信道</th><th data-i18n="th.power">功率</th><th data-i18n="th.bandwidth">带宽</th><th data-i18n="th.mode">模式</th><th data-i18n="th.state">状态</th><th data-i18n="th.ops">操作</th></tr></thead>
             <tbody id="w-ov-rows"></tbody></table>
         </div>
         </div>
@@ -333,8 +338,8 @@ const I18N={
   'btn.commit':'提交','card.ssidset':'SSID 设置（全局）',
   'th.seq':'序号','th.wlanname':'无线网络名称','th.security':'加密方式','th.psk':'密码','th.clientsnum':'客户端数目','th.ops':'操作',
   'btn.addSsid':'添加 SSID','btn.recommend':'按设备能力推荐',
-  'card.radioset':'射频设置（全局）','radio.enable':'启用该射频','radio.power':'功率(%)','btn.apply':'应用',
-  'card.overrides':'AP 覆盖设置','th.apname2':'AP 备注',
+  'card.radioset':'射频设置（全局）','radio.enable':'启用该射频','radio.power':'功率(%)','radio.mode':'模式','radio.bandwidth':'带宽','bw.auto':'自动','radio.bwHint':'带宽按所选值作为上限设置设备的最大支持带宽；设备能力低于该值时按其最大能力生效。','mode.auto':'自动（产品默认）','btn.apply':'应用',
+  'card.overrides':'AP 覆盖设置','th.apname2':'AP 备注','th.bandwidth':'带宽','th.mode':'模式',
   'ssid.enabled':'已启用','ssid.disabled':'已禁用','btn.editSsid':'编辑','ssid.newRow':'新增','ssid.newPlaceholder':'输入名称新增 SSID…','ssid.unconfigured':'未配置',
   'ov.inherit':'继承','ov.overridden':'已覆盖','ov.global':'全局','btn.modify':'修改','btn.revert':'恢复全局',
   'empty.approvedAps':'暂无已确认 AP','wireless.pending':'待同步 {n} 台 AP','wireless.synced':'配置已同步',
@@ -359,8 +364,8 @@ const I18N={
   'fw.current':'当前版本','fw.onlySameOrLower':'固件存储中没有更高版本，继续将覆盖当前版本',
   'confirm.fwSameOrLower':'所选镜像版本 {next} 不高于当前版本 {cur}，继续将覆盖更新，确定？',
   'btn.save':'保存','btn.cancel':'取消','toast.loadFail':'加载失败：{msg}','toast.opFail':'操作失败：{msg}','toast.fail':'失败：{msg}',
-  'modal.override':'AP 覆盖设置','field.channelInherit':'信道（留空=继承全局）','field.powerInherit':'功率%（留空=继承全局）',
-  'override.hint':'覆盖会替换该 AP 上对应频段的全局信道/功率；清除请用“恢复全局”。',
+  'modal.override':'AP 覆盖设置','field.channelInherit':'信道（留空=继承全局）','field.powerInherit':'功率%（留空=继承全局）','field.bwInherit':'带宽（继承=跟随全局）','field.modeInherit':'模式（留空=继承全局，0=产品默认）',
+  'override.hint':'覆盖会替换该 AP 上对应频段的全局信道/功率/带宽/模式；清除请用“恢复全局”。',
   'toast.overrideSet':'覆盖已设置，待提交同步','toast.overrideCleared':'已恢复全局，待提交同步',
   'toast.manualChannel':'手动信道需填写信道号','toast.radioApplied':'全局射频已应用，待提交同步','toast.saveFail':'保存失败：{msg}',
   'toast.noPending':'没有待同步的 AP','toast.committed':'已下发 {n} 台','toast.committedOffline':'，{n} 台离线（下次上线生效）','toast.commitFail':'提交失败：{msg}',
@@ -415,8 +420,8 @@ const I18N={
   'btn.commit':'Commit','card.ssidset':'SSID Settings (Global)',
   'th.seq':'#','th.wlanname':'Network Name','th.security':'Security','th.psk':'Password','th.clientsnum':'Clients','th.ops':'Actions',
   'btn.addSsid':'Add SSID','btn.recommend':'Recommend by device capability',
-  'card.radioset':'Radio Settings (Global)','radio.enable':'Enable this radio','radio.power':'Power (%)','btn.apply':'Apply',
-  'card.overrides':'AP Overrides','th.apname2':'AP Name',
+  'card.radioset':'Radio Settings (Global)','radio.enable':'Enable this radio','radio.power':'Power (%)','radio.mode':'Mode','radio.bandwidth':'Bandwidth','bw.auto':'Auto','radio.bwHint':'Bandwidth is sent as an upper bound: devices cap their maximum supported width at this value.','mode.auto':'Auto (vendor default)','btn.apply':'Apply',
+  'card.overrides':'AP Overrides','th.apname2':'AP Name','th.bandwidth':'Bandwidth','th.mode':'Mode',
   'ssid.enabled':'Enabled','ssid.disabled':'Disabled','btn.editSsid':'Edit','ssid.newRow':'New','ssid.newPlaceholder':'Type a name to add SSID…','ssid.unconfigured':'Unconfigured',
   'ov.inherit':'inherit','ov.overridden':'Override','ov.global':'Global','btn.modify':'Edit','btn.revert':'Revert Global',
   'empty.approvedAps':'No approved APs','wireless.pending':'{n} AP(s) pending sync','wireless.synced':'Config synced',
@@ -441,8 +446,8 @@ const I18N={
   'fw.current':'Current version','fw.onlySameOrLower':'No newer image is stored; continuing overwrites the current version',
   'confirm.fwSameOrLower':'Image version {next} is not newer than the current {cur}. Overwrite anyway?',
   'btn.save':'Save','btn.cancel':'Cancel','toast.loadFail':'Load failed: {msg}','toast.opFail':'Operation failed: {msg}','toast.fail':'Failed: {msg}',
-  'modal.override':'AP Override','field.channelInherit':'Channel (blank = inherit global)','field.powerInherit':'Power % (blank = inherit global)',
-  'override.hint':'Overrides replace the global channel/power for this AP on this band; use “Revert Global” to clear.',
+  'modal.override':'AP Override','field.channelInherit':'Channel (blank = inherit global)','field.powerInherit':'Power % (blank = inherit global)','field.bwInherit':'Bandwidth (inherit = follow global)','field.modeInherit':'Mode (blank = inherit global, 0 = product default)',
+  'override.hint':'Overrides replace the global channel/power/bandwidth/mode for this AP on this band; use “Revert Global” to clear.',
   'toast.overrideSet':'Override set, pending commit','toast.overrideCleared':'Reverted to global, pending commit',
   'toast.manualChannel':'A manual channel requires a channel number','toast.radioApplied':'Global radio applied, pending commit','toast.saveFail':'Save failed: {msg}',
   'toast.noPending':'No APs pending sync','toast.committed':'Pushed to {n}','toast.committedOffline':'; {n} offline (effective on next join)','toast.commitFail':'Commit failed: {msg}',
@@ -707,7 +712,7 @@ function wSetBand(b,btn){
   renderWireless();
 }
 const gRadio=()=>(DB.wcfg?.global_radios||[]).find(g=>g.band===wBandSel)||
-  {band:wBandSel,enable:true,channel_mode:0,channel:0,power:6,mode:0};
+  {band:wBandSel,enable:true,channel_mode:0,channel:0,power:6,mode:0,bandwidth:20};
 const gWlans=()=>(DB.wcfg?.global_wlans||[]).filter(w=>w.band===wBandSel).sort((a,b)=>a.wlan_id-b.wlan_id);
 const clientLimit=()=>(DB.wcfg&&DB.wcfg.client_limit)||null;
 function clientLimitHint(){
@@ -734,17 +739,21 @@ async function renderWireless(){
   $('r-en').checked=!!g.enable;
   $('r-chmode').value=String(g.channel_mode||0);
   $('r-ch').value=g.channel_mode?g.channel:'';
-  $('r-pw').value=g.power;
+  $('r-pw').innerHTML=powerOptions(g.power,false);
+  $('r-mode').innerHTML=modeOptions(g.mode,false,wBandSel,fleetModeMask(wBandSel));
+  $('r-bw').value=String(g.bandwidth||20);
   const aps=DB.devices.filter(d=>d.approved);
   $('w-ov-rows').innerHTML=aps.map(d=>{
     const o=ovOf(d.mac);
     const ch=o&&o.channel!=null?o.channel:t('ov.inherit');
     const pw=o&&o.power!=null?o.power:t('ov.inherit');
-    return `<tr><td>${esc(d.name||d.mac)}</td><td>${ch}</td><td>${pw}</td>
+    const bw=o&&o.bandwidth!=null?o.bandwidth:t('ov.inherit');
+    const md=o&&o.mode!=null?modeLabel(o.mode):t('ov.inherit');
+    return `<tr><td>${esc(d.name||d.mac)}</td><td>${ch}</td><td>${pw}</td><td>${bw}</td><td>${md}</td>
       <td>${o?`<span class="pill p-warn">${t('ov.overridden')}</span>`:`<span class="pill p-muted">${t('ov.global')}</span>`}</td>
       <td><button class="btn ghost sm" onclick="openOverrideModal('${esc(d.mac)}')">${t('btn.modify')}</button>${o?
         `<button class="btn ghost sm" onclick="clearOverride('${esc(d.mac)}')">${t('btn.revert')}</button>`:''}</td></tr>`;
-  }).join('') || `<tr><td colspan="5" class="muted">${t('empty.approvedAps')}</td></tr>`;
+  }).join('') || `<tr><td colspan="7" class="muted">${t('empty.approvedAps')}</td></tr>`;
   const pend=(DB.wcfg?.pending||[]);
   $('w-pending').textContent=pend.length?t('wireless.pending',{n:pend.length}):t('wireless.synced');
   const tb=document.querySelectorAll('#w-bandtabs button');
@@ -872,23 +881,75 @@ async function saveGlobalRadio(){
   const channel=manual?(+$('r-ch').value||0):0;
   if(manual&&!channel){ toast(t('toast.manualChannel')); return; }
   const body={enable:$('r-en').checked,channel_mode:manual?1:0,channel,
-    power:+($('r-pw').value||0),mode:gRadio().mode||0};
+    power:+($('r-pw').value||0),mode:+($('r-mode').value||0),
+    bandwidth:+($('r-bw').value||0)};
   try{ await apiJson(`/api/wcfg/global/radio/${wBandSel}`,'PUT',body);
     toast(t('toast.radioApplied')); await loadWcfg(); renderWireless();
   }catch(e){ toast(t('toast.saveFail',{msg:e.message})); }
 }
 
+/* Power choices are percentages in 10% steps; keep the stored value selectable
+   even when it is not on a step (older rows used arbitrary values). */
+function powerOptions(current, inherit){
+  const cur=current==null||current===''?null:Math.max(0,Math.min(100,Math.round(+current)));
+  let h=inherit?`<option value=""${cur==null?' selected':''}>${t('ov.inherit')}</option>`:'';
+  for(let v=0;v<=100;v+=10) h+=`<option value="${v}"${cur===v?' selected':''}>${v}%</option>`;
+  if(cur!=null&&cur%10) h+=`<option value="${cur}" selected>${cur}%</option>`;
+  return h;
+}
+/* Radio modes are stored normalized (0 auto, 1 11a, 2 11b, 3 11g, 4 11b/g,
+   5 11n, 6 11b/g/n, 7 11a/n, 8 11ac, 9 11a/n/ac, 10 11b/g/n/ax,
+   11 11a/n/ac/ax, 12 11b/g/n/ax/be, 13 11a/n/ac/ax/be). Each vendor maps it to
+   its own selector; the list is filtered by band so a 5G-only mode can never
+   be picked on 2.4G (and vice versa). */
+const MODE_24=[0,2,3,4,5,6,10,12];
+const MODE_5=[0,1,5,7,8,9,11,13];
+const MODE_LABEL={1:'802.11a',2:'802.11b',3:'802.11g',4:'802.11b/g',5:'802.11n',
+  6:'802.11b/g/n',7:'802.11a/n',8:'802.11ac',9:'802.11a/n/ac',
+  10:'802.11b/g/n/ax',11:'802.11a/n/ac/ax',12:'802.11b/g/n/ax/be',
+  13:'802.11a/n/ac/ax/be'};
+function modeLabel(v){
+  v=+v;
+  return v===0?t('mode.auto'):(MODE_LABEL[v]||t('mode.auto'));
+}
+function modeOptions(current, inherit, band, mask){
+  const list=band===2?MODE_5:MODE_24;
+  const cur=current==null||current===''?null:+current;
+  const fit=cur!=null&&list.includes(cur)?cur:null;
+  const ok=v=>mask==null||((mask&(1<<v))!==0);
+  let h=inherit?`<option value=""${fit==null?' selected':''}>${t('ov.inherit')}</option>`:'';
+  for(const v of list) h+=`<option value="${v}"${fit===v?' selected':''}${ok(v)?'':' disabled'}>${modeLabel(v)}</option>`;
+  return h;
+}
+/* Mode values no device of a band can express are greyed out: for the global
+   radio the union of the approved APs' capabilities, for an override the AP's
+   own mask. With nothing to compare against, every band mode stays selectable. */
+const ALL_MODES={1:MODE_24.reduce((a,v)=>a|(1<<v),0),2:MODE_5.reduce((a,v)=>a|(1<<v),0)};
+function fleetModeMask(band){
+  const aps=DB.devices.filter(d=>d.approved);
+  let mask=0;
+  for(const d of aps) mask|=band===2?(d.mode_mask_5||0):(d.mode_mask_24||0);
+  return mask||ALL_MODES[band];
+}
+function deviceModeMask(mac,band){
+  const d=DB.devices.find(x=>x.mac===mac);
+  const mask=d?(band===2?(d.mode_mask_5||0):(d.mode_mask_24||0)):0;
+  return mask||ALL_MODES[band];
+}
 /* ---------- AP overrides ---------- */
 function openOverrideModal(mac){
   const o=ovOf(mac)||{};
   openModal(t('modal.override'),`${esc(APNAME(mac))} · ${bandLabel(bandOfRid(wBandSel))}`,
     `<div class="field"><label>${t('field.channelInherit')}</label><input type="number" id="o-ch" value="${o.channel!=null?o.channel:''}" style="width:110px"></div>
-     <div class="field"><label>${t('field.powerInherit')}</label><input type="number" id="o-pw" value="${o.power!=null?o.power:''}" style="width:110px"></div>
+     <div class="field"><label>${t('field.powerInherit')}</label><select id="o-pw" style="width:110px">${powerOptions(o.power!=null?o.power:null,true)}</select></div>
+     <div class="field"><label>${t('field.bwInherit')}</label><select id="o-bw"><option value="" ${o.bandwidth==null?'selected':''}>${t('ov.inherit')}</option><option value="0" ${o.bandwidth===0?'selected':''}>${t('bw.auto')}</option><option value="20" ${o.bandwidth===20?'selected':''}>20 MHz</option><option value="40" ${o.bandwidth===40?'selected':''}>40 MHz</option><option value="80" ${o.bandwidth===80?'selected':''}>80 MHz</option><option value="160" ${o.bandwidth===160?'selected':''}>160 MHz</option></select></div>
+     <div class="field"><label>${t('field.modeInherit')}</label><select id="o-mode" style="width:110px">${modeOptions(o.mode!=null?o.mode:null,true,wBandSel,deviceModeMask(mac,wBandSel))}</select></div>
      <div class="hint">${t('override.hint')}</div>`,
     async()=>{
       const body={channel:$('o-ch').value===''?null:+$('o-ch').value,
         power:$('o-pw').value===''?null:+$('o-pw').value,
-        mode:o.mode!=null?o.mode:null};
+        bandwidth:$('o-bw').value===''?null:+$('o-bw').value,
+        mode:$('o-mode').value===''?null:+$('o-mode').value};
       await apiJson(`/api/wcfg/override/${mac}/${wBandSel}`,'PUT',body);
       toast(t('toast.overrideSet')); await loadWcfg(); renderWireless();
     });

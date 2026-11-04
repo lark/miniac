@@ -40,12 +40,13 @@ CREATE TABLE IF NOT EXISTS radios (
     channel     INTEGER,
     tx_power    INTEGER,
     -- H3C 0xfde8 per-band header config (radio_enable -> word0, power -> word2,
-    -- mode -> word3, radio_channel -> word5; channel is the IEEE channel number,
-    -- 0 = auto).
-    radio_enable   INTEGER NOT NULL DEFAULT 1,
-    radio_power    INTEGER NOT NULL DEFAULT 6,
-    radio_mode     INTEGER NOT NULL DEFAULT 0,
-    radio_channel  INTEGER NOT NULL DEFAULT 0,
+    -- mode -> word3, radio_bandwidth -> word4, radio_channel -> word5; channel
+    -- is the IEEE channel number, 0 = auto; bandwidth is MHz, 0 = auto).
+    radio_enable    INTEGER NOT NULL DEFAULT 1,
+    radio_power     INTEGER NOT NULL DEFAULT 6,
+    radio_mode      INTEGER NOT NULL DEFAULT 0,
+    radio_bandwidth INTEGER NOT NULL DEFAULT 20,
+    radio_channel   INTEGER NOT NULL DEFAULT 0,
     last_seen   INTEGER NOT NULL,
     PRIMARY KEY (mac, radio_id)
 );
@@ -151,7 +152,8 @@ CREATE TABLE IF NOT EXISTS global_radio (
     enable       INTEGER NOT NULL DEFAULT 1,
     channel      INTEGER NOT NULL DEFAULT 0,  -- IEEE channel number; 0 = auto
     power        INTEGER NOT NULL DEFAULT 6,
-    mode         INTEGER NOT NULL DEFAULT 0
+    mode         INTEGER NOT NULL DEFAULT 0,  -- vendor mode selector; 0 = default
+    bandwidth    INTEGER NOT NULL DEFAULT 20  -- MHz; 0 = auto
 );
 
 -- Global WLAN (SSID) templates per band, materialized into `radio_wlans`.
@@ -187,11 +189,12 @@ CREATE TABLE IF NOT EXISTS wifi_vlan (
 -- Per-AP overrides of the global radio settings. A NULL column inherits the
 -- global value; a non-NULL one wins. Keyed by (mac, band).
 CREATE TABLE IF NOT EXISTS ap_override (
-    mac     BLOB NOT NULL,                -- owning WTP MAC (6 raw bytes)
-    band    INTEGER NOT NULL,
-    channel INTEGER,
-    power   INTEGER,
-    mode    INTEGER,
+    mac       BLOB NOT NULL,                -- owning WTP MAC (6 raw bytes)
+    band      INTEGER NOT NULL,
+    channel   INTEGER,
+    power     INTEGER,
+    mode      INTEGER,
+    bandwidth INTEGER,
     PRIMARY KEY (mac, band)
 );
 
@@ -215,12 +218,13 @@ CREATE TABLE IF NOT EXISTS sys_setting (
 /// startup rather than a silent default at query time.
 ///
 /// global_radio: both bands up (enable=1), auto channel (0 = ACS / the vendor's
-/// stable band default), power 6. global_wlan: one secured SSID per band.
-/// Product capabilities are not seeded here; see `init_product_caps`.
+/// stable band default), power 6, 20 MHz bandwidth and the vendor's default
+/// mode selector (0). global_wlan: one secured SSID per band. Product
+/// capabilities are not seeded here; see `init_product_caps`.
 const SEED: &str = r#"
-INSERT OR IGNORE INTO global_radio (band,enable,channel,power,mode) VALUES
-    (1,1,0,6,0),
-    (2,1,0,6,0);
+INSERT OR IGNORE INTO global_radio (band,enable,channel,power,mode,bandwidth) VALUES
+    (1,1,0,6,0,20),
+    (2,1,0,6,0,20);
 
 INSERT OR IGNORE INTO global_wlan
     (band,wlan_id,ssid,akm,cipher,pmf,psk,wlan_enable,isolate,broadcast,
@@ -305,10 +309,23 @@ impl Db {
                 ("radio_enable", "INTEGER NOT NULL DEFAULT 1"),
                 ("radio_power", "INTEGER NOT NULL DEFAULT 6"),
                 ("radio_mode", "INTEGER NOT NULL DEFAULT 0"),
+                ("radio_bandwidth", "INTEGER NOT NULL DEFAULT 20"),
                 ("radio_channel", "INTEGER NOT NULL DEFAULT 0"),
             ],
         )
         .context("migrate radios h3c header")?;
+        ensure_columns(
+            &conn,
+            "global_radio",
+            &[("bandwidth", "INTEGER NOT NULL DEFAULT 20")],
+        )
+        .context("migrate global_radio.bandwidth")?;
+        ensure_columns(
+            &conn,
+            "ap_override",
+            &[("bandwidth", "INTEGER")],
+        )
+        .context("migrate ap_override.bandwidth")?;
         // Pre-split databases stored the policy in one `security` string and the
         // cipher in the integer `cipher` column (same 1/2/3 numbering). Detect the
         // missing `akm` column before adding it, so the one-time split runs

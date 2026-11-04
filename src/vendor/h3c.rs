@@ -38,6 +38,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use crate::capwap::{CtrlMsg, CwElem, CwResult, MsgElemType, MsgType};
 use crate::config;
 use crate::elements::BaseElem;
+use crate::radio::H3cRadioHeader;
 
 /// Build a Discovery Response tailored to an H3C AX60-style WTP.
 ///
@@ -351,24 +352,41 @@ fn h3c_security(w: &config::WlanConfig) -> crate::vendor::profile::SecurityField
 /// walks the value sequentially (big-endian u32) and must consume exactly the
 /// element length, in the M60 AC's layout:
 ///
-///   [7 x u32]  2.4G radio header [enable, 0, 0, mode=11, radio id=1, 0, 100]
+///   [7 x u32]  2.4G radio header [enable, 0, power, mode, bandwidth, channel, 100]
 ///   [records]  "SSID-<n>" anchored WLAN records
-///   [7 x u32]  5G radio header [enable, 0, 0, mode=8, radio id=1, 0, 100]
+///   [7 x u32]  5G radio header [..same..]
 ///   [records]  "5G-SSID-<n>" anchored records
 ///   [74B]      [33B "SSID-1"][u32 1][33B "5G-SSID-1"][u32 1] tail
 ///
-/// Both bands ride in a single element: the 5G header doubles as the element's
-/// trailing field and its enable word gates the 5G radio. A band with no WLAN
-/// yields a header with enable=0 and no records. The tail's per-band anchor and
-/// flag word are folded into the decoder's band charset fields.
+/// Both bands ride in a single element. `WTPEditSsid` reads word0 as the radio
+/// enable, word2 as TX power, word3 as the mode selector, word4 as the channel
+/// width selector and word5 as the channel (a selector code on 5G); word6 is
+/// never read (kept at the M60's 100). A band with no WLAN yields enable=0 and
+/// no records. This default form uses product-default headers; the Configure
+/// push passes the configured ones to [`encode_h3c_with`].
 pub fn encode_h3c(wlans: &[config::WlanConfig]) -> Vec<u8> {
+    let defaults = [
+        H3cRadioHeader {
+            radio_id: 1,
+            ..H3cRadioHeader::default()
+        },
+        H3cRadioHeader {
+            radio_id: 2,
+            ..H3cRadioHeader::default()
+        },
+    ];
+    encode_h3c_with(wlans, &defaults)
+}
+
+/// Like [`encode_h3c`] but with the per-band radio headers (2.4G first).
+pub fn encode_h3c_with(wlans: &[config::WlanConfig], radios: &[H3cRadioHeader; 2]) -> Vec<u8> {
     let g24: Vec<&config::WlanConfig> = wlans.iter().filter(|w| w.radio_id != 2).collect();
     let g5: Vec<&config::WlanConfig> = wlans.iter().filter(|w| w.radio_id == 2).collect();
     let mut v = Vec::new();
-    emit_h3c_band(&mut v, &g24, b"SSID-", 11);
+    emit_h3c_band(&mut v, &g24, b"SSID-", 1, &radios[0]);
     // The captured 5G header keeps radio id 1 as well (word4 = 1, unlike the
     // per-radio convention of id 2 for 5G); replicate the capture verbatim.
-    emit_h3c_band(&mut v, &g5, b"5G-SSID-", 8);
+    emit_h3c_band(&mut v, &g5, b"5G-SSID-", 2, &radios[1]);
     // Tail: both anchor labels plus a trailing flag word each.
     for anchor in [b"SSID-1".as_slice(), b"5G-SSID-1".as_slice()] {
         let mut a = [0u8; 33];
@@ -379,17 +397,97 @@ pub fn encode_h3c(wlans: &[config::WlanConfig]) -> Vec<u8> {
     v
 }
 
+/// Map a configured channel width (MHz) to the 0xfde8 header word4 selector.
+/// `WTPEditSsid` hands the code to `sub_3FF20`: 1 = 20 MHz, 2 = 40, 3 = 80,
+/// 4 = auto, 5 = 160. An unrepresentable width falls back to 20 MHz.
+pub fn h3c_bandwidth_field(mhz: u32) -> u32 {
+    match mhz {
+        0 => 4,
+        20 => 1,
+        40 => 2,
+        80 => 3,
+        160 => 5,
+        _ => 1,
+    }
+}
+
+/// Map an IEEE channel number to the 0xfde8 header word5 value. 2.4G carries
+/// the IEEE number verbatim (0 = auto). 5G uses the AX60's fixed selector code
+/// table (`WTPEditSsid`): 0/149/153/157/161/165 and 36..64, with any other
+/// number (including DFS channels) falling back to 64.
+pub fn h3c_channel_field(band: u8, ieee: u32) -> u32 {
+    if band != 2 {
+        return ieee;
+    }
+    match ieee {
+        0 => 0,
+        149 => 1,
+        153 => 2,
+        157 => 3,
+        161 => 4,
+        165 => 5,
+        36 => 6,
+        40 => 7,
+        44 => 8,
+        48 => 9,
+        52 => 0xa,
+        56 => 0xb,
+        60 => 0xc,
+        _ => 0xd,
+    }
+}
+
+/// Map a normalized [`crate::vendor::mode`] value to the 0xfde8 header word3
+/// selector. The AX60's own per-band pages enumerate the codes that
+/// `WTPEditSsidInit` decodes (`www_multi/AX60/wlan_ap_basic*.asp`):
+/// 2.4 GHz 1 = 11b, 2 = 11g, 3 = 11b/g, 4 = 11n, 5 = 11b/g/n, 6 = 11b/g/n/ax;
+/// 5 GHz 7 = 11a, 8 = 11a/n, 10 = 11a/n/ac, 11 = 11a/n/ac/ax. H3C cannot
+/// express every normalized mode (there is no ac-only or be code), so the
+/// nearest superset is used, and AUTO keeps the M60 capture's defaults
+/// (11 on 2.4 GHz, 8 on 5 GHz).
+pub fn h3c_mode_field(band: u8, mode: u32) -> u32 {
+    use crate::vendor::mode as m;
+    let mode = m::for_band(band, mode);
+    if band == 1 {
+        match mode {
+            m::B => 1,
+            m::G => 2,
+            m::BG => 3,
+            m::N => 4,
+            m::BGN => 5,
+            m::BGNAX | m::BGNAXBE => 6,
+            _ => 11,
+        }
+    } else {
+        match mode {
+            m::A => 7,
+            m::AN => 8,
+            m::AC | m::ANAC => 10,
+            m::ANACAX | m::ANACAXBE => 11,
+            // AUTO, and 11n alone (no pure-n 5 GHz code) select 11a/n.
+            _ => 8,
+        }
+    }
+}
+
 /// Append one band: a 7 x u32 header and its anchored records. An empty band
 /// keeps the header with enable=0 and no records.
-fn emit_h3c_band(v: &mut Vec<u8>, wlans: &[&config::WlanConfig], prefix: &[u8], mode: u32) {
+fn emit_h3c_band(
+    v: &mut Vec<u8>,
+    wlans: &[&config::WlanConfig],
+    prefix: &[u8],
+    band: u8,
+    hdr: &H3cRadioHeader,
+) {
+    let mode = h3c_mode_field(band, hdr.mode);
     for word in [
-        u32::from(!wlans.is_empty()), // radio enable
-        0,                            // opaque
-        0,                            // opaque
-        mode,                         // band/mode selector
-        1,                            // radio id (M60 uses 1 for both bands)
-        0,                            // channel: 0 = auto
-        100,                          // power
+        u32::from(hdr.enable && !wlans.is_empty()), // radio enable
+        0,                                          // opaque
+        hdr.power.min(100),                         // TX power
+        mode,                                       // band/mode selector
+        h3c_bandwidth_field(hdr.bandwidth),         // channel width selector
+        h3c_channel_field(band, hdr.channel),       // channel
+        100,                                        // never read (M60 parity)
     ] {
         v.extend_from_slice(&word.to_be_bytes());
     }
@@ -514,6 +612,9 @@ pub struct ConfigStatusResp<'a> {
     pub peer: SocketAddr,
     pub declared_radios: &'a [(u8, u8)],
     pub wlans: &'a [config::WlanConfig],
+    /// Effective per-radio header config (2.4G first) written into the 0xfde8
+    /// element's two band headers.
+    pub radios: [H3cRadioHeader; 2],
     /// OFDMA / MU-MIMO enable words for the fe28 element. Mirrors the M60 AC:
     /// the element is only emitted when either word is non-zero.
     pub fe28: Option<(u32, u32)>,
@@ -603,7 +704,7 @@ pub fn config_status_response(inp: &ConfigStatusResp<'_>) -> CtrlMsg {
     // Configure-stage response, and its decoder 0x52ee0 must consume the whole
     // element (see `encode_h3c`).
     if !inp.wlans.is_empty() {
-        let body = encode_h3c(inp.wlans);
+        let body = encode_h3c_with(inp.wlans, &inp.radios);
         m = m.add_elem(WLAN_CFG_H3C, &body);
     }
     // The M60 AC closes this snapshot with its AP name / telnet / LED /
@@ -847,10 +948,10 @@ mod tests {
         let b = encode_h3c(&[wlan(1, 1, "miniac24"), wlan(2, 1, "miniac5g")]);
         let rec = 163;
         assert_eq!(b.len(), 2 * (28 + rec) + 74);
-        // 2.4G header: enable=1, mode=11 at word 3, radio id=1 at word 4,
-        // power=100 at word 6.
+        // 2.4G header: enable=1, power=6 at word 2, mode=11 at word 3, 20 MHz
+        // (selector 1) at word 4, auto channel 0 at word 5, 100 at word 6.
         let hdr24 = [
-            0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 11, 0, 0, 0, 1, 0, 0,
+            0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 6, 0, 0, 0, 11, 0, 0, 0, 1, 0, 0,
             0, 0, 0, 0, 0, 100,
         ];
         assert_eq!(&b[..28], &hdr24);
@@ -862,10 +963,10 @@ mod tests {
         assert_eq!(&b[bcast..bcast + 4], &1u32.to_be_bytes());
         let cipher = 28 + 33 + 4 + 33 + 16 + 4 + 65;
         assert_eq!(&b[cipher..cipher + 4], &2u32.to_be_bytes());
-        // 5G header (mode=8, radio id=1) and its anchored record.
+        // 5G header (mode=8, same default header fields) and its anchored record.
         let g5 = 28 + rec;
         let hdr5 = [
-            0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 8, 0, 0, 0, 1, 0, 0,
+            0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 6, 0, 0, 0, 8, 0, 0, 0, 1, 0, 0,
             0, 0, 0, 0, 0, 100,
         ];
         assert_eq!(&b[g5..g5 + 28], &hdr5);
@@ -894,6 +995,109 @@ mod tests {
         let g5 = 28 + 163;
         assert_eq!(&b[g5..g5 + 4], &0u32.to_be_bytes());
         assert_eq!(&b[g5 + 12..g5 + 16], &8u32.to_be_bytes());
+    }
+
+    #[test]
+    fn h3c_header_carries_configured_radio_settings() {
+        let h24 = H3cRadioHeader {
+            radio_id: 1,
+            power: 3,
+            mode: 0,
+            bandwidth: 40,
+            ..H3cRadioHeader::default()
+        };
+        let h5 = H3cRadioHeader {
+            radio_id: 2,
+            power: 7,
+            mode: 5,
+            bandwidth: 80,
+            channel: 149,
+            ..H3cRadioHeader::default()
+        };
+        let b = encode_h3c_with(&[wlan(1, 1, "a"), wlan(2, 1, "b")], &[h24, h5]);
+        let word = |v: &[u8], at: usize| {
+            u32::from_be_bytes([v[at], v[at + 1], v[at + 2], v[at + 3]])
+        };
+        // 2.4G: enable, power 3, mode 0 -> band default 11, 40 MHz -> 2,
+        // auto channel 0, unread word6 stays 100.
+        assert_eq!(word(&b, 0), 1);
+        assert_eq!(word(&b, 8), 3);
+        assert_eq!(word(&b, 12), 11);
+        assert_eq!(word(&b, 16), 2);
+        assert_eq!(word(&b, 20), 0);
+        assert_eq!(word(&b, 24), 100);
+        // 5G: power 7, mode 5 (11n only) -> 8 (a/n, the nearest superset),
+        // 80 MHz -> 3, channel 149 -> selector 1.
+        let g5 = 28 + 163;
+        assert_eq!(word(&b, g5 + 8), 7);
+        assert_eq!(word(&b, g5 + 12), 8);
+        assert_eq!(word(&b, g5 + 16), 3);
+        assert_eq!(word(&b, g5 + 20), 1);
+    }
+
+    #[test]
+    fn h3c_header_disabled_radio_stays_off() {
+        // An explicitly disabled radio keeps enable=0 even with a WLAN record.
+        let off24 = H3cRadioHeader {
+            radio_id: 1,
+            enable: false,
+            ..H3cRadioHeader::default()
+        };
+        let on5 = H3cRadioHeader {
+            radio_id: 2,
+            ..H3cRadioHeader::default()
+        };
+        let b = encode_h3c_with(&[wlan(1, 1, "a"), wlan(2, 1, "b")], &[off24, on5]);
+        assert_eq!(&b[0..4], &0u32.to_be_bytes());
+    }
+
+    #[test]
+    fn h3c_bandwidth_and_channel_selectors() {
+        assert_eq!(h3c_bandwidth_field(20), 1);
+        assert_eq!(h3c_bandwidth_field(40), 2);
+        assert_eq!(h3c_bandwidth_field(80), 3);
+        assert_eq!(h3c_bandwidth_field(0), 4);
+        assert_eq!(h3c_bandwidth_field(160), 5);
+        // An unrepresentable width (e.g. 30 MHz) falls back to 20 MHz.
+        assert_eq!(h3c_bandwidth_field(30), 1);
+        // 2.4G passes the IEEE channel through unchanged.
+        assert_eq!(h3c_channel_field(1, 6), 6);
+        assert_eq!(h3c_channel_field(1, 0), 0);
+        // 5G selector table.
+        assert_eq!(h3c_channel_field(2, 0), 0);
+        assert_eq!(h3c_channel_field(2, 36), 6);
+        assert_eq!(h3c_channel_field(2, 64), 0xd);
+        assert_eq!(h3c_channel_field(2, 149), 1);
+        assert_eq!(h3c_channel_field(2, 165), 5);
+        // DFS channels are absent from the AX60 table and fall back to 64.
+        assert_eq!(h3c_channel_field(2, 100), 0xd);
+    }
+
+    #[test]
+    fn h3c_mode_selectors_are_per_band() {
+        use crate::vendor::mode;
+        // Defaults reproduce the M60 capture.
+        assert_eq!(h3c_mode_field(1, mode::AUTO), 11);
+        assert_eq!(h3c_mode_field(2, mode::AUTO), 8);
+        // 2.4 GHz codes from the AX60's own page.
+        assert_eq!(h3c_mode_field(1, mode::B), 1);
+        assert_eq!(h3c_mode_field(1, mode::G), 2);
+        assert_eq!(h3c_mode_field(1, mode::BG), 3);
+        assert_eq!(h3c_mode_field(1, mode::N), 4);
+        assert_eq!(h3c_mode_field(1, mode::BGN), 5);
+        assert_eq!(h3c_mode_field(1, mode::BGNAX), 6);
+        assert_eq!(h3c_mode_field(1, mode::BGNAXBE), 6);
+        // 5 GHz codes, with modes H3C cannot name snapped to the nearest set.
+        assert_eq!(h3c_mode_field(2, mode::A), 7);
+        assert_eq!(h3c_mode_field(2, mode::AN), 8);
+        assert_eq!(h3c_mode_field(2, mode::N), 8);
+        assert_eq!(h3c_mode_field(2, mode::AC), 10);
+        assert_eq!(h3c_mode_field(2, mode::ANAC), 10);
+        assert_eq!(h3c_mode_field(2, mode::ANACAX), 11);
+        assert_eq!(h3c_mode_field(2, mode::ANACAXBE), 11);
+        // A value from the other band is never sent as that band's code.
+        assert_eq!(h3c_mode_field(1, mode::AC), 11);
+        assert_eq!(h3c_mode_field(2, mode::BG), 8);
     }
 
     #[test]
@@ -960,6 +1164,13 @@ mod tests {
             peer: SocketAddr::from(([192, 168, 5, 8], 5246)),
             declared_radios: &[(0, 1), (1, 1)],
             wlans: &wlans,
+            radios: [
+                H3cRadioHeader::default(),
+                H3cRadioHeader {
+                    radio_id: 2,
+                    ..H3cRadioHeader::default()
+                },
+            ],
             fe28: None,
             fe31: None,
             led: Some(false),
@@ -1011,6 +1222,13 @@ mod tests {
                 peer: SocketAddr::from(([192, 168, 5, 8], 5246)),
                 declared_radios: &[(0, 1), (1, 1)],
                 wlans: &wlans,
+                radios: [
+                    H3cRadioHeader::default(),
+                    H3cRadioHeader {
+                        radio_id: 2,
+                        ..H3cRadioHeader::default()
+                    },
+                ],
                 fe28,
                 fe31,
                 led: None,

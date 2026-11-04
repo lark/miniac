@@ -834,21 +834,77 @@ fn version_triple(v: &[u8]) -> Option<String> {
 
 /// Private radio-record base tags AC100 carries in the Configuration Update
 /// Request that brings a radio up. 0x0404 and 0x0406 have no RFC 5416 meaning
-/// and are TP-Link's own per-radio channel/transmit records; 0x0411 (MAC
-/// Operation) and 0x0416 (Station Event Type) are the RFC 5416 names for the
-/// same numbers (see [`MsgElemType::MAC_OPERATION`] /
-/// [`MsgElemType::STATION_EVENT_TYPE`]).
+/// and are TP-Link's own per-radio channel/MAC-operation records; 0x0411 (Tx
+/// Power) and 0x0416 (WTP Radio Configuration) are the RFC 5416 elements of the
+/// same numbers (see [`MsgElemType::RADIO_TX_POWER`] /
+/// [`MsgElemType::WTP_RADIO_CONFIGURATION`]).
 const RADIO_CFG_CHAN: u16 = 0x0404;
 const RADIO_CFG_TX: u16 = 0x0406;
 
-/// Last byte of the MAC Operation record and second byte of the private 8
-/// payload, which AC100 sends per radio (`0d`/`06` for radio 1, `0f`/`09` for
-/// radio 2).
-fn radio_cfg_variant(radio_id: u8) -> (u8, u8) {
+/// Per-band TX power ceiling in dBm from the AP product database
+/// (`etc/product_info/apdb.json` for AP1300GI: 2.4G 17, 5G 15). The UI/DB value
+/// is a percentage of this ceiling; the wire carries dBm.
+const TX_POWER_MAX_DBM: [u16; 2] = [17, 15];
+
+/// Convert the configured power percentage (0–100) to the dBm value the
+/// 1041 Tx Power element carries, using the band's ceiling.
+pub fn tx_power_dbm(radio_id: u8, percent: u32) -> u16 {
+    let max = TX_POWER_MAX_DBM[usize::from(radio_id == 2)];
+    let p = percent.min(100) as u32;
+    ((p * u32::from(max) + 50) / 100) as u16
+}
+
+/// Default wireless-mode selector per radio, matching the values AC100 sends:
+/// 6 = 11b/g/n on 2.4G, 9 = 11a/n/ac on 5G.
+fn default_mode(radio_id: u8) -> u8 {
     if radio_id == 1 {
-        (0x0d, 0x06)
+        6
     } else {
-        (0x0f, 0x09)
+        9
+    }
+}
+
+/// Wireless-mode byte of the private 8 record, mapped from the normalized
+/// [`crate::vendor::mode`] value. AC100's own UI enumerates the wire codes
+/// (`www/web-static/js/common.*.js`): 0 = 11a, 1 = 11b, 2 = 11g,
+/// 3 = 11n(2.4G), 4 = 11n(5G), 5 = 11b/g, 6 = 11b/g/n, 7 = 11a/n, 8 = 11ac,
+/// 9 = 11a/n/ac, 10 = 11b/g/n/ax, 11 = 11a/n/ac/ax, 12 = 11b/g/n/ax/be,
+/// 13 = 11a/n/ac/ax/be. AUTO keeps the band default AC100 sends (6 / 9), and
+/// a mode the band cannot express falls back to that default too.
+pub fn mode_field(radio_id: u8, mode: u32) -> u8 {
+    use crate::vendor::mode as m;
+    match m::for_band(radio_id, mode) {
+        m::A => 0,
+        m::B => 1,
+        m::G => 2,
+        m::N => {
+            if radio_id == 1 {
+                3
+            } else {
+                4
+            }
+        }
+        m::BG => 5,
+        m::BGN => 6,
+        m::AN => 7,
+        m::AC => 8,
+        m::ANAC => 9,
+        m::BGNAX => 10,
+        m::ANACAX => 11,
+        m::BGNAXBE => 12,
+        m::ANACAXBE => 13,
+        _ => default_mode(radio_id),
+    }
+}
+
+/// Channel-width byte of the private 8 record: 0 = 20 MHz, 1 = 40 MHz,
+/// 2 = 80 MHz (the WTP clamps anything >= 3 to 2). Auto and 160 MHz fall back
+/// to 2, which is also the value AC100 sends by default.
+pub fn channel_width_field(bandwidth_mhz: u32) -> u8 {
+    match bandwidth_mhz {
+        20 => 0,
+        40 => 1,
+        _ => 2,
     }
 }
 
@@ -882,16 +938,31 @@ pub fn radio_admin_state_request(seq: u32, radio_id: u8, admin_state: u8) -> Ctr
 /// reproduced verbatim because the WTP keys its radio bring-up on it. Without
 /// this the radio stays administratively down and the WTP silently drops the
 /// per-radio WLAN/SSID configuration, so the SSID never goes on the air. Only
-/// the leading radio id, the two per-radio variant bytes and `channel` differ
-/// between radios.
+/// the leading radio id, the per-radio power/mode/width fields and `channel`
+/// differ between radios.
 ///
 /// `channel` is the `0x0404` record's channel field (byte 2, `uChannel`); pass
 /// it through [`channel_field`] so ACS (the default) stays AUTO and only a
 /// band configured manual pins a concrete channel. While the field is AUTO the
 /// WTP keeps its background channel scan running and may re-tune; a pinned
 /// channel disables that ("Channel != AUTO"). AC100 sent AUTO on both radios.
-pub fn radio_config_request(seq: u32, radio_id: u8, channel: u8) -> CtrlMsg {
-    let (mac_op_last, priv8_second) = radio_cfg_variant(radio_id);
+///
+/// `power` is the configured percentage (0–100), converted to dBm for the RFC
+/// 1041 Tx Power element. `mode` is the normalized [`crate::vendor::mode`]
+/// value mapped to AC100's selector by [`mode_field`]; `bandwidth_mhz` maps
+/// 20/40/80 MHz to 0/1/2 in the same private 8 record (auto and 160 fall back
+/// to 2).
+pub fn radio_config_request(
+    seq: u32,
+    radio_id: u8,
+    channel: u8,
+    power: u32,
+    mode: u32,
+    bandwidth_mhz: u32,
+) -> CtrlMsg {
+    let power_dbm = tx_power_dbm(radio_id, power);
+    let mode_byte = mode_field(radio_id, mode);
+    let width = channel_width_field(bandwidth_mhz);
     CtrlMsg::new(MsgType::CONFIG_UPDATE_REQ, seq)
         .add_element(BaseElem::RadioAdminState {
             radio_id,
@@ -911,9 +982,18 @@ pub fn radio_config_request(seq: u32, radio_id: u8, channel: u8) -> CtrlMsg {
                 0x00, 0x00, 0x00,
             ],
         )
-        .add_elem(MsgElemType::MAC_OPERATION, &[radio_id, 0x00, 0x00, mac_op_last])
+        // RFC 5416 6.25 Tx Power: radio id, reserved, dBm (big-endian).
         .add_elem(
-            MsgElemType::STATION_EVENT_TYPE,
+            MsgElemType::RADIO_TX_POWER,
+            &[
+                radio_id,
+                0x00,
+                (power_dbm >> 8) as u8,
+                power_dbm as u8,
+            ],
+        )
+        .add_elem(
+            MsgElemType::WTP_RADIO_CONFIGURATION,
             &[
                 radio_id, 0x01, 0x08, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x64, 0x43,
                 0x4e, 0x20, 0x00,
@@ -925,8 +1005,8 @@ pub fn radio_config_request(seq: u32, radio_id: u8, channel: u8) -> CtrlMsg {
                 8,
                 vec![
                     radio_id,
-                    priv8_second,
-                    0x02,
+                    mode_byte,
+                    width,
                     0x01,
                     0x00,
                     0x64,
@@ -953,6 +1033,7 @@ pub fn radio_config_request(seq: u32, radio_id: u8, channel: u8) -> CtrlMsg {
 mod tests {
     use super::*;
     use crate::capwap::MsgElemType;
+    use crate::vendor::mode;
     use crate::vendor::vsp;
 
     /// Element framing as it lands on the wire: `[tag u16][len u16][value]`.
@@ -1273,8 +1354,11 @@ mod tests {
 
     #[test]
     fn radio_config_request_matches_ac100_wire() {
-        for (radio, mac_op_last, priv8_second) in [(1u8, 0x0du8, 0x06u8), (2, 0x0f, 0x09)] {
-            let msg = radio_config_request(2, radio, 0);
+        for (radio, percent, power_dbm, mode, width) in [
+            (1u8, 76u32, 0x0du8, 0x06u8, 2u8),
+            (2, 100, 0x0f, 0x09, 2),
+        ] {
+            let msg = radio_config_request(2, radio, 0, percent, 0, 0);
             assert_eq!(msg.hdr.msg_type, MsgType::CONFIG_UPDATE_REQ);
             let e = elems(&msg);
             assert_eq!(
@@ -1283,8 +1367,8 @@ mod tests {
                     MsgElemType::RADIO_ADMIN_STATE,
                     RADIO_CFG_CHAN,
                     RADIO_CFG_TX,
-                    MsgElemType::MAC_OPERATION,
-                    MsgElemType::STATION_EVENT_TYPE,
+                    MsgElemType::RADIO_TX_POWER,
+                    MsgElemType::WTP_RADIO_CONFIGURATION,
                     MsgElemType::VENDOR_SPECIFIC_PAYLOAD,
                 ]
             );
@@ -1292,7 +1376,8 @@ mod tests {
             assert_eq!(e[0].1, vec![radio, 1]);
             assert_eq!(e[1].1.len(), 19);
             assert_eq!(e[2].1.len(), 16);
-            assert_eq!(e[3].1, vec![radio, 0, 0, mac_op_last]);
+            // Tx Power: radio id, reserved, dBm.
+            assert_eq!(e[3].1, vec![radio, 0, 0, power_dbm]);
             assert_eq!(e[4].1.len(), 16);
             // Private 8 payload inside the VSP, reserved word 0x0008.
             let (_, rsv, tlvs) = vsp::split_value(&e[5].1).unwrap();
@@ -1300,7 +1385,8 @@ mod tests {
             let v = vsp::find(&tlvs, 8).unwrap();
             assert_eq!(v.len(), 20);
             assert_eq!(v[0], radio);
-            assert_eq!(v[1], priv8_second);
+            assert_eq!(v[1], mode);
+            assert_eq!(v[2], width);
         }
     }
 
@@ -1324,7 +1410,8 @@ mod tests {
 
     #[test]
     fn radio_config_request_wire_matches_ac100_seq2() {
-        let wire = crate::vendor::framing::CtrlFrame::Rfc.frame(&radio_config_request(2, 1, 0));
+        let wire =
+            crate::vendor::framing::CtrlFrame::Rfc.frame(&radio_config_request(2, 1, 0, 76, 0, 0));
         // Byte-identical to AC100's Configuration Update Request seq 2: a
         // 16-byte RFC control header then these 111 element bytes.
         assert_eq!(wire.len(), 127);
@@ -1340,12 +1427,55 @@ mod tests {
     }
 
     #[test]
+    fn radio_power_mode_and_width_selectors() {
+        // 100% is the band ceiling from the AP product database: 17/15 dBm.
+        assert_eq!(tx_power_dbm(1, 100), 17);
+        assert_eq!(tx_power_dbm(2, 100), 15);
+        assert_eq!(tx_power_dbm(1, 76), 13);
+        assert_eq!(tx_power_dbm(2, 0), 0);
+        // AUTO keeps the AC100 band defaults (6 / 9); normalized modes map to
+        // AC100's own selector codes.
+        assert_eq!(mode_field(1, mode::AUTO), 6);
+        assert_eq!(mode_field(2, mode::AUTO), 9);
+        assert_eq!(mode_field(1, mode::B), 1);
+        assert_eq!(mode_field(1, mode::G), 2);
+        assert_eq!(mode_field(1, mode::BG), 5);
+        assert_eq!(mode_field(1, mode::N), 3);
+        assert_eq!(mode_field(2, mode::N), 4);
+        assert_eq!(mode_field(1, mode::BGN), 6);
+        assert_eq!(mode_field(2, mode::A), 0);
+        assert_eq!(mode_field(2, mode::AN), 7);
+        assert_eq!(mode_field(2, mode::AC), 8);
+        assert_eq!(mode_field(2, mode::ANAC), 9);
+        assert_eq!(mode_field(1, mode::BGNAX), 10);
+        assert_eq!(mode_field(2, mode::ANACAX), 11);
+        assert_eq!(mode_field(1, mode::BGNAXBE), 12);
+        assert_eq!(mode_field(2, mode::ANACAXBE), 13);
+        // A mode of the other band never reaches the wire; it uses the default.
+        assert_eq!(mode_field(1, mode::AC), 6);
+        assert_eq!(mode_field(2, mode::B), 9);
+        // 20/40/80 MHz -> 0/1/2; auto and 160 fall back to 2.
+        assert_eq!(channel_width_field(20), 0);
+        assert_eq!(channel_width_field(40), 1);
+        assert_eq!(channel_width_field(80), 2);
+        assert_eq!(channel_width_field(0), 2);
+        assert_eq!(channel_width_field(160), 2);
+    }
+
+    #[test]
     fn channel_field_defaults_to_acs_and_pins_only_manual() {
         // 0 keeps ACS on both bands; a non-zero channel number lands in byte 2
         // of the 0x0404 record.
         assert_eq!(channel_field(0), CHANNEL_ACS);
         assert_eq!(channel_field(11), 11);
-        let e = elems(&radio_config_request(2, 1, channel_field(11)));
+        let e = elems(&radio_config_request(
+            2,
+            1,
+            channel_field(11),
+            100,
+            0,
+            0,
+        ));
         assert_eq!(e[1].1[2], 11);
     }
 

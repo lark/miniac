@@ -4,6 +4,7 @@
 
 pub mod framing;
 pub mod h3c;
+pub mod mode;
 pub mod profile;
 pub mod tplink;
 pub mod vsp;
