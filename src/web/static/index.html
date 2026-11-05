@@ -6,26 +6,29 @@
 <title data-i18n="doc.title">miniac AC — 管理面</title>
 <style>
   :root{--bg:#f6f8fb;--panel:#ffffff;--panel2:#ffffff;--line:#e2e8f0;--text:#1f2937;--muted:#64748b;
-    --accent:#0284c7;--ok:#16a34a;--warn:#d97706;--bad:#dc2626;--sidebar:#ffffff;--sidebar-hover:#f1f5f9;}
+    /* --accent-fill is the palest tone for solid fills (buttons, chips,
+       checkboxes); --brand-blue is the wordmark's medium sky blue. */
+    --accent:#38bdf8;--accent-fill:#e0f2fe;--accent-text:#0284c7;--accent-ink:#075985;--brand-blue:#0ea5e9;
+    --ok:#16a34a;--warn:#d97706;--bad:#dc2626;--sidebar:#ffffff;--sidebar-hover:#f1f5f9;}
   *{box-sizing:border-box;}
   body{margin:0;font-family:ui-sans-serif,system-ui,-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
        background:var(--bg);color:var(--text);font-size:14px;}
   .layout{display:grid;grid-template-columns:238px 1fr;min-height:100vh;}
   aside{background:var(--sidebar);border-right:1px solid var(--line);padding:16px 12px;position:sticky;top:0;height:100vh;overflow:auto;}
   .brand{display:flex;align-items:center;gap:10px;padding:6px 10px 16px;font-size:17px;font-weight:700;letter-spacing:.02em;}
-  .brand .dot{width:10px;height:10px;border-radius:3px;background:var(--accent);box-shadow:0 0 6px rgba(2,132,199,.5);}
-  .brand .ac{color:var(--accent);}
+  .brand .dot{width:10px;height:10px;border-radius:3px;background:var(--brand-blue);box-shadow:0 0 6px rgba(14,165,233,.45);}
+  .brand .ac{color:var(--brand-blue);}
   .group{margin:14px 8px 6px;font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:#64748b;}
   nav a{display:flex;align-items:center;gap:10px;padding:9px 12px;border-radius:8px;color:var(--muted);margin:2px 0;cursor:pointer;}
   nav a svg{width:17px;height:17px;flex:0 0 17px;stroke:currentColor;fill:none;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round;}
   nav a:hover{background:var(--sidebar-hover);color:var(--text);}
-  nav a.active{background:linear-gradient(90deg,rgba(2,132,199,.12),rgba(2,132,199,.02));color:var(--text);box-shadow:inset 2px 0 0 var(--accent);}
+  nav a.active{background:linear-gradient(90deg,rgba(56,189,248,.14),rgba(56,189,248,.03));color:var(--text);box-shadow:inset 2px 0 0 var(--accent);}
   .foot{position:sticky;bottom:0;color:#94a3b8;font-size:11px;padding:14px 10px 4px;}
   .top{display:flex;align-items:center;justify-content:space-between;padding:16px 26px;border-bottom:1px solid var(--line);background:var(--panel2);position:sticky;top:0;z-index:5;}
   .top h1{font-size:18px;margin:0;font-weight:650;}
   .top .right{display:flex;align-items:center;gap:16px;color:var(--muted);font-size:13px;}
   .live{display:inline-flex;align-items:center;gap:6px;} .live i{width:8px;height:8px;border-radius:50%;background:var(--ok);box-shadow:0 0 6px rgba(22,163,74,.4);display:inline-block;}
-  .btn{background:var(--accent);color:#fff;border:none;border-radius:7px;padding:7px 13px;font-weight:650;font-size:13px;cursor:pointer;}
+  .btn{background:var(--accent-fill);color:var(--accent-ink);border:none;border-radius:7px;padding:7px 13px;font-weight:650;font-size:13px;cursor:pointer;}
   .btn.ghost{background:transparent;border:1px solid var(--line);color:var(--text);font-weight:500;}
   .btn.ok{background:var(--ok);color:#fff;} .btn.bad{background:var(--bad);color:#fff;}
   .btn.sm{padding:4px 9px;font-size:12px;} .btn:hover{filter:brightness(1.1);} .btn:disabled{opacity:.45;cursor:not-allowed;filter:none;}
@@ -50,7 +53,7 @@
   /* Hashes keep the whole value in the DOM and only clip the view, so hovering
      shows the full MD5 and clicking copies it. */
   .hash{display:inline-block;max-width:13ch;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;vertical-align:bottom;cursor:pointer;}
-  tbody tr:hover{background:rgba(2,132,199,.05);}
+  tbody tr:hover{background:rgba(56,189,248,.09);}
   .muted{color:var(--muted);}
   .ledtog{display:inline-flex;align-items:center;gap:6px;}
   .ledtog i{width:8px;height:8px;border-radius:50%;background:#cbd5e1;display:inline-block;}
@@ -69,14 +72,14 @@
   .legend b{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:5px;}
   .chips{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:4px;}
   .chip{border:1px solid var(--line);background:transparent;color:var(--muted);border-radius:999px;padding:5px 12px;font-size:12.5px;cursor:pointer;}
-  .chip.on{background:var(--accent);color:#fff;border-color:var(--accent);font-weight:650;}
+  .chip.on{background:var(--accent-fill);color:var(--accent-ink);border-color:var(--accent-fill);font-weight:650;}
   .chip.all{border-style:dashed;}
   .feed{list-style:none;margin:0;padding:0;max-height:440px;overflow:auto;}
   .feed li{padding:7px 2px;border-bottom:1px solid var(--line);font-size:13px;display:flex;gap:10px;align-items:baseline;}
   .feed li:last-child{border-bottom:none;}
   .feed .ts{color:var(--muted);font-family:ui-monospace,monospace;font-size:12px;min-width:64px;}
   .feed .cat{font-size:11px;padding:1px 7px;border-radius:6px;min-width:64px;text-align:center;}
-  .cat-system{background:#e2e8f0;color:#475569;}.cat-device{background:rgba(2,132,199,.12);color:var(--accent);}
+  .cat-system{background:#e2e8f0;color:#475569;}.cat-device{background:rgba(56,189,248,.16);color:var(--accent-text);}
   .cat-station{background:rgba(22,163,74,.12);color:var(--ok);}.cat-radio{background:rgba(147,51,234,.12);color:#7c3aed;}
   .cat-security{background:rgba(217,119,6,.12);color:var(--warn);}.cat-firmware{background:rgba(234,88,12,.12);color:#ea580c;}
   .cat-roaming{background:rgba(219,39,119,.12);color:#db2777;}.cat-admin{background:rgba(100,116,139,.12);color:var(--muted);}
@@ -87,6 +90,13 @@
   .toolbar{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-bottom:14px;}
   input,select{background:#fff;color:var(--text);border:1px solid var(--line);border-radius:7px;padding:6px 9px;font-size:13px;}
   input::placeholder{color:#64748b;}
+  /* Native checkboxes draw a white tick, which a light fill cannot carry, so
+     they are drawn here: light sky box with a dark ink check. */
+  input[type=checkbox]{appearance:none;-webkit-appearance:none;position:relative;width:16px;height:16px;
+    border:1px solid #94a3b8;border-radius:4px;background:#fff;cursor:pointer;vertical-align:middle;padding:0;}
+  input[type=checkbox]:checked{background:var(--accent-fill);border-color:var(--accent);}
+  input[type=checkbox]:checked::after{content:"";position:absolute;left:4px;top:1px;width:4px;height:8px;
+    border:solid var(--accent-ink);border-width:0 2px 2px 0;transform:rotate(45deg);}
   .note{font-size:12px;color:var(--muted);margin-top:10px;line-height:1.7;}
   .kv{display:grid;grid-template-columns:110px 1fr;gap:8px 10px;font-size:13px;}
   .kv div:nth-child(odd){color:var(--muted);}
@@ -575,7 +585,10 @@ function route(){ show(location.hash.replace(/^#\//,'')||'status'); }
 document.querySelectorAll('nav a').forEach(a=>a.addEventListener('click',()=>{location.hash='#/'+a.dataset.nav;}));
 window.addEventListener('hashchange',route);
 
-const REFRESHABLE=['status','logs','clients','wireless','devices','devmgmt','firmware'];
+/* Only pages that show live runtime state get the refresh bar; config pages
+   (wireless, firmware, system) would reset unsaved edits or never change on
+   their own, so they render once on entry instead. */
+const REFRESHABLE=['status','logs','clients','devices','devmgmt'];
 const iv={},lastMs={};
 document.querySelectorAll('main > .page').forEach(sec=>{
   const id=sec.id.replace(/^p-/,'');
@@ -663,11 +676,13 @@ function drawLogs(){
   const rows=DB.events.filter(e=>selEvents.has(e.category)).slice(-300).reverse();
   $('ev-feed').innerHTML=rows.length?rows.map(feedItem).join(''):`<li class="muted" style="display:block">${t('empty.logsFiltered')}</li>`;
 }
+let logsDrawn=false;
 async function renderLogs(){
   const before=DB.events.length;
   await loadEvents();
-  // no new events: leave the DOM untouched
-  if(DB.events.length===before) return;
+  // no new events and the feed already has content: leave the DOM untouched
+  if(logsDrawn&&DB.events.length===before) return;
+  logsDrawn=true;
   drawLogs();
 }
 
