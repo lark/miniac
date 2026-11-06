@@ -72,13 +72,6 @@ pub fn for_band(band: u8, mode: u32) -> u32 {
     }
 }
 
-/// Bit `N` set means mode `N` can run on `band`.
-pub fn band_mask(band: u8) -> u16 {
-    (AUTO..=ANACAXBE)
-        .filter(|&m| supports_band(band, m))
-        .fold(0, |acc, m| acc | (1 << m))
-}
-
 /// Radio standards a catalogued product supports, as `(11ac, 11ax)`.
 /// Uncatalogued products answer `(true, true)`, so the UI only greys a value
 /// when the catalogue positively knows the radio cannot express it.
@@ -94,9 +87,9 @@ fn product_std(vendor: &str, model: &str) -> (bool, bool) {
     }
 }
 
-/// Per-band capabilities of one product, as a [`band_mask`]-shaped bitmask.
-/// Modes above the product's standard (11ax on a Wi-Fi 5 AP, 11ac on a
-/// 2.4 GHz-only part) stay clear so the web UI can grey them out.
+/// Per-band capabilities of one product, as a bitmask where bit `N` set means
+/// mode `N` is offered. Modes above the product's standard (11ax on a Wi-Fi 5
+/// AP, 11ac on a 2.4 GHz-only part) stay clear so the web UI can grey them out.
 pub fn device_mask(vendor: &str, model: &str, band: u8) -> u16 {
     let (ac, ax) = product_std(vendor, model);
     let mut mask = 0u16;
@@ -144,12 +137,6 @@ mod tests {
     }
 
     #[test]
-    fn band_mask_lists_the_band_modes() {
-        assert_eq!(band_mask(1), 0b1_0100_0111_1101);
-        assert_eq!(band_mask(2), 0b10_1011_1010_0011);
-    }
-
-    #[test]
     fn device_mask_greys_out_standards_the_product_lacks() {
         // Wi-Fi 5 AP: 11ax modes are not offered on either band.
         let m24 = device_mask("tp-link", "TL-AP1300GI-PoE", 1);
@@ -162,7 +149,7 @@ mod tests {
         let ax5 = device_mask("h3c", "SWBA1B0", 2);
         assert!(has(ax5, ANACAX) && has(ax5, ANACAXBE));
         // Uncatalogued products are not greyed beyond their band's limits.
-        assert_eq!(device_mask("rfc", "unknown", 1), band_mask(1));
-        assert_eq!(device_mask("rfc", "unknown", 2), band_mask(2));
+        assert_eq!(device_mask("rfc", "unknown", 1), 0b1_0100_0111_1101);
+        assert_eq!(device_mask("rfc", "unknown", 2), 0b10_1011_1010_0011);
     }
 }

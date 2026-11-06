@@ -14,12 +14,16 @@
 //!   -w [addr:]port   HTTP web UI (default 127.0.0.1:8246)
 //!   -W [addr:]port   HTTPS web UI (default 127.0.0.1:8443 when enabled)
 //!   -c <file>        INI file (default ./miniac.ini when present)
+//!   -d <dir>         run directory: every relative runtime path (the INI file,
+//!                    the control dump, the database, firmware images, certs)
+//!                    is anchored here (default: the current directory)
 //!   -D <file>        plaintext CAPWAP control dump
 //!
 //! INI:
 //!   [capwap] allow, bind, iface
 //!   [stage1] enabled, net, pool_start, pool_end, gateway
-//!   [web]    http_addr, http_port, https_addr, https_port, https_cert, https_key
+//!   [web]    http_addr, http_port, https_addr, https_port, https_cert,
+//!            https_key, auth_user, auth_password, session_ttl_minutes
 //!   [h3c]    ofdma, mumimo, band_navigation
 
 use std::{
@@ -242,28 +246,46 @@ impl std::fmt::Display for ListenAddr {
     }
 }
 
+/// Management-plane credentials. Authentication stays off when both fields are
+/// absent.
+#[derive(Debug, Clone)]
+pub struct WebAuth {
+    pub user: String,
+    pub password: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct WebSettings {
     pub http: ListenAddr,
     pub https: Option<ListenAddr>,
     pub https_cert: Option<PathBuf>,
     pub https_key: Option<PathBuf>,
+    pub auth: Option<WebAuth>,
+    /// Absolute lifetime of a web session, in minutes.
+    pub session_ttl_minutes: u64,
 }
 
 impl WebSettings {
-    /// Security warnings raised at startup for non-default exposure. The web
-    /// plane has no authentication, so anything beyond loopback is exposed.
+    /// Security warnings raised at startup for non-default exposure.
     pub fn warnings(&self) -> Vec<String> {
         let mut out = Vec::new();
         if !self.http.is_loopback() {
-            out.push(format!(
-                "web UI on http://{} is reachable beyond loopback and has no authentication; \
-                 keep it on 127.0.0.1 or firewall the port",
-                self.http
-            ));
+            if self.auth.is_some() {
+                out.push(format!(
+                    "web UI on http://{} sends session cookies and login credentials in plaintext; \
+                     enable HTTPS or keep it on 127.0.0.1",
+                    self.http
+                ));
+            } else {
+                out.push(format!(
+                    "web UI on http://{} is reachable beyond loopback and has no authentication; \
+                     keep it on 127.0.0.1 or firewall the port",
+                    self.http
+                ));
+            }
         }
         if let Some(https) = &self.https {
-            if !https.is_loopback() {
+            if !https.is_loopback() && self.auth.is_none() {
                 out.push(format!(
                     "web UI on https://{} is reachable beyond loopback and has no authentication; \
                      keep it on 127.0.0.1 or firewall the port",
@@ -294,6 +316,7 @@ struct Cli {
     iface: Option<String>,
     http: Option<String>,
     https: Option<String>,
+    dir: Option<PathBuf>,
     ini: Option<PathBuf>,
     dump_file: Option<PathBuf>,
 }
@@ -321,6 +344,12 @@ fn parse_cli() -> Result<Cli> {
             }
             "-w" => cli.http = Some(args.next().ok_or_else(|| anyhow!("-w requires a value"))?),
             "-W" => cli.https = Some(args.next().ok_or_else(|| anyhow!("-W requires a value"))?),
+            "-d" => {
+                cli.dir = Some(PathBuf::from(
+                    args.next()
+                        .ok_or_else(|| anyhow!("-d requires a directory"))?,
+                ))
+            }
             "-c" => {
                 cli.ini = Some(PathBuf::from(
                     args.next().ok_or_else(|| anyhow!("-c requires a file"))?,
@@ -358,6 +387,21 @@ fn split_list(value: &str) -> Vec<String> {
 /// Load settings: CLI over the optional INI file over defaults.
 pub fn load() -> Result<Settings> {
     let cli = parse_cli()?;
+    // Enter the run directory before touching any other path, so every relative
+    // runtime path (the INI file, the control dump, the database, firmware
+    // images, certificates) is resolved against it.
+    if let Some(dir) = &cli.dir {
+        fs::create_dir_all(dir)
+            .with_context(|| format!("create run directory {}", dir.display()))?;
+        std::env::set_current_dir(dir)
+            .with_context(|| format!("enter run directory {}", dir.display()))?;
+        info!(
+            "[*] settings: run directory {}",
+            std::env::current_dir()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| dir.display().to_string())
+        );
+    }
     let ini_path = match &cli.ini {
         Some(path) => Some(path.clone()),
         None => {
@@ -480,11 +524,32 @@ fn merge(cli: Cli, ini: Option<Ini>) -> Result<Settings> {
     };
     let https_cert = get("web", "https_cert").map(PathBuf::from);
     let https_key = get("web", "https_key").map(PathBuf::from);
+    let auth_user = get("web", "auth_user").filter(|v| !v.is_empty());
+    let auth_password = get("web", "auth_password").filter(|v| !v.is_empty());
+    let auth = match (auth_user, auth_password) {
+        (Some(user), Some(password)) => Some(WebAuth {
+            user: user.to_string(),
+            password: password.to_string(),
+        }),
+        (None, None) => None,
+        _ => bail!("[web] auth_user and auth_password must be configured together"),
+    };
+    let session_ttl_minutes = match get("web", "session_ttl_minutes") {
+        Some(v) => v
+            .parse::<u64>()
+            .map_err(|_| anyhow!("invalid [web] session_ttl_minutes {v}"))?,
+        None => 480,
+    };
+    if session_ttl_minutes == 0 {
+        bail!("[web] session_ttl_minutes must be greater than zero");
+    }
     let web = WebSettings {
         http,
         https,
         https_cert,
         https_key,
+        auth,
+        session_ttl_minutes,
     };
 
     let h3c = H3cSettings {
@@ -818,6 +883,8 @@ ofdma = 7
             https: None,
             https_cert: None,
             https_key: None,
+            auth: None,
+            session_ttl_minutes: 480,
         };
         assert!(safe.warnings().is_empty());
         let risky = WebSettings {
@@ -828,7 +895,58 @@ ofdma = 7
             https: None,
             https_cert: None,
             https_key: None,
+            auth: None,
+            session_ttl_minutes: 480,
         };
         assert_eq!(risky.warnings().len(), 1);
+    }
+
+    #[test]
+    fn web_auth_requires_both_fields() {
+        let ini = parse_ini("[web]\nauth_user = admin\n");
+        assert!(merge(Cli::default(), Some(ini)).is_err());
+
+        let ini = parse_ini("[web]\nauth_user = admin\nauth_password = s3cret\n");
+        let settings = merge(Cli::default(), Some(ini)).unwrap();
+        let auth = settings.web.auth.unwrap();
+        assert_eq!(auth.user, "admin");
+        assert_eq!(auth.password, "s3cret");
+        assert_eq!(settings.web.session_ttl_minutes, 480);
+
+        let ini = parse_ini(
+            "[web]\nauth_user = admin\nauth_password = s3cret\nsession_ttl_minutes = 15\n",
+        );
+        let settings = merge(Cli::default(), Some(ini)).unwrap();
+        assert_eq!(settings.web.session_ttl_minutes, 15);
+
+        let ini = parse_ini("[web]\nsession_ttl_minutes = 0\n");
+        assert!(merge(Cli::default(), Some(ini)).is_err());
+    }
+
+    #[test]
+    fn auth_suppresses_no_auth_warning_but_flags_plaintext() {
+        let mut settings = WebSettings {
+            http: ListenAddr {
+                addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                port: 8246,
+            },
+            https: None,
+            https_cert: None,
+            https_key: None,
+            auth: Some(WebAuth {
+                user: "admin".into(),
+                password: "s3cret".into(),
+            }),
+            session_ttl_minutes: 480,
+        };
+        let warnings = settings.warnings();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("plaintext"));
+
+        settings.http = ListenAddr {
+            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 8246,
+        };
+        assert!(settings.warnings().is_empty());
     }
 }

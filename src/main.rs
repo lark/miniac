@@ -131,7 +131,7 @@ async fn main() -> Result<()> {
     );
 
     // One DTLS identity per vendor profile: the detected device profile picks
-    // the certificate directory (and whether the client certificate is pinned).
+    // the certificate directory (vendor override or the default identity set).
     let dtls_configs: Arc<
         HashMap<vendor::profile::VendorProfile, Arc<rtc_dtls::config::HandshakeConfig>>,
     > = {
@@ -815,8 +815,6 @@ async fn handle_session(
     // UI-issued command awaiting its WTP response; a firmware-driven reset is
     // tracked separately by `fw_upgrade`/`fw_record_id`.
     let mut pending_cmd: Option<wtpcmd::WtpCmd> = None;
-    // WLANs the WTP reports already holding (TP-Link private 30).
-    let mut wtp_saved_wlans: Option<Vec<vendor::tplink::SavedWlan>> = None;
     // H3C Run-state upgrade: the Reset Request is deferred and repeated (see
     // RESET_DELAY / RESET_RETRY); a successful reset ends the session.
     let mut reset_due: Option<Instant> = None;
@@ -1213,7 +1211,7 @@ async fn handle_session(
                             // TP-Link reports the WLANs it already holds (private
                             // 30) here; only TP-Link sends it.
                             if profile == vendor::profile::VendorProfile::TpLink {
-                                wtp_saved_wlans = elems
+                                let wtp_saved_wlans = elems
                                     .get(&MsgElemType::VENDOR_SPECIFIC_PAYLOAD)
                                     .into_iter()
                                     .flatten()
@@ -1661,10 +1659,6 @@ async fn handle_session(
                                                 radio_id = rw.radio_id;
                                                 ssid = Some(rw.ssid.clone());
                                             }
-                                            let assoc_at = std::time::SystemTime::now()
-                                                .duration_since(std::time::UNIX_EPOCH)
-                                                .map(|d| d.as_secs())
-                                                .unwrap_or(0);
                                             let st = stations.upsert(
                                                 ctx.mac.unwrap_or([0; 6]),
                                                 mac,
@@ -1685,7 +1679,6 @@ async fn handle_session(
                                                         rssi: None,
                                                         ip: None,
                                                         state: "associated".into(),
-                                                        associated_at: assoc_at,
                                                     });
                                                     logx::station(format!(
                                                         "station {} added on {} (radio {}, wlan {})",
@@ -2321,18 +2314,30 @@ async fn handle_session(
     }
 }
 
+/// Directory with pre-generated, redistributable identities shared by all vendors.
+const DEFAULT_CERT_DIR: &str = "certs/default";
+
+/// Resolves the DTLS identity for a profile: a vendor override under
+/// `certs/<vendor>/server.pem` first, then the shared default identity.
+fn dtls_identity_path(prof: vendor::profile::VendorProfile) -> std::path::PathBuf {
+    let vendor = prof.cert_dir().join("server.pem");
+    if vendor.exists() {
+        return vendor;
+    }
+    std::path::Path::new(DEFAULT_CERT_DIR).join("server.pem")
+}
+
 /// Builds the DTLS handshake configuration.
 ///
-/// When the profile's certificate directory (`certs/h3c`, or `certs/tplink` for
-/// TP-Link) holds the CAPWAP identity (`server.pem` + `root.pem`), the server
-/// presents that RSA certificate. H3C also requires and pins the client chain
-/// against `root.pem`, ignoring validity periods; the RFC / TP-Link forms keep
-/// server-only authentication. Otherwise a self-signed Ed25519 certificate is
-/// used and no client certificate is requested.
+/// The server identity is resolved as vendor override (`certs/<vendor>/server.pem`),
+/// then the shared `certs/default/server.pem`. Every profile
+/// uses server-only authentication: neither the tested TP-Link nor H3C WTPs verify the
+/// AC certificate, and none require the AC to ask for a client certificate. If no
+/// identity exists at all, a self-signed Ed25519 certificate is used.
 fn generate_dtls_config(
     prof: vendor::profile::VendorProfile,
 ) -> Result<Arc<rtc_dtls::config::HandshakeConfig>> {
-    use rtc_dtls::config::{ClientAuthType, ConfigBuilder};
+    use rtc_dtls::config::ConfigBuilder;
     use rtc_dtls::crypto::Certificate;
     use rtc_dtls::crypto_provider;
     use rtc_dtls::signature_hash_algorithm::SignatureScheme;
@@ -2340,33 +2345,30 @@ fn generate_dtls_config(
     let provider =
         crypto_provider::default_provider().map_err(|e| anyhow!("crypto provider: {e}"))?;
 
-    let cert_dir = prof.cert_dir();
-    if cert_dir.exists() {
-        let identity = dtls_local::load_identity(cert_dir)?;
+    let identity_path = dtls_identity_path(prof);
+    if identity_path.exists() {
+        let identity = dtls_local::load_identity_file(&identity_path)?;
         let cert = Certificate::from_signing_key(identity.certificate_chain, identity.signing_key);
-        let mut builder = ConfigBuilder::default()
+        let config = ConfigBuilder::default()
             .with_crypto_provider(provider)
             .with_certificates(vec![cert])
             .with_cipher_suites(vec![
                 rtc_dtls::cipher_suite::CipherSuiteId::Tls_Rsa_With_Aes_128_Cbc_Sha,
+                rtc_dtls::cipher_suite::CipherSuiteId::Tls_Rsa_With_Aes_256_Cbc_Sha,
             ])
             .with_signature_schemes(vec![
                 SignatureScheme::Pkcs1WithSha256,
                 SignatureScheme::Pkcs1WithSha1,
-            ]);
-        if prof.requires_client_cert() {
-            let root_der = dtls_local::load_root_cert_der(cert_dir)?;
-            builder = builder
-                .with_client_auth(ClientAuthType::RequireAnyClientCert)
-                .with_verify_peer_certificate(Some(dtls_local::verify_client_chain_callback(
-                    root_der,
-                )));
-        }
-        let config = builder
+            ])
             .with_insecure_hashes(true)
             .with_insecure_verification(true)
             .build(false, None)
             .map_err(|e| anyhow!("DTLS config: {e}"))?;
+        info!(
+            "DTLS identity for {}: {}",
+            prof.vendor_name(),
+            identity_path.display()
+        );
         return Ok(Arc::new(config));
     }
 
@@ -2381,7 +2383,7 @@ fn generate_dtls_config(
     warn!(
         "DTLS identity {} not found (cwd {}); falling back to a self-signed Ed25519 key, \
          which cannot negotiate with WTPs offering only static-RSA CBC suites",
-        cert_dir.display(),
+        identity_path.display(),
         std::env::current_dir()
             .map(|p| p.display().to_string())
             .unwrap_or_default()

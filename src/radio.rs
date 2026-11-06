@@ -258,7 +258,7 @@ impl RadioStore {
                 mac: r
                     .get::<_, Vec<u8>>(0)?
                     .try_into()
-                    .map_err(|e: Vec<u8>| rusqlite::Error::InvalidColumnIndex(0))?,
+                    .map_err(|_| rusqlite::Error::InvalidColumnIndex(0))?,
                 radio_id: r.get::<_, i64>(1)? as u8,
                 band: r.get(2)?,
                 admin_state: r.get::<_, i64>(3)? as u8,
@@ -438,7 +438,7 @@ impl RadioStore {
                 mac: r
                     .get::<_, Vec<u8>>(0)?
                     .try_into()
-                    .map_err(|e: Vec<u8>| rusqlite::Error::InvalidColumnIndex(0))?,
+                    .map_err(|_| rusqlite::Error::InvalidColumnIndex(0))?,
                 radio_id: r.get::<_, i64>(1)? as u8,
                 band: r.get(2)?,
                 admin_state: r.get::<_, i64>(3)? as u8,
@@ -460,7 +460,7 @@ fn row_wlan(r: &rusqlite::Row) -> rusqlite::Result<RadioWlan> {
     Ok(RadioWlan {
         mac: mac
             .try_into()
-            .map_err(|e: Vec<u8>| rusqlite::Error::InvalidColumnIndex(0))?,
+            .map_err(|_| rusqlite::Error::InvalidColumnIndex(0))?,
         radio_id: r.get::<_, i64>(1)? as u8,
         wlan_id: r.get::<_, i64>(2)? as u8,
         ssid: r.get(3)?,

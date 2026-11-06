@@ -333,6 +333,7 @@ const I18N={
   'nav.g.overview':'概览','nav.g.wireless':'无线','nav.g.devices':'设备','nav.g.system':'系统',
   'nav.status':'状态','nav.logs':'日志','nav.clients':'客户端','nav.wireless':'无线设置',
   'nav.devices':'设备状态','nav.devmgmt':'设备管理','nav.firmware':'固件存储','nav.system':'系统设置',
+  'nav.logout':'退出登录',
   'stat.aps':'AP 总数','stat.run':'已确认','stat.pend':'待确认','stat.sta':'客户端','stat.fw':'固件镜像',
   'card.apdist':'AP 状态分布','card.recentlog':'最近日志','card.radiooverview':'射频概览',
   'th.ap':'AP','th.band':'Band','th.channel':'信道','th.power':'功率','th.clients':'客户端','th.state':'状态',
@@ -415,6 +416,7 @@ const I18N={
   'nav.g.overview':'Overview','nav.g.wireless':'Wireless','nav.g.devices':'Devices','nav.g.system':'System',
   'nav.status':'Status','nav.logs':'Logs','nav.clients':'Clients','nav.wireless':'Wireless',
   'nav.devices':'Devices','nav.devmgmt':'Device Mgmt','nav.firmware':'Firmware','nav.system':'System',
+  'nav.logout':'Sign out',
   'stat.aps':'Total APs','stat.run':'Approved','stat.pend':'Pending','stat.sta':'Clients','stat.fw':'Firmware Images',
   'card.apdist':'AP State Distribution','card.recentlog':'Recent Logs','card.radiooverview':'Radio Overview',
   'th.ap':'AP','th.band':'Band','th.channel':'Channel','th.power':'Power','th.clients':'Clients','th.state':'State',
@@ -512,6 +514,7 @@ const fmtClock=(u)=>u?new Date(u*1000).toLocaleTimeString(LOC,{hour12:false}):'�
 
 async function api(url,opt){
   const r=await fetch(url,opt);
+  if(r.status===401){ location.href='/login'; throw new Error('authentication required'); }
   if(!r.ok) throw new Error(url+' → '+r.status+' '+(await r.text().catch(()=>'')));
   const t=await r.text(); return t?JSON.parse(t):null;
 }
@@ -529,12 +532,13 @@ const I={
  manage:'<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9l2.1 2.1M17 17l2.1 2.1M19.1 4.9L17 7M7 17l-2.1 2.1"/></svg>',
  fw:'<svg viewBox="0 0 24 24"><path d="M12 3v12"/><path d="M7 10l5 5 5-5"/><path d="M5 21h14"/></svg>',
  sys:'<svg viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16"/><circle cx="9" cy="6" r="2" fill="var(--sidebar)"/><circle cx="15" cy="12" r="2" fill="var(--sidebar)"/><circle cx="8" cy="18" r="2" fill="var(--sidebar)"/></svg>',
+ logout:'<svg viewBox="0 0 24 24"><path d="M10 4H5v16h5"/><path d="M14 8l4 4-4 4"/><path d="M18 12H9"/></svg>',
 };
 const NAV=[
  {g:'nav.g.overview',items:[{id:'status',k:'nav.status',i:'status'},{id:'logs',k:'nav.logs',i:'logs'}]},
  {g:'nav.g.wireless',items:[{id:'clients',k:'nav.clients',i:'clients'},{id:'wireless',k:'nav.wireless',i:'wifi'}]},
  {g:'nav.g.devices',items:[{id:'devices',k:'nav.devices',i:'devices'},{id:'devmgmt',k:'nav.devmgmt',i:'manage'},{id:'firmware',k:'nav.firmware',i:'fw'}]},
- {g:'nav.g.system',items:[{id:'system',k:'nav.system',i:'sys'}]},
+ {g:'nav.g.system',items:[{id:'system',k:'nav.system',i:'sys'},{id:'logout',k:'nav.logout',i:'logout'}]},
 ];
 const TITLES=Object.fromEntries(NAV.flatMap(g=>g.items.map(it=>[it.id,it.k])));
 $('nav').innerHTML=NAV.map(g=>`<div class="group">${t(g.g)}</div><nav>`+
@@ -581,9 +585,27 @@ function show(page){
   $('side').classList.remove('open');
   refresh(page,true);
 }
-function route(){ show(location.hash.replace(/^#\//,'')||'status'); }
-document.querySelectorAll('nav a').forEach(a=>a.addEventListener('click',()=>{location.hash='#/'+a.dataset.nav;}));
+function doLogout(){
+  const f=document.createElement('form');
+  f.method='post'; f.action='/api/logout';
+  document.body.appendChild(f); f.submit();
+}
+function route(){
+  const page=location.hash.replace(/^#\//,'')||'status';
+  if(page==='logout'){ doLogout(); return; }
+  show(page);
+}
+document.querySelectorAll('nav a').forEach(a=>a.addEventListener('click',()=>{
+  if(a.dataset.nav==='logout'){ doLogout(); return; }
+  location.hash='#/'+a.dataset.nav;
+}));
 window.addEventListener('hashchange',route);
+api('/api/session').then(s=>{
+  if(!s.auth_enabled){
+    const a=document.querySelector('nav a[data-nav="logout"]');
+    if(a) a.remove();
+  }
+}).catch(()=>{});
 
 /* Only pages that show live runtime state get the refresh bar; config pages
    (wireless, firmware, system) would reset unsaved edits or never change on

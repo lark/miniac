@@ -74,23 +74,14 @@ impl VendorProfile {
         }
     }
 
-    /// Directory holding the DTLS server identity (`server.pem`) and the client
-    /// trust anchor (`root.pem`).
+    /// Directory holding an optional vendor DTLS identity (`server.pem`). Missing
+    /// files fall back to the redistributable identities under `certs/default`.
     pub fn cert_dir(self) -> &'static Path {
         match self {
+            VendorProfile::H3c => Path::new("certs/h3c"),
             VendorProfile::TpLink => Path::new("certs/tplink"),
-            _ => Path::new("certs/h3c"),
+            VendorProfile::Rfc => Path::new("certs/rfc"),
         }
-    }
-
-    /// Whether the DTLS server requests and pins the peer certificate.
-    ///
-    /// H3C AX60 presents a client certificate signed by `certs/h3c/root.pem`, so
-    /// it is required and verified. The RFC and TP-Link forms keep server-only
-    /// authentication: requiring a certificate the WTP cannot present would
-    /// abort the handshake.
-    pub fn requires_client_cert(self) -> bool {
-        matches!(self, VendorProfile::H3c)
     }
 
     /// Discovery Response for this profile, framed to wire bytes.
@@ -176,15 +167,14 @@ impl VendorProfile {
         }
     }
 
-    /// Map a vendor-neutral IEEE channel number for a band to this vendor's
-    /// radio-config channel field value. `band` is 1 = 2.4G, 2 = 5G; `channel`
-    /// is 0 for auto (ACS).
+    /// Map a vendor-neutral IEEE channel number to this vendor's radio-config
+    /// channel field value; `channel` is 0 for auto (ACS).
     ///
     /// This is the single place a generic IEEE channel number turns into a
     /// vendor value: TP-Link carries an ACS sentinel (0) on auto and a channel
     /// number on a fixed pin; H3C's 0xfde8 radio header carries the IEEE channel
     /// number verbatim (0 = AUTO), so it passes through unchanged.
-    pub fn radio_channel_field(self, band: u8, channel: u32) -> u32 {
+    pub fn radio_channel_field(self, channel: u32) -> u32 {
         match self {
             VendorProfile::TpLink => u32::from(tplink::channel_field(channel)),
             VendorProfile::H3c | VendorProfile::Rfc => channel,
@@ -431,19 +421,6 @@ mod tests {
             assert_eq!(msg.hdr.msg_type, MsgType::CLEAR_CONFIG_REQ);
             assert!(msg.elems.is_empty());
         }
-        assert_eq!(
-            VendorProfile::H3c.clear_config_request(6).elems.len(),
-            crate::vendor::h3c::clear_config_request(6).elems.len()
-        );
-    }
-
-    #[test]
-    fn dtls_cert_policy_follows_profile() {
-        // Only H3C pins the client certificate.
-        assert!(VendorProfile::H3c.requires_client_cert());
-        assert!(!VendorProfile::TpLink.requires_client_cert());
-        assert_eq!(VendorProfile::TpLink.cert_dir(), Path::new("certs/tplink"));
-        assert_eq!(VendorProfile::H3c.cert_dir(), Path::new("certs/h3c"));
     }
 
     #[test]

@@ -506,7 +506,7 @@ impl WirelessConfigStore {
             power: o.as_ref().and_then(|o| o.power).unwrap_or(g.power),
             mode: o.as_ref().and_then(|o| o.mode).unwrap_or(g.mode),
             bandwidth: o.as_ref().and_then(|o| o.bandwidth).unwrap_or(g.bandwidth),
-            channel: VendorProfile::H3c.radio_channel_field(band, channel),
+            channel: VendorProfile::H3c.radio_channel_field(channel),
         })
     }
 

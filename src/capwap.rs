@@ -2,10 +2,8 @@
 //!
 //! Copyright (c) 2026  Wang Jian
 
-use anyhow::{anyhow, Result};
-use dashmap::DashMap;
+use anyhow::Result;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::net::SocketAddr;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::time::{Duration, Instant};
 
@@ -42,28 +40,9 @@ pub enum WtpState {
     ImageData,
 }
 
-#[allow(unused)]
-#[derive(Debug, Clone)]
-pub struct Wlan {
-    pub wlan_id: u8,
-    pub ssid: String,
-    pub enabled: bool,
-    pub bssid: [u8; 6],
-}
-
-#[allow(unused)]
-#[derive(Debug, Clone)]
-pub struct Radio {
-    pub id: u8,
-    pub radio_type: u8,
-    pub admin_state: u8,
-    pub wlans: Vec<Wlan>,
-}
-
 /// Runtime view of a client station associated to this WTP, maintained in memory
 /// from Station Configuration Request (Add/Delete Station) notifications. The
 /// AC-only/controller info mirrors what is persisted to the `stations` table.
-#[allow(unused)]
 #[derive(Debug, Clone)]
 pub struct RuntimeStation {
     pub mac: [u8; 6],
@@ -73,7 +52,6 @@ pub struct RuntimeStation {
     pub rssi: Option<i32>,
     pub ip: Option<String>,
     pub state: String,
-    pub associated_at: u64,
 }
 
 pub struct LastSentInfo {
@@ -84,11 +62,8 @@ pub struct LastSentInfo {
     pub retry_count: u32,
 }
 
-#[allow(unused)]
 pub struct WtpContext {
-    pub wtp_id: Vec<u8>,
     pub name: String,
-    pub description: String,
 
     /// WTP board MAC learned from WTP Board Data during join (device identifier).
     pub mac: Option<[u8; 6]>,
@@ -97,9 +72,6 @@ pub struct WtpContext {
 
     pub hardware_version: u32,
     pub software_version: u32,
-    pub boot_version: u32,
-
-    pub radios: Vec<Radio>,
 
     /// Runtime client-station table, filled from Add/Delete Station
     /// (STATION_CONFIG_REQ) after the link enters the Run state.
@@ -109,7 +81,6 @@ pub struct WtpContext {
     /// (TP-Link carries it in every Echo Request). The same value is persisted
     /// per device, so the management plane can show and re-apply it.
     pub led_on: Option<bool>,
-    pub session_id: u64,
     pub last_seen: Instant,
     /// The AC's single outstanding Request awaiting its Response.
     pub last_sent: Option<LastSentInfo>,
@@ -144,38 +115,6 @@ pub struct WtpContext {
     pub seq_counter: u32,
 }
 
-#[allow(unused)]
-pub struct AcState {
-    pub wtps: DashMap<SocketAddr, WtpContext>,
-}
-
-impl CtrlHdr {
-    pub const SIZE: usize = 8;
-
-    pub fn decode(buf: &[u8]) -> anyhow::Result<Self> {
-        if buf.len() < Self::SIZE {
-            return Err(anyhow::anyhow!("hdr too short"));
-        }
-        Ok(Self {
-            msg_type: u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]),
-            seq_num: buf[4] as u32,
-            elem_len: u16::from_be_bytes([buf[5], buf[6]]),
-            flags: buf[7],
-        })
-    }
-
-    pub fn encode(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(Self::SIZE);
-        buf.extend_from_slice(&self.msg_type.to_be_bytes());
-        buf.push((self.seq_num & 0xff) as u8);
-        buf.extend_from_slice(&self.elem_len.to_be_bytes());
-        buf.push(self.flags);
-
-        buf
-    }
-}
-
-#[allow(unused)]
 impl CtrlMsg {
     pub fn new(m_type: u32, seq: u32) -> Self {
         Self {
@@ -210,7 +149,7 @@ impl CtrlMsg {
     }
 
     /// Append a single typed base element (see `crate::elements::BaseElem`).
-    pub fn add_element(mut self, elem: crate::elements::BaseElem) -> Self {
+    pub fn add_element(self, elem: crate::elements::BaseElem) -> Self {
         let (tag, val) = elem.encode();
         self.add_elem(tag, &val)
     }
@@ -224,10 +163,6 @@ impl CtrlMsg {
             self = self.add_element(elem);
         }
         self
-    }
-
-    pub fn encode(&self) -> Vec<u8> {
-        crate::vendor::framing::CtrlFrame::Rfc.frame(self)
     }
 
     /// Encode this control message using a vendor framing (adds the 8-byte
@@ -267,42 +202,16 @@ impl CtrlMsg {
     }
 }
 
-#[allow(unused)]
-impl Wlan {
-    pub fn to_payload(&self) -> Vec<u8> {
-        let mut p = Vec::new();
-        p.push(self.wlan_id);
-        p.push(if self.enabled { 1 } else { 0 });
-        p.extend_from_slice(&self.bssid);
-        p.push(self.ssid.len() as u8);
-        p.extend_from_slice(self.ssid.as_bytes());
-        p
-    }
-}
-
-#[allow(unused)]
-impl Radio {
-    pub fn admin_payload(&self) -> Vec<u8> {
-        vec![self.id, self.admin_state]
-    }
-}
-
-#[allow(unused)]
 impl WtpContext {
     pub fn new(peer: std::net::SocketAddr) -> Self {
         Self {
-            wtp_id: Vec::new(),
             name: format!("AP-{}", peer.ip()),
-            description: String::new(),
             mac: None,
             state: WtpState::Join,
             hardware_version: 0,
             software_version: 0,
-            boot_version: 0,
-            radios: Vec::new(),
             stations: Vec::new(),
             led_on: None,
-            session_id: 0,
             last_seen: Instant::now(),
             last_sent: None,
             last_echo_sent: Instant::now(),
@@ -402,8 +311,6 @@ impl WtpContext {
     }
 
     /// Add or refresh a station in the runtime table (Add Station notification).
-    /// `associated_at` is only applied on a first sighting so a refresh does not
-    /// move the association timestamp.
     pub fn add_station(&mut self, st: RuntimeStation) {
         match self.stations.iter_mut().find(|s| s.mac == st.mac) {
             Some(existing) => {
@@ -1275,16 +1182,6 @@ pub static MSG_SCHEMAS: Lazy<HashMap<u32, MsgSchema>> = Lazy::new(|| {
 
 #[allow(unused)]
 impl MsgSchema {
-    fn new(m: &[u16], o: &[u16], multi: &[u16]) -> Self {
-        Self {
-            mandatory: m.iter().cloned().collect(),
-            optional: o.iter().cloned().collect(),
-            allow_multi: multi.iter().cloned().collect(),
-            exclusive_groups: Vec::new(),
-            at_least_one: Vec::new(),
-        }
-    }
-
     pub fn validate(
         &self,
         m_type: u32,
@@ -1643,7 +1540,6 @@ mod tests {
             rssi: None,
             ip: None,
             state: "associated".into(),
-            associated_at: 0,
         };
         ctx.add_station(st.clone());
         assert_eq!(ctx.stations.len(), 1);

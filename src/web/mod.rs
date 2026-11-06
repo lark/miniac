@@ -8,23 +8,26 @@
 //! `serde` DTOs here so no `Serialize` derive leaks into the data layer.
 
 use std::{
+    collections::HashMap,
     ffi::CStr,
     fs,
     net::SocketAddr,
     path::{Path as FsPath, PathBuf},
-    sync::Arc,
-    time::Duration,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 
 use anyhow::{anyhow, bail, Context, Result};
 use axum::{
-    extract::{DefaultBodyLimit, Multipart, Path, Query, State},
-    http::StatusCode,
-    response::{Html, IntoResponse},
+    extract::{DefaultBodyLimit, Extension, Form, Multipart, Path, Query, Request, State},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
+    middleware::{self, Next},
+    response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
     serve::Listener,
     Json, Router,
 };
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::net::{TcpListener, TcpStream};
@@ -141,6 +144,7 @@ impl IntoResponse for ApiError {
 fn router(state: Arc<AppData>) -> Router {
     Router::new()
         .route("/", get(index))
+        .route("/api/session", get(session_info))
         .route("/api/devices", get(list_devices))
         .route("/api/devices/{mac}", get(get_device).put(update_device))
         .route("/api/devices/{mac}/approve", post(approve_device))
@@ -198,6 +202,267 @@ fn router(state: Arc<AppData>) -> Router {
 }
 
 const INDEX_HTML: &str = include_str!("static/index.html");
+
+/// Protect every route with a session cookie when credentials are configured.
+fn with_auth(app: Router, settings: &WebSettings) -> Router {
+    let Some(auth) = &settings.auth else {
+        return app;
+    };
+    let state = Arc::new(AuthState::new(
+        &auth.user,
+        &auth.password,
+        Duration::from_secs(settings.session_ttl_minutes * 60),
+        settings.https.is_some(),
+    ));
+    app.route("/login", get(login_page))
+        .route("/api/login", post(login_submit))
+        .route("/api/logout", post(logout))
+        .layer(Extension(state.clone()))
+        .layer(middleware::from_fn_with_state(state, require_session))
+}
+
+const SESSION_COOKIE: &str = "miniac_session";
+
+/// In-memory session table with absolute expiry. Sessions are intentionally not
+/// persisted: restarting the AC logs every browser out.
+struct AuthState {
+    user: String,
+    password: String,
+    ttl: Duration,
+    secure_cookie: bool,
+    sessions: Mutex<HashMap<String, Instant>>,
+}
+
+impl AuthState {
+    fn new(user: &str, password: &str, ttl: Duration, secure_cookie: bool) -> Self {
+        AuthState {
+            user: user.to_string(),
+            password: password.to_string(),
+            ttl,
+            secure_cookie,
+            sessions: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn check(&self, user: &str, password: &str) -> bool {
+        constant_time_eq(user.as_bytes(), self.user.as_bytes())
+            & constant_time_eq(password.as_bytes(), self.password.as_bytes())
+    }
+
+    /// Mint a token and drop sessions that already expired.
+    fn create(&self) -> String {
+        let mut bytes = [0u8; 32];
+        rand::rng().fill_bytes(&mut bytes);
+        let token = base64_encode(&bytes);
+        let now = Instant::now();
+        let mut sessions = self.sessions.lock().unwrap();
+        sessions.retain(|_, expires| *expires > now);
+        sessions.insert(token.clone(), now + self.ttl);
+        token
+    }
+
+    fn valid(&self, token: &str) -> bool {
+        let now = Instant::now();
+        let mut sessions = self.sessions.lock().unwrap();
+        match sessions.get(token).copied() {
+            Some(expires) if expires > now => true,
+            Some(_) => {
+                sessions.remove(token);
+                false
+            }
+            None => false,
+        }
+    }
+
+    fn remove(&self, token: &str) {
+        self.sessions.lock().unwrap().remove(token);
+    }
+
+    fn cookie(&self, token: &str) -> String {
+        format!(
+            "{SESSION_COOKIE}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={}{}",
+            self.ttl.as_secs(),
+            if self.secure_cookie { "; Secure" } else { "" }
+        )
+    }
+
+    fn clear_cookie(&self) -> String {
+        format!(
+            "{SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0{}",
+            if self.secure_cookie { "; Secure" } else { "" }
+        )
+    }
+}
+
+/// Authenticate the request cookie; public endpoints are the login page and the
+/// login submission itself.
+async fn require_session(
+    State(auth): State<Arc<AuthState>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let path = req.uri().path();
+    if path == "/login" || path == "/api/login" {
+        return next.run(req).await;
+    }
+    let authorized = session_token(req.headers())
+        .map(|token| auth.valid(token))
+        .unwrap_or(false);
+    if authorized {
+        return next.run(req).await;
+    }
+    if path.starts_with("/api/") {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": "authentication required" })),
+        )
+            .into_response()
+    } else {
+        Redirect::to("/login").into_response()
+    }
+}
+
+/// Report whether a login is required so the UI can hide account controls when
+/// authentication is disabled.
+async fn session_info(auth: Option<Extension<Arc<AuthState>>>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "auth_enabled": auth.is_some() }))
+}
+
+fn session_token(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(header::COOKIE)?
+        .to_str()
+        .ok()?
+        .split(';')
+        .filter_map(|part| part.trim().split_once('='))
+        .find(|(name, _)| *name == SESSION_COOKIE)
+        .map(|(_, value)| value)
+}
+
+#[derive(Deserialize)]
+struct LoginForm {
+    username: String,
+    password: String,
+}
+
+const LOGIN_HTML: &str = r#"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>miniac login</title>
+<style>
+:root { color-scheme: dark; }
+* { box-sizing: border-box; }
+body { margin: 0; min-height: 100vh; display: grid; place-items: center;
+       background: #111418; color: #e6e9ef;
+       font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+form { width: min(340px, calc(100vw - 48px)); padding: 28px; border-radius: 12px;
+       background: #1a1f26; border: 1px solid #2a313b;
+       box-shadow: 0 18px 50px rgba(0,0,0,.45); }
+h1 { margin: 0 0 4px; font-size: 20px; }
+p.sub { margin: 0 0 20px; color: #8b95a5; font-size: 13px; }
+label { display: block; margin-bottom: 6px; color: #aab3c0; font-size: 12px; }
+input { width: 100%; margin-bottom: 14px; padding: 10px 12px; border-radius: 8px;
+        border: 1px solid #333c48; background: #11161c; color: inherit; font: inherit; }
+input:focus { outline: 2px solid #3b82f6; outline-offset: 1px; }
+button { width: 100%; padding: 10px 12px; border: 0; border-radius: 8px;
+         background: #2563eb; color: #fff; font: inherit; font-weight: 600; cursor: pointer; }
+button:hover { background: #1d4ed8; }
+p.error { margin: 0 0 14px; padding: 8px 10px; border-radius: 8px;
+          background: #3a1518; color: #fca5a5; font-size: 13px; }
+</style>
+</head>
+<body>
+<form method="post" action="/api/login" autocomplete="on">
+<h1>miniac</h1>
+<p class="sub">CAPWAP access controller</p>
+<!--error-->
+<label for="username">Username</label>
+<input id="username" name="username" autocomplete="username" required autofocus>
+<label for="password">Password</label>
+<input id="password" name="password" type="password" autocomplete="current-password" required>
+<button type="submit">Sign in</button>
+</form>
+</body>
+</html>
+"#;
+
+fn login_html(error: bool) -> String {
+    LOGIN_HTML.replace(
+        "<!--error-->",
+        if error {
+            r#"<p class="error">Invalid username or password.</p>"#
+        } else {
+            ""
+        },
+    )
+}
+
+async fn login_page() -> Html<String> {
+    Html(login_html(false))
+}
+
+async fn login_submit(
+    Extension(auth): Extension<Arc<AuthState>>,
+    Form(form): Form<LoginForm>,
+) -> Response {
+    if !auth.check(&form.username, &form.password) {
+        logx::admin("web login failed".to_string());
+        return (StatusCode::UNAUTHORIZED, Html(login_html(true))).into_response();
+    }
+    let token = auth.create();
+    let mut res = Redirect::to("/").into_response();
+    if let Ok(value) = HeaderValue::from_str(&auth.cookie(&token)) {
+        res.headers_mut().append(header::SET_COOKIE, value);
+    }
+    logx::admin(format!("web login succeeded for {}", form.username));
+    res
+}
+
+async fn logout(Extension(auth): Extension<Arc<AuthState>>, headers: HeaderMap) -> Response {
+    if let Some(token) = session_token(&headers) {
+        auth.remove(token);
+    }
+    let mut res = Redirect::to("/login").into_response();
+    if let Ok(value) = HeaderValue::from_str(&auth.clear_cookie()) {
+        res.headers_mut().append(header::SET_COOKIE, value);
+    }
+    res
+}
+
+/// Compare without early exit so the check does not leak the matching prefix.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// Minimal standard base64 encoder for the credential token.
+fn base64_encode(input: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((input.len() + 2) / 3 * 4);
+    for chunk in input.chunks(3) {
+        let b1 = *chunk.get(1).unwrap_or(&0);
+        let b2 = *chunk.get(2).unwrap_or(&0);
+        let n = ((chunk[0] as u32) << 16) | ((b1 as u32) << 8) | b2 as u32;
+        out.push(ALPHABET[(n >> 18 & 63) as usize] as char);
+        out.push(ALPHABET[(n >> 12 & 63) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            ALPHABET[(n >> 6 & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[(n & 63) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
 
 async fn index() -> impl IntoResponse {
     Html(INDEX_HTML)
@@ -1946,7 +2211,13 @@ async fn commit_wcfg(
 /// A missing certificate/key pair is generated (self-signed) and persisted, so
 /// the same identity is reused on the next start.
 pub async fn serve(state: Arc<AppData>, settings: WebSettings) -> Result<()> {
-    let app = router(state);
+    let app = with_auth(router(state), &settings);
+    if settings.auth.is_some() {
+        logx::admin(format!(
+            "web authentication enabled (session cookie, {} min lifetime)",
+            settings.session_ttl_minutes
+        ));
+    }
     let http = TcpListener::bind(settings.http.socket_addr())
         .await
         .with_context(|| format!("bind web http on {}", settings.http))?;
@@ -2148,6 +2419,7 @@ fn fingerprint(der: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::settings::WebAuth;
     use axum::body::Body;
     use axum::http::Request;
     use http_body_util::BodyExt;
@@ -2168,6 +2440,154 @@ mod tests {
             Arc::new(WirelessConfigStore::new(db.clone())),
             Arc::new(ProductCapsStore::new(db.clone())),
         ))
+    }
+
+    fn auth_settings() -> WebSettings {
+        WebSettings {
+            http: ListenAddr {
+                addr: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                port: 8246,
+            },
+            https: None,
+            https_cert: None,
+            https_key: None,
+            auth: Some(WebAuth {
+                user: "admin".into(),
+                password: "s3cret".into(),
+            }),
+            session_ttl_minutes: 30,
+        }
+    }
+
+    async fn post_login(app: &Router, user: &str, password: &str) -> Response {
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/login")
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(format!("username={user}&password={password}")))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn session_cookie_guards_routes_and_logout_revokes() {
+        let app = with_auth(router(test_state()), &auth_settings());
+
+        let login = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/login")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(login.status(), StatusCode::OK);
+
+        let page = app
+            .clone()
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(page.status(), StatusCode::SEE_OTHER);
+        assert_eq!(page.headers().get(header::LOCATION).unwrap(), "/login");
+
+        let unauth = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/devices")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED);
+
+        let bad = post_login(&app, "admin", "nope").await;
+        assert_eq!(bad.status(), StatusCode::UNAUTHORIZED);
+
+        let ok = post_login(&app, "admin", "s3cret").await;
+        assert_eq!(ok.status(), StatusCode::SEE_OTHER);
+        let set_cookie = ok
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(set_cookie.contains("HttpOnly"));
+        assert!(set_cookie.contains("SameSite=Strict"));
+        assert!(set_cookie.contains("Max-Age=1800"));
+        assert!(!set_cookie.contains("Secure"));
+        let pair = set_cookie.split(';').next().unwrap().to_string();
+
+        let authed = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/devices")
+                    .header(header::COOKIE, pair.clone())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(authed.status(), StatusCode::OK);
+
+        let out = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/logout")
+                    .header(header::COOKIE, pair.clone())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.status(), StatusCode::SEE_OTHER);
+
+        let after = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/devices")
+                    .header(header::COOKIE, pair)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(after.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn expired_session_is_pruned() {
+        let auth = AuthState::new("admin", "s3cret", Duration::from_secs(60), false);
+        let token = auth.create();
+        assert!(auth.valid(&token));
+
+        auth.sessions
+            .lock()
+            .unwrap()
+            .insert(token.clone(), Instant::now() - Duration::from_secs(1));
+        assert!(!auth.valid(&token));
+        assert!(auth.sessions.lock().unwrap().get(&token).is_none());
+    }
+
+    #[test]
+    fn base64_encoder_matches_known_vectors() {
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"admin:s3cret"), "YWRtaW46czNjcmV0");
     }
 
     #[test]
@@ -2191,6 +2611,8 @@ mod tests {
             https: Some(loopback),
             https_cert: Some(cert.clone()),
             https_key: Some(key.clone()),
+            auth: None,
+            session_ttl_minutes: 480,
         };
         let (_, _, first_fp) = load_or_create_identity(&settings, loopback).unwrap();
         let first = fs::read(&cert).unwrap();

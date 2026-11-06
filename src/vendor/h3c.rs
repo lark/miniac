@@ -184,7 +184,7 @@ pub fn join_response_with_image(seq: u32, ac_ip: Ipv4Addr, image_name: &[u8]) ->
 /// H3C private WLAN configuration element (verified against the M60 AC
 /// `/bin/AC` encoder `10045de4` and the AX60 WTP dispatcher `0xfde8 -> 26010`).
 /// Element layout is `[Type:2 BE][Len:2 BE][body]`; a single element carries
-/// SSID, enable, broadcast, encrypt and PSK (see `encode_h3c`).
+/// SSID, enable, broadcast, encrypt and PSK (see `encode_h3c_with`).
 pub const WLAN_CFG_H3C: u16 = 0xfde8;
 
 /// AX60 channel-utilization report / acknowledgement. The WTP sends the
@@ -242,13 +242,6 @@ pub fn image_id_all_version() -> Vec<u8> {
     v.extend_from_slice(b"all_version");
     v.push(0);
     v
-}
-
-/// Build a Clear Configuration Request (mtype 23), restoring factory defaults.
-/// The AX60 handler (`sub_3EE88` -> `CWWTPInitConfiguration`) parses no
-/// structured elements, so the request is sent bare.
-pub fn clear_config_request(seq: u32) -> CtrlMsg {
-    CtrlMsg::new(MsgType::CLEAR_CONFIG_REQ, seq)
 }
 
 /// Build a Release Client by AC Request (mtype 139) evicting one station.
@@ -362,23 +355,7 @@ fn h3c_security(w: &config::WlanConfig) -> crate::vendor::profile::SecurityField
 /// enable, word2 as TX power, word3 as the mode selector, word4 as the channel
 /// width selector and word5 as the channel (a selector code on 5G); word6 is
 /// never read (kept at the M60's 100). A band with no WLAN yields enable=0 and
-/// no records. This default form uses product-default headers; the Configure
-/// push passes the configured ones to [`encode_h3c_with`].
-pub fn encode_h3c(wlans: &[config::WlanConfig]) -> Vec<u8> {
-    let defaults = [
-        H3cRadioHeader {
-            radio_id: 1,
-            ..H3cRadioHeader::default()
-        },
-        H3cRadioHeader {
-            radio_id: 2,
-            ..H3cRadioHeader::default()
-        },
-    ];
-    encode_h3c_with(wlans, &defaults)
-}
-
-/// Like [`encode_h3c`] but with the per-band radio headers (2.4G first).
+/// no records. The Configure push passes the configured per-band headers.
 pub fn encode_h3c_with(wlans: &[config::WlanConfig], radios: &[H3cRadioHeader; 2]) -> Vec<u8> {
     let g24: Vec<&config::WlanConfig> = wlans.iter().filter(|w| w.radio_id != 2).collect();
     let g5: Vec<&config::WlanConfig> = wlans.iter().filter(|w| w.radio_id == 2).collect();
@@ -702,7 +679,7 @@ pub fn config_status_response(inp: &ConfigStatusResp<'_>) -> CtrlMsg {
     m = m.add_elem(0x0028, &[0u8; 1]);
     // One dual-band 0xfde8 element: the AX60 applies WLAN/SSID only from this
     // Configure-stage response, and its decoder 0x52ee0 must consume the whole
-    // element (see `encode_h3c`).
+    // element (see `encode_h3c_with`).
     if !inp.wlans.is_empty() {
         let body = encode_h3c_with(inp.wlans, &inp.radios);
         m = m.add_elem(WLAN_CFG_H3C, &body);
@@ -940,12 +917,26 @@ mod tests {
         }
     }
 
+    fn encode_default(wlans: &[config::WlanConfig]) -> Vec<u8> {
+        let defaults = [
+            H3cRadioHeader {
+                radio_id: 1,
+                ..H3cRadioHeader::default()
+            },
+            H3cRadioHeader {
+                radio_id: 2,
+                ..H3cRadioHeader::default()
+            },
+        ];
+        encode_h3c_with(wlans, &defaults)
+    }
+
     #[test]
     fn h3c_body_layout() {
         // One record per band in the M60 layout. Each record is 33B anchor +
         // u32 enable + 33B name + 5*u32, plus [65B PSK][u32 cipher][u32 rekey]
         // when encrypted, i.e. 163B.
-        let b = encode_h3c(&[wlan(1, 1, "miniac24"), wlan(2, 1, "miniac5g")]);
+        let b = encode_default(&[wlan(1, 1, "miniac24"), wlan(2, 1, "miniac5g")]);
         let rec = 163;
         assert_eq!(b.len(), 2 * (28 + rec) + 74);
         // 2.4G header: enable=1, power=6 at word 2, mode=11 at word 3, 20 MHz
@@ -989,7 +980,7 @@ mod tests {
     fn h3c_empty_band_disables_radio() {
         // A single 2.4G WLAN still emits the 5G header, with enable=0, and the
         // full tail.
-        let b = encode_h3c(&[wlan(1, 1, "miniac24")]);
+        let b = encode_default(&[wlan(1, 1, "miniac24")]);
         assert_eq!(b.len(), 28 + 163 + 28 + 74);
         assert_eq!(&b[0..4], &1u32.to_be_bytes());
         let g5 = 28 + 163;
@@ -1104,7 +1095,7 @@ mod tests {
     fn h3c_multiple_24g_ssids() {
         // Two 2.4G wlans become consecutive "SSID-<n>" records (indices 1, 2),
         // followed by the empty 5G header and the tail.
-        let b = encode_h3c(&[wlan(1, 1, "miniac24"), wlan(1, 2, "miniac24b")]);
+        let b = encode_default(&[wlan(1, 1, "miniac24"), wlan(1, 2, "miniac24b")]);
         let rec = 163;
         assert_eq!(b.len(), 28 + 2 * rec + 28 + 74);
         assert_eq!(&b[28..34], b"SSID-1");
@@ -1354,14 +1345,6 @@ mod tests {
     }
 
     #[test]
-    fn clear_config_request_is_bare() {
-        let msg = clear_config_request(9);
-        assert_eq!(msg.hdr.msg_type, MsgType::CLEAR_CONFIG_REQ);
-        assert_eq!(msg.hdr.seq_num, 9);
-        assert!(msg.elems.is_empty());
-    }
-
-    #[test]
     fn release_client_request_mac_element() {
         let mac = [0xc4, 0xc0, 0x63, 0xef, 0xca, 0x25];
         let msg = release_client_request(11, mac);
@@ -1391,7 +1374,7 @@ mod tests {
         let mut w = wlan(1, 1, "miniac24");
         w.isolate = true;
         w.broadcast = false;
-        let b = encode_h3c(&[w]);
+        let b = encode_default(&[w]);
         let word = |at: usize| u32::from_be_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]]);
         assert_eq!(word(isolate_at), 1);
         assert_eq!(word(broadcast_at), 0);
@@ -1409,14 +1392,14 @@ mod tests {
             ])
         };
         // 0 in the DB means "no limit", which H3C spells 0xffffffff.
-        assert_eq!(limit(&encode_h3c(&[wlan(1, 1, "miniac24")])), 0xffff_ffff);
+        assert_eq!(limit(&encode_default(&[wlan(1, 1, "miniac24")])), 0xffff_ffff);
         // A configured per-SSID limit rides as-is.
         let mut w = wlan(1, 1, "miniac24");
         w.client_count = 20;
-        assert_eq!(limit(&encode_h3c(&[w])), 20);
+        assert_eq!(limit(&encode_default(&[w])), 20);
         // Values above the AX60 ceiling are clamped on the wire.
         let mut w = wlan(1, 1, "miniac24");
         w.client_count = 64;
-        assert_eq!(limit(&encode_h3c(&[w])), 32);
+        assert_eq!(limit(&encode_default(&[w])), 32);
     }
 }
