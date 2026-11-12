@@ -323,6 +323,10 @@ pub enum FirmwareFormat {
     /// `..._V<major>.<minor>_<x.y.z>_Build_<date>_Rel.<rel>.bin` remains the
     /// only source for model / hardware revision.
     TpLink,
+    /// Ruijie RGOS images are RPM packages (`ed ab ee db` lead). The main RPM
+    /// header carries the build manifest as plain text: `sup_list` (hardware
+    /// product id), `target` (model), and `[softver] ver` (software version).
+    Ruijie,
 }
 
 impl FirmwareFormat {
@@ -331,6 +335,7 @@ impl FirmwareFormat {
         match self {
             FirmwareFormat::H3c => "h3c",
             FirmwareFormat::TpLink => "tplink",
+            FirmwareFormat::Ruijie => "ruijie",
         }
     }
 }
@@ -356,10 +361,21 @@ const H3C_MAGIC: &[u8] = b"H3C_+k+f";
 const H3C_HEADER_LEN: usize = 0x90;
 const H3C_VERSION_START: usize = 0x40;
 
+/// Ruijie RGOS RPM lead magic.
+const RUIJIE_RPM_MAGIC: [u8; 4] = [0xED, 0xAB, 0xEE, 0xDB];
+/// The RGOS build manifest lives inside the RPM main header, within the first
+/// few KiB. Scanning that window avoids decompressing the payload.
+const RUIJIE_MANIFEST_SCAN: usize = 0x1000;
+
 /// Identify an image's format and pull vendor / model / hardware / version out
 /// of it. Returns `None` when neither supported format matches (the caller can
 /// still store the image with explicit metadata).
 pub fn detect_image(file_name: &str, data: &[u8]) -> Option<ImageMeta> {
+    if data.starts_with(&RUIJIE_RPM_MAGIC) {
+        if let Some(meta) = ruijie_meta(data) {
+            return Some(meta);
+        }
+    }
     if data.starts_with(H3C_MAGIC) {
         let version = h3c_version(data)
             .or_else(|| file_name.strip_suffix(".bin"))
@@ -399,6 +415,55 @@ fn h3c_version(data: &[u8]) -> Option<&str> {
         }
     }
     None
+}
+
+/// Read the RGOS manifest out of an RPM main header. `target` names the model
+/// (`ap120-a`), `sup_list` the hardware product id (`0x30020122`, also the
+/// `rg_cfg/<id>/` directory) and `[softver] ver` the software version.
+fn ruijie_meta(data: &[u8]) -> Option<ImageMeta> {
+    let head = data.get(..RUIJIE_MANIFEST_SCAN.min(data.len()))?;
+    let target = manifest_value(head, b"target=")?;
+    Some(ImageMeta {
+        format: FirmwareFormat::Ruijie,
+        vendor: FirmwareFormat::Ruijie.vendor().to_string(),
+        model: ruijie_model(&target),
+        // RGOS `sup_list` is the hardware product id (also the `rg_cfg/<id>/`
+        // directory), not a revision the WTP reports, so leaving it empty keeps
+        // firmware selection working (`select_for_wtp` only compares a
+        // non-empty hardware version on both sides).
+        hw_version: String::new(),
+        version: manifest_section_value(head, b"[softver]", b"ver=").unwrap_or_default(),
+    })
+}
+
+/// First `key=value` in the manifest window, terminated by end of line, `;` or
+/// NUL (the manifest shares the header with binary tag data).
+fn manifest_value(head: &[u8], key: &[u8]) -> Option<String> {
+    let at = head.windows(key.len()).position(|w| w == key)? + key.len();
+    let rest = &head[at..];
+    let end = rest
+        .iter()
+        .position(|&b| matches!(b, b'\n' | b'\r' | 0 | b';'))
+        .unwrap_or(rest.len());
+    let value = String::from_utf8_lossy(&rest[..end]).trim().to_string();
+    (!value.is_empty()).then_some(value)
+}
+
+/// `key=value` in the manifest section that follows a `[section]` marker.
+fn manifest_section_value(head: &[u8], section: &[u8], key: &[u8]) -> Option<String> {
+    let at = head.windows(section.len()).position(|w| w == section)? + section.len();
+    manifest_value(&head[at..], key)
+}
+
+/// Map an RGOS `target` (`ap120-a`) to the model string the WTP reports in its
+/// Board Data (`RG-AP120-A`).
+fn ruijie_model(target: &str) -> String {
+    let upper = target.trim().to_ascii_uppercase();
+    if upper.starts_with("AP") {
+        format!("RG-{upper}")
+    } else {
+        upper
+    }
 }
 
 /// Legacy TP-Link container head: `00 00 01 00` + magic `55 AA 4C 5E`.
@@ -878,7 +943,13 @@ fn now_unix() -> u64 {
 /// a firmware image download.
 pub enum UpgradeCmd {
     /// Deliver `image` to the WTP under the Image Identifier `name`.
-    Start { image: Vec<u8>, name: String },
+    Start {
+        image: Vec<u8>,
+        name: String,
+        /// Catalogue software version; Ruijie announces it in the Image
+        /// Identifier (type 1) so the WTP can compare it with its running one.
+        version: String,
+    },
 }
 
 /// Registry mapping a WTP MAC to its live session's command channel, letting
@@ -1132,6 +1203,28 @@ mod tests {
     }
 
     #[test]
+    fn detect_ruijie_rgos_image() {
+        let mut data = vec![0xED, 0xAB, 0xEE, 0xDB];
+        data.extend_from_slice(&[0u8; 0x3fc]);
+        data.extend_from_slice(
+            b"sup_list=0x30020122;\n\
+              [rootfs]\n\
+              name=rootfs.ubi\n\
+              ver=1.0.0.2e5482c0\n\
+              target=ap120-a\n\
+              buildtime=2020/03/17 12:38:21\n\
+              [softver]\n\
+              ver=AP_RGOS 11.1(9)B1P25, Release(07151712)\n",
+        );
+        let meta = detect_image("RGOS11.1_B1P25_S1C2_install.bin", &data).unwrap();
+        assert_eq!(meta.format, FirmwareFormat::Ruijie);
+        assert_eq!(meta.vendor, "ruijie");
+        assert_eq!(meta.model, "RG-AP120-A");
+        assert!(meta.hw_version.is_empty());
+        assert_eq!(meta.version, "AP_RGOS 11.1(9)B1P25, Release(07151712)");
+    }
+
+    #[test]
     fn detect_tplink_image() {
         let meta = detect_image(
             "TL-AP1300GI-PoE_V2.0_1.0.6_Build_20200311_Rel.13347.bin",
@@ -1262,7 +1355,8 @@ mod tests {
             mac,
             UpgradeCmd::Start {
                 image: vec![],
-                name: "fw.bin".to_string()
+                name: "fw.bin".to_string(),
+                version: "1.0".to_string(),
             }
         )); // no live session
 
@@ -1273,13 +1367,19 @@ mod tests {
             mac,
             UpgradeCmd::Start {
                 image: vec![1, 2, 3],
-                name: "fw.bin".to_string()
+                name: "fw.bin".to_string(),
+                version: "1.0".to_string(),
             }
         ));
         match rx.blocking_recv() {
-            Some(UpgradeCmd::Start { image, name }) => {
+            Some(UpgradeCmd::Start {
+                image,
+                name,
+                version,
+            }) => {
                 assert_eq!(image, vec![1, 2, 3]);
                 assert_eq!(name, "fw.bin");
+                assert_eq!(version, "1.0");
             }
             _ => panic!("expected Start command"),
         }

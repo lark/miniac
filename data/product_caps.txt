@@ -6,7 +6,7 @@
 #
 # Record format, one per line, '|'-separated (9 fields):
 #   vendor | model | version | akm | cipher | pmf | limits | source | notes
-#     vendor  : profile token, one of 'h3c' | 'tplink' | 'rfc'
+#     vendor  : profile token, one of 'h3c' | 'tplink' | 'ruijie' | 'rfc'
 #     model   : device model; empty = any model of the vendor
 #     version : firmware/hardware version; empty = any version
 #     akm     : comma list of open, psk, psk-sae, sae
@@ -32,3 +32,9 @@ h3c | | | open,psk,psk-sae | tkip,ccmp,tkip+ccmp | | max_clients=0-32 | AX60 roo
 # open WLAN omits the private 9 element entirely. WPA3 and TKIP are not
 # characterized, so only open|psk and AES/CCMP are claimed.
 tplink | | | open,psk | ccmp | | max_clients=1-100 | TL-AC100 mitm6: private 9 auth=2 (WPA2), cipher=2 (AES); open omits private 9 | PSK/WPA2-AES characterized; WPA3 and TKIP uncharacterized; per-SSID client limit is 1-100
+# Ruijie RG-AP120-A: WLAN security travels as the Add WLAN (1024) key field plus
+# an RSN IE (element 1029, decode 0x4b417c) that is forwarded to the driver, so
+# the firmware itself does not constrain the suite list. Nothing about WPA3,
+# PMF or a per-SSID client limit has been verified yet, so the lists stay empty
+# (uncharacterized = no constraint) rather than guessing.
+ruijie | | | | | | | RGOS 11.1(1)B1P25 apagd 0x41e704 (Add WLAN key) + wbs_mng 0x4b417c (elem 1029 RSN IE) | PSK via 1024 key; WPA3/PMF/client-limit carriers unverified; do not claim capabilities without evidence

@@ -137,9 +137,13 @@ async fn main() -> Result<()> {
     > = {
         use vendor::profile::VendorProfile;
         let mut m = HashMap::new();
+        // RG-AP1920 (RGOS 11.9) is built with CONFIG_CAPWAP_HAVE_DTLS and starts
+        // a DTLS handshake by default, unlike the RG-AP120-A, so the Ruijie
+        // profile needs an identity entry of its own.
         for p in [
             VendorProfile::H3c,
             VendorProfile::TpLink,
+            VendorProfile::Ruijie,
             VendorProfile::Rfc,
         ] {
             m.insert(p, generate_dtls_config(p)?);
@@ -579,7 +583,7 @@ fn configs_from_store(
             auth_type,
             mac_mode: 0,
             tunnel_mode: 0,
-            suppress_ssid: false,
+            suppress_ssid: !rw.broadcast,
             ssid: rw.ssid.clone().into_bytes(),
             security: rw.security.clone(),
             wlan_enable: rw.wlan_enable,
@@ -635,6 +639,7 @@ fn requested_image(
     devices: &device::DeviceStore,
     mac: Option<device::Mac>,
     elems: &HashMap<u16, Vec<CwElem>>,
+    profile: vendor::profile::VendorProfile,
 ) -> Option<(firmware::FirmwareImage, firmware::ImageIdentifier)> {
     // Image Identifier body: vendor id (u32 BE) followed by the image name.
     let raw = match elems.get(&MsgElemType::IMAGE_ID)?.first()? {
@@ -662,11 +667,18 @@ fn requested_image(
         .as_ref()
         .and_then(|d| d.hw_version.clone())
         .unwrap_or_default();
-    // The identifier payload is a UTF-8 name under RFC or H3C and a binary
-    // version under TP-Link; only the catalogue hint is textual either way.
-    let requested = String::from_utf8_lossy(&id.name);
-    let requested = requested.trim_matches('\0');
-    match fw.select_for_wtp(requested, &vendor, &model, &hw) {
+    // The identifier payload is a UTF-8 name under RFC or H3C, a binary
+    // version under TP-Link, and a vendor id plus sub-TLVs under Ruijie.
+    let requested = match profile {
+        vendor::profile::VendorProfile::Ruijie => vendor::ruijie::image_identifier_name(&id.name),
+        _ => None,
+    };
+    let requested = requested.unwrap_or_else(|| {
+        String::from_utf8_lossy(&id.name)
+            .trim_matches('\0')
+            .to_string()
+    });
+    match fw.select_for_wtp(&requested, &vendor, &model, &hw) {
         Ok(Some(img)) => Some((img, id)),
         Ok(None) => None,
         Err(e) => {
@@ -1066,6 +1078,7 @@ async fn handle_session(
                             }
                             // Persist device learned from the join exchange (keyed by MAC).
                             let mut join_image: Option<Vec<u8>> = None;
+                            let mut join_version: Option<String> = None;
                             if let Some(mac) = wtp_mac_from_elems(&elems, profile) {
                                 ctx.mac = Some(mac);
                                 devices.mark_live(mac);
@@ -1103,12 +1116,17 @@ async fn handle_session(
                                 upgrade.register(mac, upgrade_tx.clone());
                                 cfg_update.register(mac, cfg_update_tx.clone());
                                 wtp_cmd.register(mac, wtp_cmd_tx.clone());
-                                // H3C join-time entry (M60 `ACEnterJoin`): an image
-                                // queued for an offline WTP is announced in the
-                                // Join Response, so this WTP downloads it before
-                                // taking any configuration instead of from the
-                                // Run state.
-                                if profile == vendor::profile::VendorProfile::H3c {
+                                // H3C join-time entry (M60 `ACEnterJoin`) and the
+                                // RGOS equivalent: an image queued for an offline
+                                // WTP is announced in the Join Response (element 25
+                                // is `may` there), so this WTP downloads it before
+                                // taking any configuration instead of from the Run
+                                // state.
+                                if matches!(
+                                    profile,
+                                    vendor::profile::VendorProfile::H3c
+                                        | vendor::profile::VendorProfile::Ruijie
+                                ) {
                                     if !fw_policy.update_on_join() {
                                         // Startup updates are opt-in: a power
                                         // restore must not start every AP's
@@ -1127,6 +1145,7 @@ async fn handle_session(
                                                             name: name.clone(),
                                                         },
                                                     );
+                                                    join_version = Some(img.version.clone());
                                                     join_image = Some(name);
                                                     logx::firmware(format!(
                                                         "firmware {} announced to {} in the join response",
@@ -1161,11 +1180,20 @@ async fn handle_session(
                             // entry; WTP.dis 0x23754 counts entries and re-parses
                             // each at 0x1df5c). The RFC / TP-Link form uses the
                             // standards-shaped builder.
-                            let resp_msg = match join_image.as_deref() {
-                                Some(name) => {
+                            let resp_msg = match (join_image.as_deref(), profile) {
+                                (Some(name), vendor::profile::VendorProfile::H3c) => {
                                     vendor::h3c::join_response_with_image(seq, ac_ip, name)
                                 }
-                                None => profile.join_response(seq, ac_ip, b"miniac", true),
+                                (Some(name), vendor::profile::VendorProfile::Ruijie) => {
+                                    vendor::ruijie::join_response_with_image(
+                                        seq,
+                                        ac_ip,
+                                        b"miniac",
+                                        join_version.as_deref().unwrap_or_default(),
+                                        &String::from_utf8_lossy(name),
+                                    )
+                                }
+                                _ => profile.join_response(seq, ac_ip, b"miniac", true),
                             };
                             let resp_buf = resp_msg.encode_for(frame(profile));
                             capdtls.write(&resp_buf).await?;
@@ -1294,6 +1322,12 @@ async fn handle_session(
                                         },
                                     )
                                 }
+                                // RG-AP120-A requires only CAPWAP Timers (12) and
+                                // WTP Fallback (40); it carries no WLAN config, so
+                                // the WLANs go out in the Run-entry push below.
+                                vendor::profile::VendorProfile::Ruijie => {
+                                    vendor::ruijie::config_status_response(seq)
+                                }
                                 _ => vendor::h3c::config_status_response(
                                     &vendor::h3c::ConfigStatusResp {
                                         seq,
@@ -1312,9 +1346,14 @@ async fn handle_session(
                             capdtls.write(&resp_buf).await?;
                             ctx.set_last_sent(&resp_msg, resp_buf);
                             cfg_status.mark_pushed([vendor::h3c::WLAN_CFG_H3C]);
-                            // The TP-Link form carries no WLAN configuration, so
-                            // the WLANs go out only in the later Run-entry push.
-                            let resp_wlans = if profile == vendor::profile::VendorProfile::TpLink {
+                            // The TP-Link and Ruijie forms carry no WLAN
+                            // configuration, so their WLANs go out only in the
+                            // later Run-entry push.
+                            let resp_wlans = if matches!(
+                                profile,
+                                vendor::profile::VendorProfile::TpLink
+                                    | vendor::profile::VendorProfile::Ruijie
+                            ) {
                                 0
                             } else {
                                 wlans.len()
@@ -1467,6 +1506,120 @@ async fn handle_session(
                                     peer
                                 ));
                             }
+                            // RG-AP120-A takes WLANs in the private 0x33DD01
+                            // message, one Add WLAN element (1024) per message;
+                            // the WTP acknowledges each with 0x33DD02. As with
+                            // TP-Link, the set is released after the change-state
+                            // response and is not retransmitted.
+                            //
+                            // Radio bring-up: each radio is brought up with a
+                            // bare Radio Admin State (element 31) followed by a
+                            // Configure Update Request carrying channel (1028),
+                            // TX power (1041) and WTP Radio Config (1046). The
+                            // config-done VSP (0x1010) is sent after all WLANs
+                            // so the WTP applies the accumulated configuration.
+                            if profile == vendor::profile::VendorProfile::Ruijie {
+                                let mac = ctx.mac.unwrap_or([0; 6]);
+                                if radios.list_wlans(mac)?.is_empty() {
+                                    wcfg.materialize(&radios, mac)?;
+                                }
+                                if radios.list_wlans(mac)?.is_empty() {
+                                    anyhow::bail!(
+                                        "no WLAN configuration for {} (global_wlan default missing)",
+                                        device::mac_to_str(mac)
+                                    );
+                                }
+                                // RGOS has no "delete WLAN" primitive over CAPWAP
+                                // (apagd 0x417060 registers only 23 and 0x33DD01,
+                                // and the Add WLAN decoder 0x41e704 has no 0x401
+                                // branch), so a disabled WLAN is simply not
+                                // pushed. Its row stays in the DB for the
+                                // management view and reappears when re-enabled.
+                                let wlans = configs_from_store(&*radios, mac)?;
+                                for radio_id in 1..=2u8 {
+                                    let hdr = wcfg.effective_radio(mac, radio_id)?;
+                                    if !hdr.enable {
+                                        let msg = vendor::ruijie::radio_admin_state_request(
+                                            ctx.next_seq(),
+                                            radio_id,
+                                            1,
+                                        );
+                                        ctx.push_msg(msg.encode_for(frame(profile)));
+                                        continue;
+                                    }
+                                    let channel = hdr.channel as u8;
+                                    let msg = vendor::ruijie::radio_admin_state_request(
+                                        ctx.next_seq(),
+                                        radio_id,
+                                        2,
+                                    );
+                                    ctx.push_msg(msg.encode_for(frame(profile)));
+                                    let msg = vendor::ruijie::radio_config_request(
+                                        ctx.next_seq(),
+                                        radio_id,
+                                        channel,
+                                        hdr.power as u8,
+                                        hdr.mode,
+                                    );
+                                    ctx.push_msg(msg.encode_for(frame(profile)));
+                                    // Channel width rides in the 11n VSP; it also
+                                    // restores the AP's factory A-MPDU / short GI
+                                    // / LDPC defaults, which the same blob writes.
+                                    if let Some(msg) = vendor::ruijie::ht_11n_request(
+                                        ctx.next_seq(),
+                                        radio_id,
+                                        hdr.bandwidth,
+                                    ) {
+                                        ctx.push_msg(msg.encode_for(frame(profile)));
+                                    }
+                                }
+                                for w in &wlans {
+                                    // The VLAN mapping must be installed before
+                                    // the Add WLAN that references it.
+                                    if let Some(req) = vendor::ruijie::vlan_mapping_request(
+                                        ctx.next_seq(),
+                                        w.wlan_id,
+                                        w.vlan_id,
+                                    ) {
+                                        ctx.burst_msg(req.encode_for(frame(profile)));
+                                    }
+                                    let req = vendor::ruijie::wlan_config_update_request(
+                                        ctx.next_seq(),
+                                        w,
+                                    );
+                                    ctx.burst_msg(req.encode_for(frame(profile)));
+                                }
+                                let done = vendor::ruijie::config_done_request(ctx.next_seq());
+                                ctx.burst_msg(done.encode_for(frame(profile)));
+                                // Re-apply the remembered LED setting: an AP
+                                // restart resets its LED, so the last state the
+                                // operator chose is pushed again. RGOS does not
+                                // report the LED state back, so there is nothing
+                                // to learn from Echo.
+                                if let Some(on) = devices.get(mac)?.and_then(|d| d.led_on) {
+                                    let seq = ctx.next_seq();
+                                    ctx.burst_msg(
+                                        profile
+                                            .led_update_request(seq, on)
+                                            .encode_for(frame(profile)),
+                                    );
+                                }
+                                let radios_queued = ctx.push_queue.len();
+                                let burst_queued = ctx.push_burst.len();
+                                for buf in ctx.release_push() {
+                                    capdtls.write(&buf).await?;
+                                }
+                                info!(
+                                    "[>] to {}: {} radio message(s), {} WLAN/config-done message(s) queued for Ruijie",
+                                    peer, radios_queued, burst_queued
+                                );
+                                logx::device(format!(
+                                    "pushed {} radio(s) and {} WLAN config(s) to {} in Run state",
+                                    radios_queued,
+                                    wlans.len(),
+                                    peer
+                                ));
+                            }
                         }
 
                         (WtpState::Run | WtpState::ImageData, MsgType::ECHO_REQ) => {
@@ -1515,11 +1668,15 @@ async fn handle_session(
                             debug!("[<] from {}: echo resp (seq {})", peer, seq);
                         }
 
-                        (WtpState::Run, t) if t == vendor::tplink::WLAN_CONFIG_UPDATE_RESP => {
+                        (WtpState::Run, t)
+                            if t == vendor::tplink::WLAN_CONFIG_UPDATE_RESP
+                                || t == vendor::ruijie::WLAN_CFG_UPDATE_RESP =>
+                        {
                             // Reply to the private WLAN Configuration Update
-                            // Request (0x0033DD02). It echoes the private
-                            // arguments the WTP accepted; the push itself is not
-                            // queued, so this only records that the WTP answered.
+                            // Request (0x0033DD01) shared by TP-Link and Ruijie.
+                            // It echoes the private arguments the WTP accepted;
+                            // the push itself is not queued, so this only records
+                            // that the WTP answered.
                             info!("[<] from {}: WLAN configuration update resp (seq {})", peer, seq);
                             // Release the next serialized push, if any is due.
                             for buf in ctx.release_push() {
@@ -1625,6 +1782,35 @@ async fn handle_session(
                                 // This traffic also proves the WTP is alive;
                                 // `last_seen` stays in memory and only reaches
                                 // the DB when the AC exits normally.
+                                if let Some(mac) = ctx.mac {
+                                    devices.mark_live(mac);
+                                }
+                            }
+                            // RGOS reports each radio's average client RSSI as
+                            // bare element 0xa6 (`count, (radio, rssi i8) *
+                            // count`). There is no matching field in the radio
+                            // model, so it is decoded for observability; an
+                            // unchanged value repeats every report.
+                            if profile == vendor::profile::VendorProfile::Ruijie {
+                                let report = elems
+                                    .get(&vendor::ruijie::AVG_RSSI_VSP)
+                                    .and_then(|items| {
+                                        items.iter().find_map(|item| match item {
+                                            CwElem::Unknown(_, v) => Some(v.as_slice()),
+                                            _ => None,
+                                        })
+                                    });
+                                if let Some(value) = report {
+                                    let rssi = vendor::ruijie::parse_avg_rssi(value);
+                                    if rssi.is_empty() {
+                                        debug!(
+                                            "[*] avg rssi report: malformed value ({}B)",
+                                            value.len()
+                                        );
+                                    } else {
+                                        debug!("[*] avg rssi report: {:?}", rssi);
+                                    }
+                                }
                                 if let Some(mac) = ctx.mac {
                                     devices.mark_live(mac);
                                 }
@@ -1791,7 +1977,7 @@ async fn handle_session(
                                 continue;
                             }
                             if fw_upgrade.session.is_none() {
-                                let (img, bytes, id) = match requested_image(&fw, &devices, ctx.mac, &elems) {
+                                let (img, bytes, id) = match requested_image(&fw, &devices, ctx.mac, &elems, profile) {
                                     Some((img, id)) => match fw.load_image_bytes(img.id) {
                                         Ok(Some(bytes)) => (img, bytes, id),
                                         Ok(None) => {
@@ -1862,7 +2048,7 @@ async fn handle_session(
                                 continue;
                             }
                             if fw_upgrade.session.is_none() {
-                                if let Some((img, id)) = requested_image(&fw, &devices, ctx.mac, &elems) {
+                                if let Some((img, id)) = requested_image(&fw, &devices, ctx.mac, &elems, profile) {
                                     match fw.load_image_bytes(img.id) {
                                         Ok(Some(bytes)) => {
                                             let mac = ctx.mac.unwrap_or([0; 6]);
@@ -2205,7 +2391,11 @@ async fn handle_session(
 
             cmd = upgrade_rx.recv(), if !outstanding && ctx.state == WtpState::Run => {
                 match cmd {
-                    Some(firmware::UpgradeCmd::Start { image, name }) => {
+                    Some(firmware::UpgradeCmd::Start {
+                        image,
+                        name,
+                        version,
+                    }) => {
                         info!("[>] to {}: firmware download announced via management plane", peer);
                         let name_bytes = name.as_bytes().to_vec();
                         // TP-Link identifies an image by the 14-byte binary
@@ -2237,6 +2427,13 @@ async fn handle_session(
                             vendor::profile::VendorProfile::TpLink => {
                                 vendor::tplink::image_update_request(ctx.next_seq(), &image_id.name)
                             }
+                            vendor::profile::VendorProfile::Ruijie => config::config_update(
+                                ctx.next_seq(),
+                                &[BaseElem::ImageId(vendor::ruijie::image_identifier(
+                                    &version, &name,
+                                ))],
+                                &[],
+                            ),
                             vendor::profile::VendorProfile::Rfc => config::config_update(
                                 ctx.next_seq(),
                                 &[BaseElem::ImageIdentifier(

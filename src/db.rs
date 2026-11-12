@@ -491,6 +491,7 @@ mod tests {
             rows,
             vec![
                 ("h3c".to_string(), String::new(), String::new(), 7, 7),
+                ("ruijie".to_string(), String::new(), String::new(), 0, 0),
                 ("tplink".to_string(), String::new(), String::new(), 3, 2),
             ]
         );
@@ -513,7 +514,7 @@ mod tests {
         let n: i64 = conn
             .query_row("SELECT COUNT(*) FROM product_caps", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(n, 2);
+        assert_eq!(n, 3);
     }
 
     #[test]

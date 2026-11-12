@@ -1114,7 +1114,7 @@ async fn upload_firmware(
         && (given(&vendor).is_none() || given(&model).is_none())
     {
         return Err(ApiError::bad_request(format!(
-            "unrecognized firmware '{file_name}': supported formats are h3c and tplink; \
+            "unrecognized firmware '{file_name}': supported formats are h3c, tplink and ruijie; \
              fill vendor and model to store it explicitly"
         )));
     }
@@ -1199,6 +1199,7 @@ async fn trigger_upgrade(
         UpgradeCmd::Start {
             image: bytes,
             name: img.file_name.clone(),
+            version: img.version.clone(),
         },
     ) {
         // No live session: with startup updates disabled an offline WTP cannot
@@ -1492,6 +1493,7 @@ fn fleet_profiles(st: &AppData) -> Vec<VendorProfile> {
                 Some(v) if v.eq_ignore_ascii_case("tp-link") || v.eq_ignore_ascii_case("tplink") => {
                     Some(VendorProfile::TpLink)
                 }
+                Some(v) if v.eq_ignore_ascii_case("ruijie") => Some(VendorProfile::Ruijie),
                 _ => None,
             };
             if let Some(p) = profile {

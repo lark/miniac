@@ -1027,7 +1027,7 @@ async function approve(mac){ try{await api(`/api/devices/${mac}/approve`,{method
 /* ---------- device management ---------- */
 /* Vendors whose over-CAPWAP upgrade path miniac already speaks. Anything else
    (unknown or not yet adapted) keeps the button disabled with a reason. */
-const FW_ADAPTED=['h3c','tp-link','tplink'];
+const FW_ADAPTED=['h3c','tp-link','tplink','ruijie'];
 const FW_UNSUPPORTED=[]; // known to refuse CAPWAP upgrades; empty until one is found
 const normVendor=(v)=>(v||'').trim().toLowerCase();
 /* Devices carry the family label ("tp-link") while images carry the detected
@@ -1035,7 +1035,7 @@ const normVendor=(v)=>(v||'').trim().toLowerCase();
 const vendorKey=(v)=>{const s=normVendor(v);return s==='tp-link'?'tplink':s;};
 /* Display spelling of a vendor key: the wire value is lowercase ("h3c",
    "tp-link"), the UI shows the product name. */
-const vendorLabel=(v)=>{const k=vendorKey(v);return k==='h3c'?'H3C':k==='tplink'?'TP-Link':(v||'—');};
+const vendorLabel=(v)=>{const k=vendorKey(v);return k==='h3c'?'H3C':k==='tplink'?'TP-Link':k==='ruijie'?'Ruijie':(v||'—');};
 /* Mirrors FirmwareStore::select_for_wtp: vendor/model must match, and an image
    without a hardware revision applies to every revision of that model. */
 function fwImagesFor(d){

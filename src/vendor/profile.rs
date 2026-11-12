@@ -19,7 +19,7 @@ use crate::capwap::{CtrlMsg, MsgElemType, MsgType};
 use crate::config::{self, Akm, Cipher, SecurityPolicy};
 use crate::elements::ImageIdentifier;
 use crate::vendor::framing::CtrlFrame;
-use crate::vendor::{h3c, tplink, vsp};
+use crate::vendor::{h3c, ruijie, tplink, vsp};
 
 /// Which vendor form a session speaks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -30,6 +30,9 @@ pub enum VendorProfile {
     /// TP-Link AC100: RFC framing and private elements nested in the RFC
     /// Vendor Specific Payload element (37).
     TpLink,
+    /// Ruijie RG-AP120-A (RGOS FIT AP): RFC framing, private elements as bare
+    /// top-level tags, and the `0x33DD01`/`0x33DD02` WLAN update messages.
+    Ruijie,
     /// Vendor-neutral RFC 5415 forms; the default for unrecognized devices.
     #[default]
     Rfc,
@@ -53,7 +56,13 @@ impl VendorProfile {
         if is_h3c_framed(req) {
             return VendorProfile::H3c;
         }
-        Self::for_vendor_id(rfc_vsp_vendor_id(req)).unwrap_or(VendorProfile::Rfc)
+        if let Some(profile) = Self::for_vendor_id(rfc_vsp_vendor_id(req)) {
+            return profile;
+        }
+        if ruijie::looks_like_ruijie(req) {
+            return VendorProfile::Ruijie;
+        }
+        VendorProfile::Rfc
     }
 
     /// Profile for a vendor identifier (IANA enterprise number, as carried in
@@ -80,6 +89,7 @@ impl VendorProfile {
         match self {
             VendorProfile::H3c => Path::new("certs/h3c"),
             VendorProfile::TpLink => Path::new("certs/tplink"),
+            VendorProfile::Ruijie => Path::new("certs/ruijie"),
             VendorProfile::Rfc => Path::new("certs/rfc"),
         }
     }
@@ -97,7 +107,7 @@ impl VendorProfile {
     ) -> Option<Vec<u8>> {
         match self {
             VendorProfile::H3c => h3c::discovery_response(req, ac_ips, ac_name),
-            VendorProfile::TpLink | VendorProfile::Rfc => {
+            VendorProfile::TpLink | VendorProfile::Ruijie | VendorProfile::Rfc => {
                 // RFC 5415 Discovery Request: 8-byte base header, Message Type at
                 // [8..12] (Discovery Request = 1), 1-byte sequence at [12].
                 if req.len() < 16 || req[11] != 1 {
@@ -120,6 +130,7 @@ impl VendorProfile {
         match self {
             VendorProfile::H3c => h3c::join_response(seq, ac_ip, ok),
             VendorProfile::TpLink => tplink::join_response(seq, ac_ip, ac_name, ok),
+            VendorProfile::Ruijie => ruijie::join_response(seq, ac_ip, ac_name, ok),
             VendorProfile::Rfc => config::join_response(seq, ac_ip, ac_name, 0, ok),
         }
     }
@@ -135,7 +146,7 @@ impl VendorProfile {
             VendorProfile::TpLink => {
                 tplink::reset_request(seq, image_name, tplink::RESET_MASK_RESTART)
             }
-            VendorProfile::Rfc => {
+            VendorProfile::Ruijie | VendorProfile::Rfc => {
                 config::reset_request(seq, &ImageIdentifier::new(0, image_name.to_vec()))
             }
         }
@@ -155,11 +166,13 @@ impl VendorProfile {
     ///
     /// H3C carries the u32 state in its 0xfdf4 element. TP-Link AC100 wraps the
     /// same u32 in private 57 inside the Vendor Specific Payload (captured from
-    /// a TL-AC100 ↔ TL-AP1300GI session). RFC has no standard LED element, so
-    /// it keeps the H3C-shaped tag it used before.
+    /// a TL-AC100 ↔ TL-AP1300GI session). Ruijie uses VSP 0x13dc with a
+    /// `[mode, state]` payload. RFC has no standard LED element, so it keeps the
+    /// H3C-shaped tag it used before.
     pub fn led_update_request(self, seq: u32, on: bool) -> CtrlMsg {
         match self {
             VendorProfile::TpLink => tplink::led_update_request(seq, on),
+            VendorProfile::Ruijie => ruijie::led_update_request(seq, on),
             VendorProfile::H3c | VendorProfile::Rfc => {
                 CtrlMsg::new(MsgType::CONFIG_UPDATE_REQ, seq)
                     .add_elem(h3c::CFG_LED, &u32::from(on).to_be_bytes())
@@ -177,7 +190,7 @@ impl VendorProfile {
     pub fn radio_channel_field(self, channel: u32) -> u32 {
         match self {
             VendorProfile::TpLink => u32::from(tplink::channel_field(channel)),
-            VendorProfile::H3c | VendorProfile::Rfc => channel,
+            VendorProfile::H3c | VendorProfile::Ruijie | VendorProfile::Rfc => channel,
         }
     }
 
@@ -186,6 +199,7 @@ impl VendorProfile {
         match self {
             VendorProfile::H3c => "h3c",
             VendorProfile::TpLink => "tplink",
+            VendorProfile::Ruijie => "ruijie",
             VendorProfile::Rfc => "rfc",
         }
     }
@@ -197,6 +211,7 @@ impl VendorProfile {
         match self {
             VendorProfile::H3c => "h3c",
             VendorProfile::TpLink => "tp-link",
+            VendorProfile::Ruijie => "ruijie",
             VendorProfile::Rfc => "rfc",
         }
     }
@@ -268,7 +283,7 @@ impl VendorProfile {
             }
             // The RFC / vendor-neutral form carries the policy through the
             // private security element with no lossy mapping.
-            VendorProfile::Rfc => SecurityFields {
+            VendorProfile::Ruijie | VendorProfile::Rfc => SecurityFields {
                 encrypt: if policy.secured() { 1 } else { 0 },
                 cipher: policy.cipher.wire(),
                 auth: 0,
@@ -334,6 +349,7 @@ mod tests {
     fn framing_follows_profile() {
         assert_eq!(VendorProfile::H3c.frame(), CtrlFrame::H3c);
         assert_eq!(VendorProfile::TpLink.frame(), CtrlFrame::Rfc);
+        assert_eq!(VendorProfile::Ruijie.frame(), CtrlFrame::Rfc);
         assert_eq!(VendorProfile::Rfc.frame(), CtrlFrame::Rfc);
         // Unrecognized devices fall back to the RFC profile.
         assert_eq!(VendorProfile::default(), VendorProfile::Rfc);
@@ -415,6 +431,7 @@ mod tests {
         for p in [
             VendorProfile::H3c,
             VendorProfile::TpLink,
+            VendorProfile::Ruijie,
             VendorProfile::Rfc,
         ] {
             let msg = p.clear_config_request(6);
